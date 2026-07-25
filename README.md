@@ -34,7 +34,8 @@ available, targets JPEG XL, and handles large images such as panoramas.
 
 ### AppImage
 
-Download the AppImage, make it executable, and run it:
+Download the AppImage from the [releases page](https://github.com/andrinbr/xl-view/releases),
+make it executable, and run it:
 
 ```console
 chmod +x xl-view-x86_64.AppImage
