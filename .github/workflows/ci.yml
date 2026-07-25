@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"] # only version tags, e.g. v1.0.0
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality, coverage, and tests
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+      SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+      SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+      SONAR_QUALITY_GATE_ENABLED: ${{ vars.SONAR_QUALITY_GATE_ENABLED }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pin current master (2026-07-23)
+        with:
+          toolchain: 1.88.0
+          components: clippy,rustfmt,llvm-tools-preview
+
+      - name: Install Cargo tools
+        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # pin v2.84.1
+        with:
+          tool: cargo-llvm-cov,cargo-deny,cargo-about
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # pin v2.9.1
+
+      - name: Check dependency licenses and sources
+        run: cargo deny --locked check licenses sources
+
+      - name: Check third-party license notices
+        run: |
+          generated_notices=$(mktemp)
+          cargo about generate --workspace --locked --fail \
+            --output-file "$generated_notices" docs/legal/about.hbs
+          diff --strip-trailing-cr --unified THIRD-PARTY-LICENSES.html "$generated_notices"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Check packaging scripts
+        run: sh -n scripts/*.sh packaging/linux/appimage/*.sh packaging/linux/appimage/AppRun
+
+      - name: Install Vulkan SDK and Lavapipe
+        uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # pin v1.6.0
+        with:
+          install_lavapipe: true
+
+      - name: Show Vulkan device information
+        run: vulkaninfo --summary
+
+      - name: Run tests and generate coverage
+        run: |
+          cargo llvm-cov --workspace --all-features --all-targets --locked \
+            --lcov --output-path lcov.info -- --include-ignored --test-threads=1
+          test -s lcov.info
+
+      - name: SonarQube scan
+        if: ${{ env.SONAR_TOKEN != '' }}
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f # pin v8.2.1
+        with:
+          args: >
+            -Dsonar.organization=${{ env.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+
+      - name: SonarQube quality gate
+        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_QUALITY_GATE_ENABLED == 'true' }}
+        uses: SonarSource/sonarqube-quality-gate-action@cf038b0e0cdecfa9e56c198bbb7d21d751d62c3b # pin v1.2.0
+        with:
+          pollingTimeoutSec: 600
+
+  appimage:
+    name: Build and publish AppImage
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed to create/upload the GitHub release
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+
+      - name: Build AppImage container
+        run: buildah build --file packaging/linux/appimage/Dockerfile --tag xl-view-appimage .
+
+      - name: Build AppImage
+        run: podman run --rm --userns=keep-id --volume "$GITHUB_WORKSPACE:/work" xl-view-appimage
+
+      - name: Verify AppImage
+        run: target/appimage/xl-view-x86_64.AppImage --appimage-extract-and-run --version
+
+      - name: Publish AppImage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              target/appimage/xl-view-x86_64.AppImage \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              target/appimage/xl-view-x86_64.AppImage \
+              --generate-notes \
+              --verify-tag
+          fi

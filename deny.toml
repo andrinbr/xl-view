@@ -1,0 +1,71 @@
+[graph]
+# These are the release targets whose dependency graphs are checked.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
+
+[output]
+feature-depth = 1
+
+[licenses]
+# Licenses approved for dependencies linked into the GPL-3.0-only application.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unicode-3.0",
+]
+
+confidence-threshold = 0.8
+
+# The unpublished workspace crates are themselves GPL-3.0-only. 
+exceptions = [
+    { allow = ["GPL-3.0-only"], crate = "xl-view" },
+    { allow = ["GPL-3.0-only"], crate = "vulkan-hdr-metadata" },
+]
+
+[licenses.private]
+# Do not silently exempt unpublished workspace members.
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# Require every Git dependency to use an immutable revision instead of a
+# branch or tag.
+required-git-spec = "rev"
+
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+]
+
+allow-git = [
+    "https://github.com/slint-ui/winit",
+]
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []
+
+[advisories]
+ignore = []

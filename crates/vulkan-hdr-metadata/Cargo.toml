@@ -1,0 +1,25 @@
+[package]
+name = "vulkan-hdr-metadata"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Optional VK_EXT_hdr_metadata integration for XL-View's wgpu swapchain"
+repository.workspace = true
+publish = false
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+ash = "0.38.0"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+wgpu = { version = "30.0.0", default-features = false, features = [
+    "std",
+    "vulkan",
+] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

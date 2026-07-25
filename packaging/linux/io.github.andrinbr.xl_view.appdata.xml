@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.andrinbr.xl_view</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>XL-View</name>
+  <summary>A minimalist HDR image viewer optimized for large images</summary>
+  <developer id="io.github.andrinbr">
+    <name>Andrin Brunner</name>
+  </developer>
+  <description>
+    <p>
+      View SDR, HLG, and PQ images using native Wayland and Vulkan presentation.
+      The current version supports JPEG XL files, and the compositor remains
+      responsible for final display mapping and calibration.
+    </p>
+  </description>
+  <url type="homepage">https://github.com/andrinbr/xl-view</url>
+  <launchable type="desktop-id">io.github.andrinbr.xl_view.desktop</launchable>
+  <provides>
+    <mediatype>image/jxl</mediatype>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-07-11" />
+  </releases>
+</component>

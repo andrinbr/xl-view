@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bg_v2" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#071426" />
+      <stop offset="100%" stop-color="#0d4f73" />
+    </linearGradient>
+
+    <!-- Sun Gradient -->
+    <linearGradient id="sun_v2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fff3a6" />
+      <stop offset="100%" stop-color="#ff8054" />
+    </linearGradient>
+
+    <!-- Gradients for the peak layers -->
+    <linearGradient id="peak1_v2" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#0d4f73" />
+      <stop offset="100%" stop-color="#116b84" />
+    </linearGradient>
+
+    <linearGradient id="peak2_v2" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0%" stop-color="#116b84" />
+      <stop offset="100%" stop-color="#2ac8b5" />
+    </linearGradient>
+
+    <!-- Clip Path -->
+    <clipPath id="container_clip_v2">
+      <rect width="512" height="512" rx="104" />
+    </clipPath>
+  </defs>
+
+  <!-- Main Container -->
+  <rect width="512" height="512" rx="104" fill="url(#bg_v2)" />
+
+  <!-- Content Group -->
+  <g clip-path="url(#container_clip_v2)">
+    <!-- Sun -->
+    <circle cx="160" cy="160" r="60" fill="url(#sun_v2)" />
+
+    <!-- First peak -->
+    <path d="M0 512 L0 380 L120 280 L220 360 L320 260 L420 380 L512 300 L512 512 Z"
+          fill="url(#peak1_v2)"
+          stroke="#ffffff"
+          stroke-width="1.5"
+          stroke-opacity="0.2" />
+
+    <!-- Second peak fill only -->
+    <path d="M0 512 L0 440 L150 340 L280 400 L400 320 L512 420 L512 512 Z"
+          fill="url(#peak2_v2)" />
+
+    <!-- Second peak highlight only on top edge -->
+    <path d="M0 440 L150 340 L280 400 L400 320 L512 420"
+          fill="none"
+          stroke="#ffffff"
+          stroke-width="2"
+          stroke-opacity="0.3"
+          stroke-linejoin="round"
+          stroke-linecap="round" />
+  </g>
+</svg>

@@ -1,0 +1,88 @@
+[package]
+name = "xl-view"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A minimalist HDR image viewer optimized for large images"
+homepage = "https://github.com/andrinbr/xl-view"
+repository.workspace = true
+publish = false
+default-run = "xl-view"
+
+[workspace]
+members = ["crates/vulkan-hdr-metadata"]
+default-members = ["."]
+resolver = "3"
+
+[workspace.package]
+authors = ["Andrin Brunner"]
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-only"
+repository = "https://github.com/andrinbr/xl-view"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+fontdue = { version = "0.9.3", default-features = false, features = ["std"] }
+half = "2.7.1"
+jxl-grid = "0.6.2"
+jxl-oxide = { version = "0.12.6", default-features = false, features = [
+    "moxcms",
+    "rayon",
+] }
+kamadak-exif = "0.6.1"
+moxcms = "0.8.1"
+pollster = "0.4.0"
+rayon = "1.12"
+resvg = { version = "0.47.0", default-features = false }
+rfd = { version = "0.17.2", default-features = false, features = [
+    "wayland",
+    "xdg-portal",
+] }
+roxmltree = "0.21.1"
+sysinfo = { version = "=0.38.4", default-features = false, features = ["system"] }
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Temporary until drag-and-drop support lands upstream in winit:
+# https://github.com/rust-windowing/winit/pull/4571
+# Keep this pinned to an exact revision; switch back to a crates.io winit release once that PR is
+# merged and released.
+winit = { git = "https://github.com/slint-ui/winit", rev = "65e4f0b07f848212f98aa441f0bb2fa9ee9f39d7", default-features = false, features = [
+    "wayland",
+    "wayland-csd-adwaita",
+    "wayland-dlopen",
+] }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+vulkan-hdr-metadata = { path = "crates/vulkan-hdr-metadata" }
+wgpu = { version = "30.0.0", default-features = false, features = [
+    "parking_lot",
+    "std",
+    "vulkan",
+    "wgsl",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30.0.0", default-features = false, features = [
+    "metal",
+    "parking_lot",
+    "std",
+    "wgsl",
+] }
+
+[dev-dependencies]
+naga = { version = "30.0.0", features = ["wgsl-in"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

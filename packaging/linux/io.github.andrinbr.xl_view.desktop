@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=XL-View
+GenericName=Image Viewer
+Comment=A minimalist HDR image viewer optimized for large images
+Exec=xl-view %f
+Icon=xl-view
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/jxl;
+Keywords=JPEG XL;JXL;HDR;image;viewer;
+StartupNotify=true
+StartupWMClass=io.github.andrinbr.xl_view
