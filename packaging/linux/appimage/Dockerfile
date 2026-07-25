@@ -11,7 +11,7 @@ RUN apt-get update \
         desktop-file-utils \
         file \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --user-group appimage \
+    && useradd --create-home --uid 1000 --user-group appimage \
     && mkdir -p /work \
     && chown appimage:appimage /work
 

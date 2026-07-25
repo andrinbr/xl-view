@@ -28,7 +28,7 @@ From the repository root, run:
 
 ```console
 buildah build --file packaging/linux/appimage/Dockerfile --tag xl-view-appimage .
-podman run --rm --userns=keep-id --volume "$PWD:/work:Z" xl-view-appimage
+podman run --rm --userns=keep-id:uid=1000,gid=1000 --volume "$PWD:/work:Z" xl-view-appimage
 ```
 
 The AppImage is written to `target/appimage/`.

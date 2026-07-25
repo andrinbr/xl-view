@@ -103,7 +103,7 @@ jobs:
         run: buildah build --file packaging/linux/appimage/Dockerfile --tag xl-view-appimage .
 
       - name: Build AppImage
-        run: podman run --rm --userns=keep-id --volume "$GITHUB_WORKSPACE:/work" xl-view-appimage
+        run: podman run --rm --userns=keep-id:uid=1000,gid=1000 --volume "$GITHUB_WORKSPACE:/work" xl-view-appimage
 
       - name: Verify AppImage
         run: target/appimage/xl-view-x86_64.AppImage --appimage-extract-and-run --version
