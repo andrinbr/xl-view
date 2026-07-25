@@ -6,7 +6,7 @@ Run these commands from the repository root.
 
 ```console
 cargo install --locked cargo-deny
-cargo install --locked cargo-about
+cargo install --locked cargo-about --features="cli"
 ```
 
 ## Check dependency licenses

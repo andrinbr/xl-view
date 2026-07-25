@@ -26,3 +26,19 @@ accepted = ["GPL-3.0-only"]
 
 [vulkan-hdr-metadata]
 accepted = ["GPL-3.0-only"]
+
+# Workaround to get a more deterministic output from cargo-about
+# https://github.com/EmbarkStudios/cargo-about/issues/202 
+[rfd.clarify]
+# rfd contains a second LICENSE for vendored window_identifier code.
+# Pin both files because cargo-about's recursive scan can otherwise select
+# either MIT text depending on traversal order.
+license = "MIT"
+
+[[rfd.clarify.files]]
+path = "LICENSE"
+checksum = "65fc947f4bac882a2cd104ef73c246b1b037059df9f2b3a58b7f77f0b9e56071"
+
+[[rfd.clarify.files]]
+path = "src/backend/xdg_desktop_portal/window_identifier/LICENSE"
+checksum = "ae26bc7b1bc91fb8648f6a298decbb1a77090a56c9d04e2c23b8365e5f54acb5"
