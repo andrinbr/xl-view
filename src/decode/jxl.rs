@@ -147,13 +147,13 @@ fn decode_initialized_image(
         .checked_add(estimated_render_scratch_bytes(width, height)?)
         .ok_or(DecodeError::SizeOverflow)?;
     validate_output_memory(required_output_and_scratch_bytes, limits)?;
-    if let Some(available) = maximum_retained_bytes {
-        if required_retained_bytes > available {
-            return Err(DecodeError::PrefetchTooLarge {
-                required: required_retained_bytes,
-                available,
-            });
-        }
+    if let Some(available) = maximum_retained_bytes
+        && required_retained_bytes > available
+    {
+        return Err(DecodeError::PrefetchTooLarge {
+            required: required_retained_bytes,
+            available,
+        });
     }
     let (render, pixel_format, transform) = if associated_alpha {
         if xyb_encoded || grayscale || hdr_type.is_some() {

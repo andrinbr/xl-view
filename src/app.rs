@@ -1023,13 +1023,13 @@ impl ApplicationHandler for Application {
             self.gpu_memory_limit_bytes,
         ) {
             Ok(mut gpu) => {
-                if let Some(image) = self.session.take_decoded_image() {
-                    if let Err(error) = gpu.set_image(&image) {
-                        self.fatal_error = Some(RuntimeError::ImageInstall(error));
-                        self.session.cancel_pending_presentation();
-                        event_loop.exit();
-                        return;
-                    }
+                if let Some(image) = self.session.take_decoded_image()
+                    && let Err(error) = gpu.set_image(&image)
+                {
+                    self.fatal_error = Some(RuntimeError::ImageInstall(error));
+                    self.session.cancel_pending_presentation();
+                    event_loop.exit();
+                    return;
                 }
                 if self.diagnostics {
                     diagnostics::print_report("startup", &gpu.startup_diagnostics_report());

@@ -166,13 +166,13 @@ impl DecodeCoordinator {
                 DecodeQueueDisposition::Coalesced
             }
             Some(JobLocation::Prefetch) => {
-                if let Some(index) = state.prefetch.iter().position(|job| job.key == key) {
-                    if let Some(mut job) = state.prefetch.remove(index) {
-                        job.path = path;
-                        job.purpose = purpose;
-                        state.demand.push_back(job);
-                        state.jobs.insert(key, JobLocation::Demand);
-                    }
+                if let Some(index) = state.prefetch.iter().position(|job| job.key == key)
+                    && let Some(mut job) = state.prefetch.remove(index)
+                {
+                    job.path = path;
+                    job.purpose = purpose;
+                    state.demand.push_back(job);
+                    state.jobs.insert(key, JobLocation::Demand);
                 }
                 DecodeQueueDisposition::Promoted
             }

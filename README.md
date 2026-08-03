@@ -7,7 +7,6 @@
 
   [![CI](https://github.com/andrinbr/xl-view/actions/workflows/ci.yml/badge.svg)](https://github.com/andrinbr/xl-view/actions/workflows/ci.yml)
   ![License](https://img.shields.io/github/license/andrinbr/xl-view)
-  ![Rust](https://img.shields.io/badge/rust-1.88%2B-orange)
   [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=andrinbr_xl-view&metric=coverage)](https://sonarcloud.io/summary/new_code?id=andrinbr_xl-view)
   [![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=andrinbr_xl-view&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=andrinbr_xl-view)
 
@@ -49,8 +48,8 @@ downloaded file and it handles installation and the menu entry.
 
 ### Building from source
 
-XL-View builds with Rust 1.88 or newer (see
-[rust-toolchain.toml](rust-toolchain.toml)). 
+The required Rust compiler is configured in
+[rust-toolchain.toml](rust-toolchain.toml).
 
 ```console
 git clone https://github.com/andrinbr/xl-view.git

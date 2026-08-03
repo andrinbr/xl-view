@@ -1,5 +1,5 @@
-# Source: rust:1.88.0-bookworm
-FROM rust@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0
+# Source: rust:1.97-bookworm
+FROM rust@sha256:77fac8b98f9f46062bb680b6d25d5bcaabfc400143952ebc572e924bcbedc3fa
 
 # Install AppImage build dependencies and prepare the unprivileged build user.
 RUN apt-get update \

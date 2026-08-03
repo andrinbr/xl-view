@@ -970,8 +970,7 @@ impl GpuState {
         let logical_tiles = image
             .store
             .tile_columns()
-            .checked_mul(image.store.tile_rows())
-            .unwrap_or(u32::MAX);
+            .saturating_mul(image.store.tile_rows());
         let desired_capacity = working_set_capacity(
             logical_tiles,
             (self.config.width, self.config.height),
