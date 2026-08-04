@@ -102,8 +102,6 @@ pub(super) fn startup_report(
         }
     )
     .unwrap();
-    #[cfg(target_vendor = "apple")]
-    writeln!(report, "HDR metadata signaling: managed by Metal").unwrap();
     writeln!(report, "HDR metadata state: {hdr_metadata_status}").unwrap();
     if diagnostics_pattern {
         writeln!(report).unwrap();

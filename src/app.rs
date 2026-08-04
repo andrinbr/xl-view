@@ -828,14 +828,15 @@ impl Application {
     }
 
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        self.note_pointer_activity(Instant::now());
         let amount = match delta {
             MouseScrollDelta::LineDelta(_, vertical) => f64::from(vertical) * 0.18,
             MouseScrollDelta::PixelDelta(delta) => delta.y * 0.005,
+            _ => return,
         };
         if let (Some(position), Some(gpu)) = (self.cursor_position, self.gpu.as_mut()) {
             gpu.zoom_at(position, amount.exp());
         }
-        self.note_pointer_activity(Instant::now());
     }
 
     fn handle_primary_pointer_button(&mut self, state: ElementState) {

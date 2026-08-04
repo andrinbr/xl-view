@@ -316,7 +316,6 @@ pub fn initialize(
     install_failure_callbacks(&device, report_failure);
     let size = window.surface_size();
     let config = surface_configuration(candidate, size);
-    let last_hdr_info = surface.display_hdr_info(&adapter);
     let initial_metadata = surface_hdr_metadata(
         candidate,
         rendering_options,
@@ -325,6 +324,7 @@ pub fn initialize(
         0.0,
     );
     let hdr_metadata_status = surface.configure(&config, initial_metadata);
+    let last_hdr_info = surface.display_hdr_info(&adapter);
     let adapter_info = adapter.get_info();
     tracing::info!(
         adapter = %adapter_info.name,
@@ -511,12 +511,9 @@ impl GpuState {
             #[cfg(not(target_vendor = "apple"))]
             SignalStatus::Signaled => "Metadata signaled",
             SignalStatus::NotRequested => "Metadata not requested",
-            #[cfg(not(target_vendor = "apple"))]
             SignalStatus::Unsupported => "Metadata unsupported",
             #[cfg(not(target_vendor = "apple"))]
             SignalStatus::SurfaceUnavailable => "Metadata unavailable",
-            #[cfg(target_vendor = "apple")]
-            SignalStatus::BackendManaged => "Metadata managed by Metal",
         }
     }
 
@@ -1176,15 +1173,9 @@ impl GpuState {
             candidate,
             PhysicalSize::new(self.config.width, self.config.height),
         );
-        let hdr_info = self.surface.display_hdr_info(&self.adapter);
-        let hdr_info_changed = hdr_info != self.last_hdr_info;
-        if hdr_info_changed {
-            tracing::info!(reason, hdr_info = ?hdr_info, "display HDR information changed");
-        }
         let format_changed = candidate.format != self.candidate.format;
         self.candidate = candidate;
         self.hdr_encoding_available = hdr_encoding_available;
-        self.last_hdr_info = hdr_info;
         if format_changed {
             let bindings = self.image.bindings();
             self.presentation.rebuild_pipeline(
@@ -1197,14 +1188,22 @@ impl GpuState {
                 &self.image_sampler,
             );
         }
-        self.update_params();
         let metadata = self.current_hdr_metadata();
-        let submission_lock = Arc::clone(&self.submission_lock);
-        let _submission_guard = submission_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let status = self.surface.configure(&self.config, metadata);
+        let status = {
+            let submission_lock = Arc::clone(&self.submission_lock);
+            let _submission_guard = submission_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.surface.configure(&self.config, metadata)
+        };
         self.set_hdr_metadata_status(status, reason);
+        let hdr_info = self.surface.display_hdr_info(&self.adapter);
+        let hdr_info_changed = hdr_info != self.last_hdr_info;
+        if hdr_info_changed {
+            tracing::info!(reason, hdr_info = ?hdr_info, "display HDR information changed");
+        }
+        self.last_hdr_info = hdr_info;
+        self.update_params();
     }
 
     fn reconfigure(&mut self, reason: &str) -> Result<(), GpuOperationError> {

@@ -7,7 +7,7 @@ pub(super) use vulkan_hdr_metadata::{HdrMetadata, HdrSurface, SignalStatus, requ
 mod apple {
     use std::fmt;
 
-    /// HDR luminance values retained for Metal's backend-managed presentation path.
+    /// HDR luminance values retained for future `CAEDRMetadata` integration.
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct HdrMetadata {
         _mastering_max: f32,
@@ -32,18 +32,18 @@ mod apple {
         }
     }
 
-    /// Result of handing HDR presentation state to the Metal backend.
+    /// Result of attempting to associate HDR metadata with a Metal surface.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum SignalStatus {
         NotRequested,
-        BackendManaged,
+        Unsupported,
     }
 
     impl fmt::Display for SignalStatus {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str(match self {
                 Self::NotRequested => "HDR metadata not requested",
-                Self::BackendManaged => "managed by Metal",
+                Self::Unsupported => "HDR metadata signaling unsupported",
             })
         }
     }
@@ -51,19 +51,18 @@ mod apple {
     #[derive(Debug)]
     pub struct HdrMetadataSignaler {
         device: wgpu::Device,
-        raw_metadata_supported: bool,
+        supported: bool,
     }
 
     impl HdrMetadataSignaler {
         pub const fn is_supported(&self) -> bool {
-            self.raw_metadata_supported
+            self.supported
         }
 
         pub fn bind_surface(self, surface: wgpu::Surface<'_>) -> HdrSurface<'_> {
             HdrSurface {
                 surface,
                 device: self.device,
-                backend_managed: true,
             }
         }
     }
@@ -72,7 +71,6 @@ mod apple {
     pub struct HdrSurface<'window> {
         surface: wgpu::Surface<'window>,
         device: wgpu::Device,
-        backend_managed: bool,
     }
 
     impl<'window> HdrSurface<'window> {
@@ -98,18 +96,18 @@ mod apple {
             metadata: Option<HdrMetadata>,
         ) -> SignalStatus {
             self.surface.configure(&self.device, config);
-            self.metadata_status(metadata)
+            Self::metadata_status(metadata)
         }
 
+        #[allow(clippy::unused_self)] // Mirrors the platform surface interface used by the renderer.
         pub fn set_metadata(&self, metadata: Option<HdrMetadata>) -> SignalStatus {
-            self.metadata_status(metadata)
+            Self::metadata_status(metadata)
         }
 
-        fn metadata_status(&self, metadata: Option<HdrMetadata>) -> SignalStatus {
-            if metadata.is_some() && self.backend_managed {
-                SignalStatus::BackendManaged
-            } else {
-                SignalStatus::NotRequested
+        fn metadata_status(metadata: Option<HdrMetadata>) -> SignalStatus {
+            match metadata {
+                Some(_) => SignalStatus::Unsupported,
+                None => SignalStatus::NotRequested,
             }
         }
     }
@@ -121,7 +119,7 @@ mod apple {
         let (device, queue) = adapter.request_device(descriptor).await?;
         let signaler = HdrMetadataSignaler {
             device: device.clone(),
-            raw_metadata_supported: false,
+            supported: false,
         };
         Ok((device, queue, signaler))
     }

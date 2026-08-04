@@ -46,11 +46,9 @@ sysinfo = { version = "=0.38.4", default-features = false, features = ["system"]
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Temporary until drag-and-drop support lands upstream in winit:
-# https://github.com/rust-windowing/winit/pull/4571
-# Keep this pinned to an exact revision; switch back to a crates.io winit release once that PR is
-# merged and released.
-winit = { git = "https://github.com/slint-ui/winit", rev = "65e4f0b07f848212f98aa441f0bb2fa9ee9f39d7", default-features = false, features = [
+# Temporary until a winit release includes the new drag-and-drop API: https://github.com/rust-windowing/winit/pull/4571
+# Keep upstream master pinned to an exact revision and switch back to a crates.io winit release once the API is released.
+winit = { git = "https://github.com/rust-windowing/winit", rev = "42366231b0d92480a933339bd5eaa7fba8106f42", default-features = false, features = [
     "wayland",
     "wayland-csd-adwaita",
     "wayland-dlopen",
