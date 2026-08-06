@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     tags: ["v*"] # only version tags, e.g. v1.0.0
@@ -12,7 +13,7 @@ permissions:
 
 jobs:
   quality:
-    name: Quality, coverage, and tests
+    name: Quality checks
     runs-on: ubuntu-latest
     env:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
