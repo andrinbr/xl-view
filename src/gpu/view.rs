@@ -104,6 +104,9 @@ impl ViewTransform {
     }
 
     pub fn pan_by(&mut self, delta_x: f64, delta_y: f64) {
+        if !delta_x.is_finite() || !delta_y.is_finite() {
+            return;
+        }
         self.mode = ViewMode::Manual;
         self.center.x -= delta_x / self.scale;
         self.center.y -= delta_y / self.scale;
@@ -222,6 +225,26 @@ mod tests {
         assert_near(view.center().x, 500.0);
         view.pan_by(-10_000.0, 0.0);
         assert_near(view.center().x, 1500.0);
+    }
+
+    #[test]
+    fn non_finite_pan_is_ignored() {
+        let mut view =
+            ViewTransform::fit(PhysicalSize::new(2000, 1000), PhysicalSize::new(1000, 1000));
+        view.set_one_to_one(1.0);
+        let center = view.center();
+        let mode = view.mode;
+
+        for (delta_x, delta_y) in [
+            (f64::NAN, 0.0),
+            (0.0, f64::NAN),
+            (f64::INFINITY, 0.0),
+            (0.0, f64::NEG_INFINITY),
+        ] {
+            view.pan_by(delta_x, delta_y);
+            assert_eq!(view.center(), center);
+            assert_eq!(view.mode, mode);
+        }
     }
 
     #[test]

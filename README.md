@@ -131,12 +131,14 @@ For debug logging, set `RUST_LOG`, e.g.
 | `Esc` | Leave fullscreen |
 | `Q` / `Ctrl+Q` | Quit |
 
-### Mouse
+### Mouse and touchpad
 
 | Input | Action |
 | --- | --- |
 | Left-drag | Pan |
 | Scroll wheel | Zoom in / out |
+| Two-finger scroll | Pan |
+| Pinch | Zoom in / out |
 | Primary double-click | Toggle fullscreen |
 
 ## Supported image formats

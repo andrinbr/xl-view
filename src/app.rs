@@ -829,13 +829,40 @@ impl Application {
 
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
         self.note_pointer_activity(Instant::now());
-        let amount = match delta {
-            MouseScrollDelta::LineDelta(_, vertical) => f64::from(vertical) * 0.18,
-            MouseScrollDelta::PixelDelta(delta) => delta.y * 0.005,
-            _ => return,
-        };
-        if let (Some(position), Some(gpu)) = (self.cursor_position, self.gpu.as_mut()) {
-            gpu.zoom_at(position, amount.exp());
+        match delta {
+            // Winit generally reports discrete mouse wheels in lines and touchpad scrolling in
+            // pixels. Keeping line scrolling as zoom and pixel scrolling as pan avoids treating a
+            // two-finger touchpad pan as zoom. A smooth-scroll mouse that only reports pixels will
+            // pan as well because Winit does not expose the input source here.
+            // see https://github.com/rust-windowing/winit/issues/4315.
+            MouseScrollDelta::LineDelta(_, vertical) => {
+                let amount = f64::from(vertical) * 0.18;
+                if let (Some(position), Some(gpu)) = (self.cursor_position, self.gpu.as_mut()) {
+                    gpu.zoom_at(position, amount.exp());
+                }
+            }
+            MouseScrollDelta::PixelDelta(delta) => {
+                if let Some(gpu) = self.gpu.as_mut() {
+                    gpu.pan_by(delta.x, delta.y);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_pinch_gesture(&mut self, delta: f64) {
+        self.note_pointer_activity(Instant::now());
+        let anchor = self.zoom_anchor();
+        if let (Some(gpu), Some(anchor)) = (self.gpu.as_mut(), anchor) {
+            // Winit reports an additive magnification delta; zoom_at expects a factor.
+            gpu.zoom_at(anchor, 1.0 + delta);
+        }
+    }
+
+    fn handle_pan_gesture(&mut self, delta: PhysicalPosition<f32>) {
+        self.note_pointer_activity(Instant::now());
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.pan_by(f64::from(delta.x), f64::from(delta.y));
         }
     }
 
@@ -1105,6 +1132,8 @@ impl ApplicationHandler for Application {
                 self.handle_pointer_button(state, &button);
             }
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
+            WindowEvent::PinchGesture { delta, .. } => self.handle_pinch_gesture(delta),
+            WindowEvent::PanGesture { delta, .. } => self.handle_pan_gesture(delta),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } => {
                 self.handle_keyboard_input(event_loop, &event);
