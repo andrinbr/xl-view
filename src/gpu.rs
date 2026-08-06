@@ -22,6 +22,14 @@ pub(super) use ui::OverlaySection;
 
 pub(super) type WorkReadyNotifier = Arc<dyn Fn() + Send + Sync>;
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
 pub(super) fn create_fullscreen_render_pipeline(
     device: &wgpu::Device,
     label: &str,

@@ -43,7 +43,7 @@ pub const TILE_SIZE: u32 = 512;
 // levels. More deeply minified views continue sampling the coarse preview.
 pub const TILE_GUTTER: u32 = 8;
 pub const CANONICAL_BYTES_PER_PIXEL: usize = 8;
-const HALF_CONVERSION_CHUNK_SAMPLES: usize = 1024;
+pub const HALF_CONVERSION_CHUNK_SAMPLES: usize = 1024;
 const AUTOMATIC_MEMORY_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 type CanonicalPixel = [u8; CANONICAL_BYTES_PER_PIXEL];
 type CoarsePixel = [f32; 4];

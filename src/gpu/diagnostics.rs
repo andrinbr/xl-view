@@ -60,6 +60,7 @@ pub(super) struct ImageWorkDiagnostics {
     pub(super) tile_hits: u64,
     pub(super) tile_misses: u64,
     pub(super) viewport_resampler: String,
+    pub(super) resampling_scratch_peak_bytes: u64,
     pub(super) gpu_image_budget_bytes: u64,
     pub(super) gpu_memory_limit_bytes: u64,
 }
@@ -167,7 +168,7 @@ pub(super) fn image_finished_report(diagnostics: &ImageWorkDiagnostics) -> Strin
 fn write_image_work_status(
     report: &mut String,
     diagnostics: &ImageWorkDiagnostics,
-    viewport_newline: bool,
+    trailing_newline: bool,
 ) {
     writeln!(
         report,
@@ -175,18 +176,23 @@ fn write_image_work_status(
         diagnostics.tile_cache, diagnostics.tile_hits, diagnostics.tile_misses,
     )
     .unwrap();
-    if viewport_newline {
+    writeln!(
+        report,
+        "  viewport resampling: {}",
+        diagnostics.viewport_resampler
+    )
+    .unwrap();
+    let scratch_mib = bytes_to_mib(diagnostics.resampling_scratch_peak_bytes);
+    if trailing_newline {
         writeln!(
             report,
-            "  viewport resampling: {}",
-            diagnostics.viewport_resampler
+            "  CPU resampling scratch peak: {scratch_mib:.2} MiB"
         )
         .unwrap();
     } else {
         write!(
             report,
-            "  viewport resampling: {}",
-            diagnostics.viewport_resampler
+            "  CPU resampling scratch peak: {scratch_mib:.2} MiB"
         )
         .unwrap();
     }
@@ -338,7 +344,8 @@ mod tests {
                 "  GPU allocator memory: unavailable\n",
                 "  coarse-preview mip levels: 4\n",
                 "  tile cache: 2 of 3 working-set slots resident (hits 8, misses 5)\n",
-                "  viewport resampling: active 800x600",
+                "  viewport resampling: active 800x600\n",
+                "  CPU resampling scratch peak: 0.25 MiB",
             )
         );
 
@@ -347,6 +354,7 @@ mod tests {
             concat!(
                 "  tile cache: 2 of 3 working-set slots resident (hits 8, misses 5)\n",
                 "  viewport resampling: active 800x600\n",
+                "  CPU resampling scratch peak: 0.25 MiB\n",
                 "  GPU image budget estimate: 1.50 MiB of 4.00 MiB",
             )
         );
@@ -358,6 +366,7 @@ mod tests {
             tile_hits: 8,
             tile_misses: 5,
             viewport_resampler: "active 800x600".to_owned(),
+            resampling_scratch_peak_bytes: MIB / 4,
             gpu_image_budget_bytes: MIB / 2 * 3,
             gpu_memory_limit_bytes: 4 * MIB,
         }

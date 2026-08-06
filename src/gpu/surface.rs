@@ -841,7 +841,10 @@ impl GpuState {
             return Ok(());
         };
         let mut visual_change = image.bindings.tile_cache.process_completions(&self.queue)?;
-        let resampled_view_changed = image.bindings.viewport_resampler.process_completions();
+        let resampled_view_changed = image
+            .bindings
+            .viewport_resampler
+            .process_completions(&self.device);
         if resampled_view_changed {
             self.rebuild_image_bind_group();
             debug_assert!(self.image_gpu_budget_bytes() <= self.gpu_memory_limit_bytes);
@@ -1120,6 +1123,7 @@ impl GpuState {
             tile_hits: bindings.tile_cache.hits,
             tile_misses: bindings.tile_cache.misses,
             viewport_resampler: bindings.viewport_resampler.status(),
+            resampling_scratch_peak_bytes: bindings.viewport_resampler.scratch_peak_bytes(),
             gpu_image_budget_bytes: self.image_gpu_budget_bytes(),
             gpu_memory_limit_bytes: self.gpu_memory_limit_bytes,
         }

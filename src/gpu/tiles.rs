@@ -7,10 +7,10 @@ use std::thread::JoinHandle;
 use wgpu::TextureFormat;
 use wgpu::util::DeviceExt;
 
-use super::WorkReadyNotifier;
 use super::mip::{LinearMipGenerator, mip_level_count, rgba16f_texture_budget_bytes};
 use super::upload::TextureUploadLayout;
 use super::view::ViewTransform;
+use super::{WorkReadyNotifier, panic_payload_message};
 use crate::units::usize_from_u32;
 use xl_view::decode::{DecodedTileStore, TILE_GUTTER, TILE_SIZE};
 
@@ -147,8 +147,13 @@ impl Drop for TileWorker {
             state.pending.clear();
             wake.notify_one();
         }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && let Err(payload) = thread.join()
+        {
+            tracing::error!(
+                panic = panic_payload_message(payload.as_ref()),
+                "tile-cache worker panicked"
+            );
         }
     }
 }
