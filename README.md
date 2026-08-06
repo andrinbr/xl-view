@@ -19,15 +19,15 @@ available, targets JPEG XL, and handles large images such as panoramas.
 
 ## Features
 
-- **HDR presentation** via PQ, HLG, scRGB, and SDR outputs
-- **Compositor-managed color** that preserves HDR range for final display mapping
-- **Large image support** with asynchronous decoding and smooth image panning
-- **Lanczos2 resampling** of the visible region for sharp views
-- **Image cache** with folder-neighbor prefetch for fast navigation
-- **EXIF metadata overlay**
-- **Exposure adjustment** for inspecting highlights and shadows
-- **Selectable backgrounds** to help with image inspection
-- **Diagnostics mode** with an HDR test pattern and runtime reporting
+- **HDR output:** view images in PQ, HLG, scRGB, or SDR, selecting the closest display mode automatically
+- **Accurate color:** preserve the image's full HDR range for the compositor to map to the display
+- **Responsive large-image viewing:** open panoramas and other large images without blocking the UI, with smooth panning
+- **Sharp scaling:** high-quality resampling for a detailed view
+- **Image cache and preloading:** keep recent images in memory and preload adjacent files for faster browsing
+- **Metadata overlay:** inspect image, output, and EXIF details without leaving the viewer
+- **Exposure adjustment:** brighten or darken an image to inspect highlights and shadows
+- **Selectable backgrounds:** assess contrast, edges, and transparency on different backgrounds
+- **Display diagnostics:** show a test pattern and runtime/display information
 
 ## Installation
 
