@@ -218,6 +218,8 @@ fn output_transform(canonical: vec4f, ui: vec4f, position: vec2u) -> vec3f {
                 if params.encode_srgb == 1u { return encoded; }
                 return srgb_eotf(encoded);
             }
+            // Keep metadata fixed so exposure moves pixels through the curve
+            // instead of renormalizing its input range.
             let bt709 = BT2020_TO_BT709 * mapped_bt2020_nits(
                 working,
                 params.hdr_reference_white_nits,
@@ -225,7 +227,13 @@ fn output_transform(canonical: vec4f, ui: vec4f, position: vec2u) -> vec3f {
                 params.output_peak_nits,
                 params.source_dynamic_range,
             );
-            let image_nits = gamut_map(bt709, luma_bt709(bt709), params.output_peak_nits);
+            // Resolve gamut once in destination primaries; channel clipping
+            // avoids adding neutral components to saturated highlights.
+            let image_nits = clamp(
+                bt709,
+                vec3f(0.0),
+                vec3f(params.output_peak_nits),
+            );
             let linear = clamp(
                 image_nits * (1.0 - ui_alpha) + ui_linear_bt709 * params.ui_white_nits,
                 vec3f(0.0), vec3f(params.output_peak_nits),

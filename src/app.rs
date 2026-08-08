@@ -362,14 +362,9 @@ impl Application {
         let title = if let Some(message) = self.session.status_message() {
             format!("{APPLICATION_NAME} - {message}")
         } else if let Some(image) = self.session.loaded_image() {
-            if image.hdr_source
-                && self
-                    .gpu
-                    .as_ref()
-                    .is_some_and(gpu::GpuState::hdr_encoding_unavailable)
-            {
+            if image.hdr_source && self.gpu.as_ref().is_some_and(|gpu| !gpu.is_hdr_surface()) {
                 format!(
-                    "{APPLICATION_NAME} - {} - {}x{} - HDR source tone-mapped to SDR",
+                    "{APPLICATION_NAME} - {} - {}x{} - HDR image shown in standard range",
                     image.file_name, image.dimensions.0, image.dimensions.1
                 )
             } else {

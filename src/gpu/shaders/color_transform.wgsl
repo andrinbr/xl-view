@@ -19,14 +19,43 @@ fn srgb_eotf(encoded: vec3f) -> vec3f {
 }
 
 // SMPTE ST 2084 inverse EOTF, with luminance normalized to 10,000 nits.
-fn pq_oetf(normalized_luminance: vec3f) -> vec3f {
+fn pq_oetf_scalar(normalized_luminance: f32) -> f32 {
     let m1 = 0.1593017578125;
     let m2 = 78.84375;
     let c1 = 0.8359375;
     let c2 = 18.8515625;
     let c3 = 18.6875;
-    let powered = pow(max(normalized_luminance, vec3f(0.0)), vec3f(m1));
-    return pow((c1 + c2 * powered) / (1.0 + c3 * powered), vec3f(m2));
+    let powered = pow(max(normalized_luminance, 0.0), m1);
+    return pow((c1 + c2 * powered) / (1.0 + c3 * powered), m2);
+}
+
+fn pq_oetf(normalized_luminance: vec3f) -> vec3f {
+    return vec3f(
+        pq_oetf_scalar(normalized_luminance.x),
+        pq_oetf_scalar(normalized_luminance.y),
+        pq_oetf_scalar(normalized_luminance.z),
+    );
+}
+
+// SMPTE ST 2084 EOTF, returning luminance normalized to 10,000 nits.
+fn pq_eotf_scalar(encoded: f32) -> f32 {
+    let m1 = 0.1593017578125;
+    let m2 = 78.84375;
+    let c1 = 0.8359375;
+    let c2 = 18.8515625;
+    let c3 = 18.6875;
+    let powered = pow(max(encoded, 0.0), 1.0 / m2);
+    let numerator = max(powered - c1, 0.0);
+    let denominator = max(c2 - c3 * powered, 1.175494e-38);
+    return pow(numerator / denominator, 1.0 / m1);
+}
+
+fn pq_eotf(encoded: vec3f) -> vec3f {
+    return vec3f(
+        pq_eotf_scalar(encoded.x),
+        pq_eotf_scalar(encoded.y),
+        pq_eotf_scalar(encoded.z),
+    );
 }
 
 fn hlg_oetf(scene_linear: vec3f) -> vec3f {
@@ -64,6 +93,31 @@ const BT709_TO_BT2020 = mat3x3f(
     vec3f(0.0433131, 0.0113623, 0.8955953),
 );
 
+// PQ-based BT.2100-3 ICtCp matrices. PQ gives the absolute-nits working space
+// a fixed perceptual intensity axis for both PQ and HLG sources; an HLG-based
+// intermediate would require choosing a display peak and system gamma.
+// LMS_P denotes PQ-encoded LMS.
+const BT2020_TO_LMS = mat3x3f(
+    vec3f(1688.0, 683.0, 99.0) / 4096.0,
+    vec3f(2146.0, 2951.0, 309.0) / 4096.0,
+    vec3f(262.0, 462.0, 3688.0) / 4096.0,
+);
+const LMS_TO_BT2020 = mat3x3f(
+    vec3f(3.4366067, -0.7913296, -0.0259499),
+    vec3f(-2.5064521, 1.9836005, -0.0989137),
+    vec3f(0.0698454, -0.1922709, 1.1248636),
+);
+const LMS_P_TO_ICTCP = mat3x3f(
+    vec3f(2048.0, 6610.0, 17933.0) / 4096.0,
+    vec3f(2048.0, -13613.0, -17390.0) / 4096.0,
+    vec3f(0.0, 7003.0, -543.0) / 4096.0,
+);
+const ICTCP_TO_LMS_P = mat3x3f(
+    vec3f(1.0, 1.0, 1.0),
+    vec3f(0.0086090, -0.0086090, 0.5600313),
+    vec3f(0.1110296, -0.1110296, -0.3206272),
+);
+
 fn luma_bt2020(rgb: vec3f) -> f32 {
     return dot(rgb, vec3f(0.2627, 0.6780, 0.0593));
 }
@@ -85,19 +139,42 @@ fn hlg_input_to_canonical(
     return scene * ootf * (source_peak_nits / hdr_reference_white_nits);
 }
 
+// The caller bypasses tone mapping when the source already fits the output.
 fn tone_map_luminance(
     luminance: f32,
-    hdr_reference_white_nits: f32,
+    reference_white_nits: f32,
     source_peak_nits: f32,
     display_peak_nits: f32,
 ) -> f32 {
-    let white = min(hdr_reference_white_nits, display_peak_nits * 0.75);
-    if luminance <= white || source_peak_nits <= display_peak_nits {
-        return min(luminance, display_peak_nits);
-    }
-    let headroom = max(display_peak_nits - white, 1e-20);
-    let highlight = luminance - white;
-    return white + highlight / (1.0 + highlight / headroom);
+    let reference_white = min(reference_white_nits, display_peak_nits);
+    let input_range = source_peak_nits / reference_white;
+    let output_range = display_peak_nits / reference_white;
+    let coefficient = (output_range * (1.0 + input_range) - input_range)
+        / (input_range * input_range);
+    let relative = luminance / reference_white;
+    let mapped = relative * (1.0 + relative * coefficient) / (1.0 + relative);
+    return clamp(mapped * reference_white, 0.0, display_peak_nits);
+}
+
+fn tone_map_bt2020_ictcp(
+    rgb_nits: vec3f,
+    reference_white_nits: f32,
+    source_peak_nits: f32,
+    display_peak_nits: f32,
+) -> vec3f {
+    if source_peak_nits <= display_peak_nits { return rgb_nits; }
+    let lms_p = pq_oetf(max(BT2020_TO_LMS * rgb_nits, vec3f(0.0)) / 10000.0);
+    var ictcp = LMS_P_TO_ICTCP * lms_p;
+    let intensity_nits = pq_eotf_scalar(max(ictcp.x, 0.0)) * 10000.0;
+    let mapped_intensity = tone_map_luminance(
+        intensity_nits,
+        reference_white_nits,
+        source_peak_nits,
+        display_peak_nits,
+    );
+    ictcp.x = pq_oetf_scalar(mapped_intensity / 10000.0);
+    let mapped_lms = pq_eotf(max(ICTCP_TO_LMS_P * ictcp, vec3f(0.0))) * 10000.0;
+    return LMS_TO_BT2020 * mapped_lms;
 }
 
 // Hue-preserving destination-gamut mapping along the line from equal-luminance
@@ -137,15 +214,10 @@ fn mapped_bt2020_nits(
     if source_dynamic_range == 0u {
         return gamut_map(nits, luma_bt2020(nits), display_peak_nits);
     }
-    let luminance = luma_bt2020(nits);
-    var scaled = vec3f(0.0);
-    if luminance > 0.0 {
-        scaled = nits * (tone_map_luminance(
-            luminance,
-            hdr_reference_white_nits,
-            source_peak_nits,
-            display_peak_nits,
-        ) / luminance);
-    }
-    return gamut_map(scaled, luma_bt2020(scaled), display_peak_nits);
+    return tone_map_bt2020_ictcp(
+        nits,
+        hdr_reference_white_nits,
+        source_peak_nits,
+        display_peak_nits,
+    );
 }

@@ -17,26 +17,6 @@ fn capability(
 }
 
 #[test]
-fn hdr_candidate_detection_requires_a_usable_encoding() {
-    let unusable = [
-        capability(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
-        capability(TextureFormat::Rgba8Unorm, SurfaceColorSpaces::BT2100_PQ),
-    ];
-    assert!(!has_hdr_encoding_candidate(&unusable));
-
-    for candidate in [
-        capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_PQ),
-        capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_HLG),
-        capability(
-            TextureFormat::Rgba16Float,
-            SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
-        ),
-    ] {
-        assert!(has_hdr_encoding_candidate(&[candidate]));
-    }
-}
-
-#[test]
 fn pq_ten_bit_beats_advertised_eight_bit_and_other_color_spaces() {
     let capabilities = [
         capability(TextureFormat::Rgba8Unorm, SurfaceColorSpaces::BT2100_PQ),
@@ -248,7 +228,7 @@ fn automatic_output_reports_a_distinct_missing_surface_pair() {
 }
 
 #[test]
-fn hdr_peaks_are_container_defined_and_sdr_uses_reported_white() {
+fn hdr_peaks_are_container_defined_and_sdr_uses_fixed_reference_white() {
     let reported = wgpu::DisplayHdrInfo {
         luminance: Some(wgpu::DisplayLuminance {
             max_nits: Some(1_500.0),
@@ -258,33 +238,41 @@ fn hdr_peaks_are_container_defined_and_sdr_uses_reported_white() {
         ..Default::default()
     };
     assert_eq!(
-        resolved_output_peak_nits(SurfaceColorSpace::Bt2100Pq, &reported).to_bits(),
+        resolved_output_peak_nits(SurfaceColorSpace::Bt2100Pq).to_bits(),
         PQ_ENCODING_PEAK_NITS.to_bits(),
     );
     assert_eq!(
-        resolved_output_peak_nits(SurfaceColorSpace::Bt2100Hlg, &reported).to_bits(),
+        resolved_output_peak_nits(SurfaceColorSpace::Bt2100Hlg).to_bits(),
         HLG_ENCODING_PEAK_NITS.to_bits(),
     );
     assert_eq!(
-        resolved_output_peak_nits(SurfaceColorSpace::ExtendedSrgbLinear, &reported).to_bits(),
+        resolved_output_peak_nits(SurfaceColorSpace::ExtendedSrgbLinear).to_bits(),
         EXTENDED_LINEAR_FALLBACK_PEAK_NITS.to_bits(),
     );
     assert_eq!(
-        resolved_output_peak_nits(SurfaceColorSpace::Srgb, &reported).to_bits(),
-        180.0_f32.to_bits(),
+        resolved_output_peak_nits(SurfaceColorSpace::Srgb).to_bits(),
+        HDR_REFERENCE_WHITE_NITS.to_bits(),
     );
     assert_eq!(
-        resolved_ui_white_nits(&reported).to_bits(),
+        resolved_ui_white_nits(SurfaceColorSpace::Srgb, &reported).to_bits(),
+        HDR_REFERENCE_WHITE_NITS.to_bits()
+    );
+    assert_eq!(
+        resolved_ui_white_nits(SurfaceColorSpace::DisplayP3, &reported).to_bits(),
+        HDR_REFERENCE_WHITE_NITS.to_bits()
+    );
+    assert_eq!(
+        resolved_ui_white_nits(SurfaceColorSpace::Bt2100Pq, &reported).to_bits(),
         180.0_f32.to_bits()
     );
 
     let unknown = wgpu::DisplayHdrInfo::default();
     assert_eq!(
-        resolved_output_peak_nits(SurfaceColorSpace::Srgb, &unknown).to_bits(),
+        resolved_output_peak_nits(SurfaceColorSpace::Srgb).to_bits(),
         HDR_REFERENCE_WHITE_NITS.to_bits(),
     );
     assert_eq!(
-        resolved_ui_white_nits(&unknown).to_bits(),
+        resolved_ui_white_nits(SurfaceColorSpace::Bt2100Pq, &unknown).to_bits(),
         HDR_REFERENCE_WHITE_NITS.to_bits()
     );
 }

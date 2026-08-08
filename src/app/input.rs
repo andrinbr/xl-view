@@ -94,6 +94,12 @@ impl FullscreenState {
 pub(super) fn image_cursor(has_image: bool, is_dragging: bool) -> CursorIcon {
     match (has_image, is_dragging) {
         (true, true) => CursorIcon::Grabbing,
+        // Win32 has no predefined open/closed-hand cursors. Winit consequently
+        // maps Grab to IDC_SIZEALL, so keep the normal arrow at rest.
+        // https://github.com/rust-windowing/winit/issues/1043
+        #[cfg(target_os = "windows")]
+        (true, false) => CursorIcon::Default,
+        #[cfg(not(target_os = "windows"))]
         (true, false) => CursorIcon::Grab,
         (false, _) => CursorIcon::Default,
     }

@@ -16,6 +16,43 @@ pub const HDR_REFERENCE_WHITE_NITS: f32 = 203.0;
 const BT2020_LUMA: [f64; 3] = [0.2627, 0.6780, 0.0593];
 const BT709_LUMA: [f64; 3] = [0.2126, 0.7152, 0.0722];
 
+// PQ-based BT.2100-3 ICtCp matrices. PQ gives the absolute-nits working space
+// a fixed perceptual intensity axis for both PQ and HLG sources; an HLG-based
+// intermediate would require choosing a display peak and system gamma.
+// LMS_P denotes PQ-encoded LMS.
+const BT2020_TO_LMS: [[f64; 3]; 3] = [
+    [1_688.0 / 4_096.0, 2_146.0 / 4_096.0, 262.0 / 4_096.0],
+    [683.0 / 4_096.0, 2_951.0 / 4_096.0, 462.0 / 4_096.0],
+    [99.0 / 4_096.0, 309.0 / 4_096.0, 3_688.0 / 4_096.0],
+];
+const LMS_TO_BT2020: [[f64; 3]; 3] = [
+    [
+        3.436_606_694_333_078_4,
+        -2.506_452_118_656_27,
+        0.069_845_424_323_191_48,
+    ],
+    [
+        -0.791_329_555_598_928_7,
+        1.983_600_451_792_290_7,
+        -0.192_270_896_193_362,
+    ],
+    [
+        -0.025_949_899_690_592_672,
+        -0.098_913_714_711_726_44,
+        1.124_863_614_402_319_2,
+    ],
+];
+const LMS_P_TO_ICTCP: [[f64; 3]; 3] = [
+    [2_048.0 / 4_096.0, 2_048.0 / 4_096.0, 0.0],
+    [6_610.0 / 4_096.0, -13_613.0 / 4_096.0, 7_003.0 / 4_096.0],
+    [17_933.0 / 4_096.0, -17_390.0 / 4_096.0, -543.0 / 4_096.0],
+];
+const ICTCP_TO_LMS_P: [[f64; 3]; 3] = [
+    [1.0, 0.008_609_037_037_932_756, 0.111_029_625_003_025_96],
+    [1.0, -0.008_609_037_037_932_756, -0.111_029_625_003_025_96],
+    [1.0, 0.560_031_335_710_679_1, -0.320_627_174_987_318_85],
+];
+
 /// Linear BT.709/sRGB to CIE XYZ (D65), with matrix rows stored in order.
 pub const BT709_TO_XYZ_D65: [[f64; 3]; 3] = [
     [
@@ -224,11 +261,7 @@ impl OutputTransform {
     /// Transforms one straight-alpha canonical working-space pixel.
     #[must_use]
     pub fn transform(self, rgba: [f64; 4]) -> [f64; 4] {
-        let exposure = if self.exposure_stops.is_finite() {
-            (self.exposure_stops * LN_2).exp()
-        } else {
-            1.0
-        };
+        let exposure = exposure_scale(self.exposure_stops);
         let working = [rgba[0], rgba[1], rgba[2]]
             .map(sanitize)
             .map(|channel| channel * exposure);
@@ -254,20 +287,11 @@ impl OutputTransform {
         }
         let reference_white = f64::from(HDR_REFERENCE_WHITE_NITS);
         let nits = working.map(|channel| channel * reference_white);
+        // Keep metadata fixed so exposure moves pixels through the curve
+        // instead of renormalizing its input range.
         let source_peak = self.source_intensity_target.nits();
         let output_peak = self.output_peak.nits();
-        // Reserve a shoulder when HDR reference white reaches the destination
-        // ceiling (common for SDR), while leaving it intact on HDR outputs.
-        let source_white = reference_white.min(output_peak * 0.75);
-        let luminance = dot(nits, BT2020_LUMA);
-        let mapped_luminance =
-            tone_map_luminance(luminance, source_white, source_peak, output_peak);
-        let scaled = if luminance > 0.0 {
-            nits.map(|channel| channel * mapped_luminance / luminance)
-        } else {
-            [0.0; 3]
-        };
-        gamut_map_rgb(scaled, BT2020_LUMA, Some(output_peak))
+        tone_map_bt2020_ictcp(nits, reference_white, source_peak, output_peak)
     }
 
     #[allow(clippy::cast_possible_truncation)] // The presentation shader and surface use f32.
@@ -308,8 +332,9 @@ impl OutputTransform {
         }
         let bt2020 = self.mapped_bt2020_nits(working);
         let bt709 = multiply(BT2020_TO_BT709, bt2020);
-        gamut_map_rgb(bt709, BT709_LUMA, Some(self.output_peak.nits()))
-            .map(|nits| (nits / self.output_peak.nits()).clamp(0.0, 1.0))
+        // Resolve gamut once in destination primaries; channel clipping avoids
+        // adding neutral components to saturated highlights.
+        bt709.map(|nits| (nits / self.output_peak.nits()).clamp(0.0, 1.0))
     }
 }
 
@@ -421,14 +446,70 @@ pub fn dither_unorm(value: f64, x: u32, y: u32, channel: u32, bits: u8) -> f64 {
     (sanitize(value) + (first - second) / levels).clamp(0.0, 1.0)
 }
 
-fn tone_map_luminance(luminance: f64, white: f64, source_peak: f64, output_peak: f64) -> f64 {
+// The caller bypasses tone mapping when the source already fits the output.
+fn tone_map_luminance(
+    luminance: f64,
+    reference_white: f64,
+    source_peak: f64,
+    output_peak: f64,
+) -> f64 {
     let luminance = sanitize(luminance);
-    if luminance <= white || source_peak <= output_peak {
-        return luminance.min(output_peak);
+    let reference_white = reference_white.min(output_peak);
+    let input_range = source_peak / reference_white;
+    let output_range = output_peak / reference_white;
+    let coefficient = (output_range * (1.0 + input_range) - input_range) / input_range.powi(2);
+    let relative = luminance / reference_white;
+    let mapped = relative * (1.0 + relative * coefficient) / (1.0 + relative);
+    (mapped * reference_white).clamp(0.0, output_peak)
+}
+
+fn bt2020_nits_to_ictcp(rgb: [f64; 3]) -> [f64; 3] {
+    let lms_p =
+        multiply(BT2020_TO_LMS, rgb).map(|channel| pq_oetf_f64(channel.max(0.0) / 10_000.0));
+    multiply(LMS_P_TO_ICTCP, lms_p)
+}
+
+fn ictcp_to_bt2020_nits(ictcp: [f64; 3]) -> [f64; 3] {
+    let lms =
+        multiply(ICTCP_TO_LMS_P, ictcp).map(|channel| pq_eotf_f64(channel.max(0.0)) * 10_000.0);
+    multiply(LMS_TO_BT2020, lms)
+}
+
+fn tone_map_bt2020_ictcp(
+    rgb_nits: [f64; 3],
+    reference_white: f64,
+    source_peak: f64,
+    output_peak: f64,
+) -> [f64; 3] {
+    if source_peak <= output_peak {
+        return rgb_nits;
     }
-    let headroom = (output_peak - white).max(f64::MIN_POSITIVE);
-    let highlight = luminance - white;
-    white + highlight / (1.0 + highlight / headroom)
+    let mut ictcp = bt2020_nits_to_ictcp(rgb_nits);
+    let intensity_nits = pq_eotf_f64(ictcp[0].max(0.0)) * 10_000.0;
+    let mapped_intensity =
+        tone_map_luminance(intensity_nits, reference_white, source_peak, output_peak);
+    ictcp[0] = pq_oetf_f64(mapped_intensity / 10_000.0);
+    ictcp_to_bt2020_nits(ictcp)
+}
+
+fn pq_eotf_f64(encoded: f64) -> f64 {
+    let m1 = f64::from(PQ_M1);
+    let m2 = f64::from(PQ_M2);
+    let c1 = f64::from(PQ_C1);
+    let c2 = f64::from(PQ_C2);
+    let c3 = f64::from(PQ_C3);
+    let power = encoded.max(0.0).powf(m2.recip());
+    ((power - c1).max(0.0) / (c2 - c3 * power).max(f64::MIN_POSITIVE)).powf(m1.recip())
+}
+
+fn pq_oetf_f64(normalized_luminance: f64) -> f64 {
+    let m1 = f64::from(PQ_M1);
+    let m2 = f64::from(PQ_M2);
+    let c1 = f64::from(PQ_C1);
+    let c2 = f64::from(PQ_C2);
+    let c3 = f64::from(PQ_C3);
+    let power = normalized_luminance.max(0.0).powf(m1);
+    ((c1 + c2 * power) / (1.0 + c3 * power)).powf(m2)
 }
 
 // Hue-preserving destination-gamut mapping: move along the line from the
@@ -460,6 +541,14 @@ fn sanitize(value: f64) -> f64 {
         value.max(0.0)
     } else {
         0.0
+    }
+}
+
+fn exposure_scale(stops: f64) -> f64 {
+    if stops.is_finite() {
+        (stops * LN_2).exp()
+    } else {
+        1.0
     }
 }
 
@@ -584,6 +673,84 @@ mod tests {
     }
 
     #[test]
+    fn ictcp_matrices_round_trip_bt2020_and_preserve_neutral_intensity() {
+        for rgb in [
+            [0.0; 3],
+            [203.0; 3],
+            [1_000.0, 250.0, 40.0],
+            [50.0, 600.0, 120.0],
+        ] {
+            let ictcp = bt2020_nits_to_ictcp(rgb);
+            let round_trip = ictcp_to_bt2020_nits(ictcp);
+            for index in 0..3 {
+                assert_near(round_trip[index], rgb[index], 2.0e-6);
+            }
+        }
+
+        let neutral = bt2020_nits_to_ictcp([203.0; 3]);
+        assert_near(neutral[0], pq_oetf_f64(203.0 / 10_000.0), 2.0e-12);
+        assert_near(neutral[1], 0.0, 2.0e-7);
+        assert_near(neutral[2], 0.0, 2.0e-7);
+    }
+
+    #[test]
+    fn modified_reinhard_curve_is_smooth_and_hits_declared_endpoints() {
+        let reference = 203.0;
+        let source_peak = 1_000.0;
+        let output_peak = 203.0;
+        assert_near(
+            tone_map_luminance(0.0, reference, source_peak, output_peak),
+            0.0,
+            EPSILON,
+        );
+        assert_near(
+            tone_map_luminance(source_peak, reference, source_peak, output_peak),
+            output_peak,
+            EPSILON,
+        );
+
+        let mut previous = -1.0;
+        for input in 0..=1_000 {
+            let mapped = tone_map_luminance(f64::from(input), reference, source_peak, output_peak);
+            assert!(mapped >= previous);
+            assert!(mapped <= output_peak);
+            previous = mapped;
+        }
+        assert_near(
+            tone_map_luminance(reference, reference, source_peak, output_peak),
+            105.682_713_5,
+            1.0e-10,
+        );
+    }
+
+    #[test]
+    fn ictcp_tone_mapping_retains_perceptual_chroma_components() {
+        let source = [1_000.0, 250.0, 40.0];
+        let before = bt2020_nits_to_ictcp(source);
+        let mapped = tone_map_bt2020_ictcp(source, 203.0, 1_000.0, 203.0);
+        let after = bt2020_nits_to_ictcp(mapped);
+        assert_near(after[1], before[1], 2.0e-6);
+        assert_near(after[2], before[2], 2.0e-6);
+        assert!(after[0] < before[0]);
+    }
+
+    #[test]
+    fn hdr_to_sdr_clips_final_channels_without_adding_neutral() {
+        let transform = transform(OutputEncoding::SdrSrgbHardware, 1_000.0, 203.0);
+        let peak = 1_000.0 / 203.0;
+        for (input, expected) in [
+            ([peak, 0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]),
+            ([0.0, peak, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]),
+            ([0.0, 0.0, peak, 1.0], [0.0, 0.0, 1.0, 1.0]),
+        ] {
+            let output = transform.transform(input);
+            for index in 0..4 {
+                assert_near(output[index], expected[index], EPSILON);
+            }
+        }
+    }
+
+    #[test]
     fn source_peak_only_drives_sdr_mapping_and_hlg_uses_its_container_peak() {
         assert_near(hlg_system_gamma(1_000.0), 1.2, f64::from(f32::EPSILON));
         assert!(hlg_system_gamma(2_000.0) > hlg_system_gamma(1_000.0));
@@ -643,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn tone_mapping_is_monotonic_rolls_highlights_and_bounds_sdr() {
+    fn tone_mapping_is_monotonic_rolls_highlights_and_reaches_sdr_peak() {
         let transform = transform(OutputEncoding::SdrSrgbHardware, 4_000.0, 203.0);
         let mut previous = -1.0;
         for step in 0..=4_000 {
@@ -654,11 +821,11 @@ mod tests {
             previous = output;
         }
         assert!(transform.transform([1_000.0 / 203.0; 4])[0] < 1.0);
-        assert!(transform.transform([4_000.0 / 203.0; 4])[0] < 1.0);
+        assert_near(transform.transform([4_000.0 / 203.0; 4])[0], 1.0, 2.0e-6);
     }
 
     #[test]
-    fn exposure_precedes_tone_mapping() {
+    fn exposure_moves_pixels_through_a_fixed_tone_curve() {
         let base = transform(OutputEncoding::SdrSrgbHardware, 4_000.0, 203.0);
         let exposed = OutputTransform {
             exposure_stops: 1.0,
@@ -669,6 +836,15 @@ mod tests {
             base.transform([0.5, 0.5, 0.5, 1.0])[0],
             EPSILON,
         );
+
+        let peak = transform(OutputEncoding::SdrSrgbHardware, 1_000.0, 203.0);
+        let lowered = OutputTransform {
+            exposure_stops: -1.0,
+            ..peak
+        };
+        let source_white = [1_000.0 / 203.0; 4];
+        assert_near(peak.transform(source_white)[0], 1.0, 2.0e-6);
+        assert!(lowered.transform(source_white)[0] < 1.0);
     }
 
     #[test]

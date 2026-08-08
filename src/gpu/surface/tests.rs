@@ -522,6 +522,7 @@ fn tiled_shader_matches_continuous_sampling_across_boundaries() {
             TextureFormat::Rgba16Float,
             1_000.0,
             BackgroundMode::Black,
+            0.0,
             SourceDynamicRange::Sdr,
             Some(&fixture),
             None,
@@ -537,6 +538,7 @@ fn tiled_shader_matches_continuous_sampling_across_boundaries() {
             TextureFormat::Rgba16Float,
             1_000.0,
             BackgroundMode::Black,
+            0.0,
             SourceDynamicRange::Sdr,
             None,
             None,
@@ -683,6 +685,14 @@ impl OffscreenTestGpu {
     }
 
     fn render(&self, request: OffscreenRenderRequest<'_>) -> Vec<[f32; 4]> {
+        self.render_with_exposure(request, 0.0)
+    }
+
+    fn render_with_exposure(
+        &self,
+        request: OffscreenRenderRequest<'_>,
+        exposure_stops: f32,
+    ) -> Vec<[f32; 4]> {
         let has_image = request.canonical_pixels.is_some() || request.tiled_resources.is_some();
         render_offscreen_scene(
             &self.device,
@@ -691,6 +701,7 @@ impl OffscreenTestGpu {
             request.format,
             request.peak_nits,
             request.background,
+            exposure_stops,
             request.source_dynamic_range,
             request.canonical_pixels,
             request.ui_pixel,
@@ -715,6 +726,8 @@ fn offscreen_shader_pixels_match_cpu_reference() {
 
     assert_tiled_sampling_matches_canonical(&gpu);
     assert_output_transforms_match_reference(&gpu, &luminance_fixture);
+    assert_exposure_matches_reference(&gpu, &luminance_fixture);
+    assert_hdr_color_mapping_matches_reference(&gpu);
     assert_sdr_attachment_paths_agree(&gpu, &luminance_fixture);
     assert_hlg_pattern_round_trips(&gpu);
     assert_alpha_compositing_matches_reference(&gpu);
@@ -853,6 +866,94 @@ fn assert_output_transforms_match_reference(gpu: &OffscreenTestGpu, fixture: &[f
                 case.tolerance,
             );
         }
+    }
+}
+
+fn assert_exposure_matches_reference(gpu: &OffscreenTestGpu, fixture: &[f32]) {
+    let case = OffscreenOutputCase {
+        color_space: SurfaceColorSpace::Srgb,
+        format: TextureFormat::Rgba8Unorm,
+        encoding: OutputEncoding::SdrSrgbExplicit,
+        peak_nits: HDR_REFERENCE_WHITE_NITS,
+        tolerance: 2.0 / 255.0,
+    };
+    let exposure_stops = -1.0;
+    let actual = gpu.render_with_exposure(
+        OffscreenRenderRequest {
+            color_space: case.color_space,
+            format: case.format,
+            peak_nits: case.peak_nits,
+            background: BackgroundMode::Black,
+            source_dynamic_range: SourceDynamicRange::Hlg,
+            canonical_pixels: Some(fixture),
+            ui_pixel: None,
+            tiled_resources: None,
+        },
+        exposure_stops,
+    );
+    let reference = OutputTransform {
+        exposure_stops: f64::from(exposure_stops),
+        ..output_reference(case, SourceDynamicRange::Hlg, 1_000.0)
+    };
+    for (index, nits) in PATCH_NITS.map(f64::from).into_iter().enumerate() {
+        let working = nits / f64::from(HDR_REFERENCE_WHITE_NITS);
+        assert_rgba_close(
+            &format!("exposure {exposure_stops:+.1}, patch {nits}"),
+            &actual[index],
+            reference.transform([working, working, working, 1.0]),
+            case.tolerance,
+        );
+    }
+}
+
+fn assert_hdr_color_mapping_matches_reference(gpu: &OffscreenTestGpu) {
+    let colors_nits = [
+        [1_000.0, 250.0, 40.0],
+        [50.0, 600.0, 120.0],
+        [40.0, 200.0, 1_000.0],
+        [400.0, 400.0, 400.0],
+        [203.0, 203.0, 203.0],
+        [20.0, 5.0, 1.0],
+        [0.0, 0.0, 0.0],
+    ];
+    let fixture = (0..OFFSCREEN_HEIGHT)
+        .flat_map(|_| {
+            colors_nits.into_iter().flat_map(|rgb| {
+                [
+                    rgb[0] / HDR_REFERENCE_WHITE_NITS,
+                    rgb[1] / HDR_REFERENCE_WHITE_NITS,
+                    rgb[2] / HDR_REFERENCE_WHITE_NITS,
+                    1.0,
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    let case = OffscreenOutputCase {
+        color_space: SurfaceColorSpace::Srgb,
+        format: TextureFormat::Rgba8Unorm,
+        encoding: OutputEncoding::SdrSrgbExplicit,
+        peak_nits: HDR_REFERENCE_WHITE_NITS,
+        tolerance: 2.0 / 255.0,
+    };
+    let actual = gpu.render(OffscreenRenderRequest {
+        color_space: case.color_space,
+        format: case.format,
+        peak_nits: case.peak_nits,
+        background: BackgroundMode::Black,
+        source_dynamic_range: SourceDynamicRange::Hlg,
+        canonical_pixels: Some(&fixture),
+        ui_pixel: None,
+        tiled_resources: None,
+    });
+    let reference = output_reference(case, SourceDynamicRange::Hlg, 1_000.0);
+    for (index, rgb) in colors_nits.into_iter().enumerate() {
+        let working = rgb.map(|channel| f64::from(channel / HDR_REFERENCE_WHITE_NITS));
+        assert_rgba_close(
+            &format!("HDR color {index}"),
+            &actual[index],
+            reference.transform([working[0], working[1], working[2], 1.0]),
+            case.tolerance,
+        );
     }
 }
 
@@ -1157,6 +1258,7 @@ fn render_offscreen_scene(
     format: TextureFormat,
     peak_nits: f32,
     background: BackgroundMode,
+    exposure_stops: f32,
     source_dynamic_range: SourceDynamicRange,
     canonical_pixels: Option<&[f32]>,
     ui_pixel: Option<[f32; 4]>,
@@ -1181,7 +1283,7 @@ fn render_offscreen_scene(
         format,
     };
     let rendering_options = RenderingOptions {
-        exposure_stops: 0.0,
+        exposure_stops,
         background,
     };
     let hdr_info = wgpu::DisplayHdrInfo {

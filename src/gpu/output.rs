@@ -73,12 +73,6 @@ pub(super) fn is_hdr_color_space(color_space: SurfaceColorSpace) -> bool {
     )
 }
 
-pub(super) fn has_hdr_encoding_candidate(capabilities: &[SurfaceFormatCapabilities]) -> bool {
-    [OutputMode::Pq, OutputMode::Hlg, OutputMode::Scrgb]
-        .into_iter()
-        .any(|mode| select_surface_candidate(capabilities, mode, SourceDynamicRange::Hlg).is_some())
-}
-
 pub(super) fn surface_configuration(
     candidate: SurfaceCandidate,
     size: PhysicalSize<u32>,
@@ -182,7 +176,14 @@ pub(super) fn hdr_mapping_summary(
     }
 }
 
-pub(super) fn resolved_ui_white_nits(hdr_info: &wgpu::DisplayHdrInfo) -> f32 {
+pub(super) fn resolved_ui_white_nits(
+    color_space: SurfaceColorSpace,
+    hdr_info: &wgpu::DisplayHdrInfo,
+) -> f32 {
+    if !is_hdr_color_space(color_space) {
+        // Image and UI share a fixed relative-white scale on non-HDR outputs.
+        return HDR_REFERENCE_WHITE_NITS;
+    }
     hdr_info
         .luminance
         .as_ref()
@@ -191,17 +192,11 @@ pub(super) fn resolved_ui_white_nits(hdr_info: &wgpu::DisplayHdrInfo) -> f32 {
         .unwrap_or(HDR_REFERENCE_WHITE_NITS)
 }
 
-pub(super) fn resolved_output_peak_nits(
-    color_space: SurfaceColorSpace,
-    hdr_info: &wgpu::DisplayHdrInfo,
-) -> f32 {
+pub(super) fn resolved_output_peak_nits(color_space: SurfaceColorSpace) -> f32 {
     match color_space {
-        SurfaceColorSpace::Srgb => hdr_info
-            .luminance
-            .as_ref()
-            .and_then(|luminance| luminance.sdr_white_nits)
-            .filter(|peak| peak.is_finite() && *peak > 0.0)
-            .unwrap_or(HDR_REFERENCE_WHITE_NITS),
+        // SDR surfaces carry relative values. The OS-reported SDR white is
+        // where an HDR desktop places that surface, not the surface's peak.
+        SurfaceColorSpace::Srgb => HDR_REFERENCE_WHITE_NITS,
         SurfaceColorSpace::Bt2100Pq => PQ_ENCODING_PEAK_NITS,
         SurfaceColorSpace::Bt2100Hlg => HLG_ENCODING_PEAK_NITS,
         SurfaceColorSpace::ExtendedSrgbLinear => EXTENDED_LINEAR_FALLBACK_PEAK_NITS,

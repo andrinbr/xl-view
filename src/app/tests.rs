@@ -359,6 +359,14 @@ fn double_click_only_depends_on_the_click_interval() {
 fn image_cursor_shows_pan_availability_and_drag_state() {
     assert_eq!(image_cursor(false, false), CursorIcon::Default);
     assert_eq!(image_cursor(false, true), CursorIcon::Default);
-    assert_eq!(image_cursor(true, false), CursorIcon::Grab);
-    assert_eq!(image_cursor(true, true), CursorIcon::Grabbing);
+    #[cfg(target_os = "windows")]
+    {
+        assert_eq!(image_cursor(true, false), CursorIcon::Default);
+        assert_eq!(image_cursor(true, true), CursorIcon::Grabbing);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        assert_eq!(image_cursor(true, false), CursorIcon::Grab);
+        assert_eq!(image_cursor(true, true), CursorIcon::Grabbing);
+    }
 }

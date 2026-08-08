@@ -25,9 +25,9 @@ use super::output::{
 };
 use super::output::{
     FALLBACK_HDR_SOURCE_PEAK_NITS, RenderingOptions, SurfaceCandidate, SurfaceOutputError,
-    finite_non_negative, has_hdr_encoding_candidate, hdr_mapping_summary, is_hdr_color_space,
-    quantization_bits, resolved_output_peak_nits, resolved_ui_white_nits,
-    select_required_surface_candidate, shader_mode, surface_configuration, surface_hdr_metadata,
+    finite_non_negative, hdr_mapping_summary, is_hdr_color_space, quantization_bits,
+    resolved_output_peak_nits, resolved_ui_white_nits, select_required_surface_candidate,
+    shader_mode, surface_configuration, surface_hdr_metadata,
 };
 #[cfg(test)]
 use super::presentation::{PARAM_BUFFER_USAGE, presentation_shader_source};
@@ -225,7 +225,6 @@ enum ResamplingReservation {
 #[derive(Clone, Copy)]
 struct SurfaceSelection {
     candidate: SurfaceCandidate,
-    hdr_encoding_available: bool,
 }
 
 /// A fully validated image transition whose remaining commit steps are infallible.
@@ -263,7 +262,6 @@ pub struct GpuState {
     ui_texture: wgpu::Texture,
     image_sampler: wgpu::Sampler,
     hdr_metadata_status: SignalStatus,
-    hdr_encoding_available: bool,
     gpu_memory_limit_bytes: u64,
     diagnostics_pattern: bool,
     notify_work_ready: WorkReadyNotifier,
@@ -305,8 +303,6 @@ pub fn initialize(
         output_mode,
         source_dynamic_range,
     )?;
-    let hdr_encoding_available = has_hdr_encoding_candidate(&capabilities.format_capabilities);
-
     let device_descriptor = viewer_device_descriptor();
     let (device, queue, hdr_metadata_signaler) =
         pollster::block_on(hdr_metadata::request_device(&adapter, &device_descriptor))
@@ -395,7 +391,6 @@ pub fn initialize(
         ui_texture,
         image_sampler,
         hdr_metadata_status,
-        hdr_encoding_available,
         gpu_memory_limit_bytes,
         diagnostics_pattern,
         notify_work_ready,
@@ -494,10 +489,6 @@ impl GpuState {
 
     pub fn is_hdr_surface(&self) -> bool {
         is_hdr_color_space(self.candidate.color_space)
-    }
-
-    pub fn hdr_encoding_unavailable(&self) -> bool {
-        !self.hdr_encoding_available
     }
 
     pub fn image_gpu_budget_bytes(&self) -> u64 {
@@ -720,7 +711,6 @@ impl GpuState {
             self.rebuild_image_bind_group();
         }
         if surface_selection.candidate == self.candidate {
-            self.hdr_encoding_available = surface_selection.hdr_encoding_available;
             self.update_params();
             self.refresh_hdr_metadata("image changed");
         } else {
@@ -1145,17 +1135,11 @@ impl GpuState {
             self.output_mode,
             source_dynamic_range,
         )?;
-        Ok(SurfaceSelection {
-            candidate,
-            hdr_encoding_available: has_hdr_encoding_candidate(&capabilities.format_capabilities),
-        })
+        Ok(SurfaceSelection { candidate })
     }
 
     fn configure_surface(&mut self, selection: SurfaceSelection, reason: &str) {
-        let SurfaceSelection {
-            candidate,
-            hdr_encoding_available,
-        } = selection;
+        let SurfaceSelection { candidate } = selection;
         let candidate_changed = candidate != self.candidate;
         if candidate_changed {
             tracing::info!(
@@ -1179,7 +1163,6 @@ impl GpuState {
         );
         let format_changed = candidate.format != self.candidate.format;
         self.candidate = candidate;
-        self.hdr_encoding_available = hdr_encoding_available;
         if format_changed {
             let bindings = self.image.bindings();
             self.presentation.rebuild_pipeline(
@@ -1308,7 +1291,7 @@ fn shader_parameters(
         (view.center().x as f32, view.center().y as f32)
     });
     let view_scale = view_transform.map_or(1.0, |view| view.scale() as f32);
-    let output_peak_nits = resolved_output_peak_nits(candidate.color_space, hdr_info);
+    let output_peak_nits = resolved_output_peak_nits(candidate.color_space);
     PresentationParams {
         mode: shader_mode(candidate.color_space),
         encode_srgb: candidate.color_space == SurfaceColorSpace::Srgb
@@ -1323,7 +1306,7 @@ fn shader_parameters(
         viewport_height: viewport_dimensions.1,
         image_width,
         image_height,
-        ui_white_nits: resolved_ui_white_nits(hdr_info),
+        ui_white_nits: resolved_ui_white_nits(candidate.color_space, hdr_info),
         view_center_x: center.0,
         view_center_y: center.1,
         view_scale,
