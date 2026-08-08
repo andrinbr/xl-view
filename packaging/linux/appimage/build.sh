@@ -66,7 +66,7 @@ assemble_appdir() {
         "$appdir/usr/share/licenses/xl-view/COPYRIGHT"
     install -m 0644 "$ROOT/LICENSE" \
         "$appdir/usr/share/licenses/xl-view/LICENSE"
-    install -m 0644 "$ROOT/THIRD-PARTY-LICENSES.html" \
+    install -m 0644 "$ROOT/docs/legal/THIRD-PARTY-LICENSES.html" \
         "$appdir/usr/share/licenses/xl-view/THIRD-PARTY-LICENSES.html"
     install -m 0644 "$ROOT/assets/fonts/AdwaitaSans-LICENSE.txt" \
         "$appdir/usr/share/licenses/xl-view/AdwaitaSans-LICENSE.txt"

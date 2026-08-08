@@ -49,7 +49,8 @@ jobs:
           generated_notices=$(mktemp)
           cargo about generate --workspace --locked --fail \
             --output-file "$generated_notices" docs/legal/about.hbs
-          diff --strip-trailing-cr --unified THIRD-PARTY-LICENSES.html "$generated_notices"
+          diff --strip-trailing-cr --unified \
+            docs/legal/THIRD-PARTY-LICENSES.html "$generated_notices"
 
       - name: Check formatting
         run: cargo fmt --all --check

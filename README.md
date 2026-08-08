@@ -193,6 +193,6 @@ compositor, GPU/driver, and `--diagnostics` output where relevant.
 Copyright information is available in [COPYRIGHT](COPYRIGHT). XL-View is
 licensed under GPL-3.0-only, see [LICENSE](LICENSE). License information for
 Rust dependencies is available in
-[THIRD-PARTY-LICENSES.html](THIRD-PARTY-LICENSES.html). The bundled Adwaita
+[THIRD-PARTY-LICENSES.html](docs/legal/THIRD-PARTY-LICENSES.html). The bundled Adwaita
 Sans font is licensed under the SIL Open Font License 1.1, see
 [AdwaitaSans-LICENSE.txt](assets/fonts/AdwaitaSans-LICENSE.txt).

@@ -31,12 +31,12 @@ every dependency.
 
 ```console
 cargo about generate --workspace --locked --fail \
-  --output-file THIRD-PARTY-LICENSES.html docs/legal/about.hbs
+  --output-file docs/legal/THIRD-PARTY-LICENSES.html docs/legal/about.hbs
 ```
 
-Review and commit the updated `THIRD-PARTY-LICENSES.html`. Run this command
-after changing `Cargo.toml` or `Cargo.lock`. The CI checks that the committed file
-is current.
+Review and commit the updated `docs/legal/THIRD-PARTY-LICENSES.html`. Run this
+command after changing `Cargo.toml` or `Cargo.lock`. The CI checks that the
+committed file is current.
 
 Cargo tools only inspect Rust packages. Notices for bundled fonts, icons, and
 other assets must be maintained separately.
