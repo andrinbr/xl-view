@@ -26,7 +26,10 @@ use winit::keyboard::ModifiersState;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::monitor::Fullscreen;
 #[cfg(target_os = "linux")]
-use winit::platform::wayland::{EventLoopBuilderExtWayland, WindowAttributesWayland};
+use winit::platform::{
+    startup_notify::{self, EventLoopExtStartupNotify},
+    wayland::{EventLoopBuilderExtWayland, WindowAttributesWayland},
+};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 #[cfg(target_os = "linux")]
@@ -1012,9 +1015,15 @@ impl ApplicationHandler for Application {
             .with_window_icon(Some(app_icon::window_icon()))
             .with_surface_size(LogicalSize::new(1024.0, 682.0));
         #[cfg(target_os = "linux")]
-        let attributes = attributes.with_platform_attributes(Box::new(
-            WindowAttributesWayland::default().with_name(APPLICATION_ID, APPLICATION_ID),
-        ));
+        let attributes = {
+            let mut wayland_attributes =
+                WindowAttributesWayland::default().with_name(APPLICATION_ID, APPLICATION_ID);
+            if let Some(token) = event_loop.read_token_from_env() {
+                startup_notify::reset_activation_token_env();
+                wayland_attributes = wayland_attributes.with_activation_token(token);
+            }
+            attributes.with_platform_attributes(Box::new(wayland_attributes))
+        };
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::<dyn Window>::from(window),
             Err(error) => {

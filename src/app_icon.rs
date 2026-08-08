@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use resvg::{tiny_skia, usvg};
 use winit::icon::{Icon, RgbaIcon};
 
-const ICON_SVG_BYTES: &[u8] = include_bytes!("../assets/icons/xl-view.svg");
+const ICON_SVG_BYTES: &[u8] = include_bytes!("../assets/icons/io.github.andrinbr.xl_view.svg");
 const WINDOW_ICON_SIZE: u32 = 128;
 
 pub(crate) fn window_icon() -> Icon {

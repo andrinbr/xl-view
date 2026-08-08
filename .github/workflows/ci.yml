@@ -59,7 +59,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Check packaging scripts
-        run: sh -n scripts/*.sh packaging/linux/appimage/*.sh packaging/linux/appimage/AppRun
+        run: |
+          for script in scripts/*.sh packaging/linux/appimage/*.sh; do
+            sh -n "$script"
+          done
 
       - name: Install Vulkan SDK and Lavapipe
         uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # pin v1.6.0

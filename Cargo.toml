@@ -11,6 +11,34 @@ repository.workspace = true
 publish = false
 default-run = "xl-view"
 
+[package.metadata.packager]
+product-name = "XL-View"
+identifier = "io.github.andrinbr.xl_view"
+category = "GraphicsAndDesign"
+copyright = "Copyright 2026 Andrin Brunner and contributors"
+license-file = "LICENSE"
+icons = ["assets/icons/io.github.andrinbr.xl_view.png"]
+# cargo-packager names the Linux desktop file after the main binary (stripping any extension suffixes).
+# This alias gives it the correct application ID while the desktop entry launches xl-view.
+binaries = [
+    { path = "io.github.andrinbr.xl_view.bin", main = true },
+    { path = "xl-view" },
+]
+file-associations = [
+    { extensions = ["jxl"], mime-type = "image/jxl", name = "JPEG XL image", role = "viewer" },
+]
+
+[package.metadata.packager.deb]
+desktop-template = "packaging/linux/io.github.andrinbr.xl_view.desktop"
+
+[package.metadata.packager.appimage.files]
+"packaging/linux/io.github.andrinbr.xl_view.appdata.xml" = "usr/share/metainfo/io.github.andrinbr.xl_view.appdata.xml"
+"assets/icons/io.github.andrinbr.xl_view.svg" = "usr/share/icons/hicolor/scalable/apps/io.github.andrinbr.xl_view.svg"
+"COPYRIGHT" = "usr/share/licenses/xl-view/COPYRIGHT"
+"LICENSE" = "usr/share/licenses/xl-view/LICENSE"
+"docs/legal/THIRD-PARTY-LICENSES.html" = "usr/share/licenses/xl-view/THIRD-PARTY-LICENSES.html"
+"assets/fonts/AdwaitaSans-LICENSE.txt" = "usr/share/licenses/xl-view/AdwaitaSans-LICENSE.txt"
+
 [workspace]
 members = ["crates/vulkan-hdr-metadata"]
 default-members = ["."]

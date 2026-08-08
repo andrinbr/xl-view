@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/icons/xl-view.svg" alt="XL-View logo" width="128" />
+  <img src="assets/icons/io.github.andrinbr.xl_view.svg" alt="XL-View logo" width="128" />
 
   # XL-View
 
