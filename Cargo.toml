@@ -38,6 +38,7 @@ desktop-template = "packaging/linux/io.github.andrinbr.xl_view.desktop"
 "LICENSE" = "usr/share/licenses/xl-view/LICENSE"
 "docs/legal/THIRD-PARTY-LICENSES.html" = "usr/share/licenses/xl-view/THIRD-PARTY-LICENSES.html"
 "assets/fonts/AdwaitaSans-LICENSE.txt" = "usr/share/licenses/xl-view/AdwaitaSans-LICENSE.txt"
+"packaging/linux/appimage/AppImage-RUNTIME-LICENSE.txt" = "usr/share/licenses/xl-view/AppImage-RUNTIME-LICENSE.txt"
 
 [workspace]
 members = ["crates/vulkan-hdr-metadata"]

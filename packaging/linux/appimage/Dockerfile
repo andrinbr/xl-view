@@ -13,14 +13,13 @@ RUN apt-get update \
         desktop-file-utils \
         file \
     && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-packager --version "${CARGO_PACKAGER_VERSION}" --locked \
+    && rm -rf /usr/local/cargo/registry \
     && useradd --create-home --uid 1000 --user-group appimage \
     && mkdir -p /work \
     && chown appimage:appimage /work
 
-# Pin the package builder while allowing it to manage its AppImage helpers.
-RUN cargo install cargo-packager \
-    --version "${CARGO_PACKAGER_VERSION}" \
-    --locked
+COPY --chmod=0755 build-appimage.sh /usr/local/bin/build-appimage
 
 WORKDIR /work
 
@@ -32,4 +31,4 @@ ENV CARGO_TARGET_DIR=/work/target/appimage-container
 # Run builds without root privileges.
 USER appimage
 
-CMD ["packaging/linux/appimage/build.sh", "/work/target/appimage/xl-view-x86_64.AppImage"]
+ENTRYPOINT ["/usr/local/bin/build-appimage"]

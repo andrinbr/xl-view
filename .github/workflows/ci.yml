@@ -58,11 +58,8 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Check packaging scripts
-        run: |
-          for script in scripts/*.sh packaging/linux/appimage/*.sh; do
-            sh -n "$script"
-          done
+      - name: Lint shell scripts
+        run: shellcheck scripts/*.sh packaging/linux/appimage/*.sh
 
       - name: Install Vulkan SDK and Lavapipe
         uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # pin v1.6.0
@@ -104,14 +101,20 @@ jobs:
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin v7.0.1
 
-      - name: Build AppImage container
-        run: buildah build --file packaging/linux/appimage/Dockerfile --tag xl-view-appimage .
+      - name: Build AppImage builder image
+        run: buildah build --file packaging/linux/appimage/Dockerfile --tag xl-view-appimage packaging/linux/appimage
 
       - name: Build AppImage
         run: podman run --rm --userns=keep-id:uid=1000,gid=1000 --volume "$GITHUB_WORKSPACE:/work" xl-view-appimage
 
-      - name: Verify AppImage
-        run: target/appimage/xl-view-x86_64.AppImage --appimage-extract-and-run --version
+      - name: Verify release version
+        run: |
+          actual_version=$(
+            APPIMAGE_EXTRACT_AND_RUN=1 \
+              target/appimage/xl-view-x86_64.AppImage --version
+          )
+          test "$actual_version" = "xl-view ${GITHUB_REF_NAME#v}" ||
+            { echo "::error::AppImage reports '$actual_version', tag is '$GITHUB_REF_NAME'"; exit 1; }
 
       - name: Publish AppImage
         env:

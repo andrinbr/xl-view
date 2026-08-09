@@ -64,8 +64,8 @@ Or install it into your Cargo bin directory:
 cargo install --path .
 ```
 
-To build the AppImage yourself, run `packaging/linux/appimage/build.sh` from the
-repository root (see [packaging/linux/appimage/README.md](packaging/linux/appimage/README.md)).
+To build the AppImage yourself, follow the container build instructions in
+[packaging/linux/appimage/README.md](packaging/linux/appimage/README.md).
 
 ## Requirements
 
