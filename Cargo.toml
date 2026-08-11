@@ -92,6 +92,9 @@ wgpu = { version = "30.0.0", default-features = false, features = [
     "wgsl",
 ] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+winsafe = { version = "0.0.28", features = ["kernel"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "30.0.0", default-features = false, features = [
     "metal",

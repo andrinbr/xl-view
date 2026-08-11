@@ -293,6 +293,7 @@ pub fn initialize(
     }))
     .map_err(GpuInitializationError::backend_unavailable)?;
     let capabilities = surface.get_capabilities(&adapter);
+    let initial_hdr_info = surface.display_hdr_info(&adapter);
     let source_dynamic_range = if diagnostics_pattern {
         SourceDynamicRange::Hlg
     } else {
@@ -302,6 +303,7 @@ pub fn initialize(
         &capabilities.format_capabilities,
         output_mode,
         source_dynamic_range,
+        &initial_hdr_info,
     )?;
     let device_descriptor = viewer_device_descriptor();
     let (device, queue, hdr_metadata_signaler) =
@@ -777,13 +779,16 @@ impl GpuState {
         self.window.request_redraw();
     }
 
-    pub fn zoom_at(&mut self, position: winit::dpi::PhysicalPosition<f64>, factor: f64) {
-        if let Some(image) = self.image.loaded_mut() {
-            image.view_transform.zoom_at(position, factor);
-        }
+    /// Returns whether this zoom snapped to the fit stop.
+    pub fn zoom_at(&mut self, position: winit::dpi::PhysicalPosition<f64>, factor: f64) -> bool {
+        let stopped_at_fit = self
+            .image
+            .loaded_mut()
+            .is_some_and(|image| image.view_transform.zoom_at(position, factor));
         self.request_view_work();
         self.update_params();
         self.window.request_redraw();
+        stopped_at_fit
     }
 
     pub fn pan_by(&mut self, delta_x: f64, delta_y: f64) {
@@ -1130,10 +1135,12 @@ impl GpuState {
         source_dynamic_range: SourceDynamicRange,
     ) -> Result<SurfaceSelection, SurfaceOutputError> {
         let capabilities = self.surface.get_capabilities(&self.adapter);
+        let hdr_info = self.surface.display_hdr_info(&self.adapter);
         let candidate = select_required_surface_candidate(
             &capabilities.format_capabilities,
             self.output_mode,
             source_dynamic_range,
+            &hdr_info,
         )?;
         Ok(SurfaceSelection { candidate })
     }

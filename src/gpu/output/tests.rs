@@ -71,6 +71,63 @@ fn automatic_output_prefers_the_matching_source_encoding() {
     }
 }
 
+fn display_hdr_info(high_dynamic_range: Option<bool>) -> wgpu::DisplayHdrInfo {
+    wgpu::DisplayHdrInfo {
+        coarse: Some(wgpu::DisplayCoarseRange {
+            high_dynamic_range,
+            gamut: None,
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn automatic_output_uses_sdr_when_display_reports_hdr_disabled() {
+    let capabilities = [
+        capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_PQ),
+        capability(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
+    ];
+
+    let hdr_disabled = display_hdr_info(Some(false));
+    let selected = select_required_surface_candidate(
+        &capabilities,
+        OutputMode::Auto,
+        SourceDynamicRange::Hlg,
+        &hdr_disabled,
+    )
+    .unwrap();
+
+    assert_eq!(selected.color_space, SurfaceColorSpace::Srgb);
+    assert_eq!(
+        select_required_surface_candidate(
+            &capabilities[..1],
+            OutputMode::Auto,
+            SourceDynamicRange::Hlg,
+            &hdr_disabled,
+        ),
+        Err(SurfaceOutputError::NoUsablePair)
+    );
+    assert_eq!(
+        select_required_surface_candidate(
+            &capabilities,
+            OutputMode::Pq,
+            SourceDynamicRange::Hlg,
+            &hdr_disabled,
+        )
+        .unwrap()
+        .color_space,
+        SurfaceColorSpace::Bt2100Pq
+    );
+}
+
+#[test]
+fn display_hdr_enabled_only_rejects_an_explicit_sdr_state() {
+    assert!(display_hdr_enabled(&display_hdr_info(Some(true))));
+    assert!(!display_hdr_enabled(&display_hdr_info(Some(false))));
+    assert!(display_hdr_enabled(&display_hdr_info(None)));
+    assert!(display_hdr_enabled(&wgpu::DisplayHdrInfo::default()));
+}
+
 #[test]
 fn hlg_falls_back_to_pq_when_hlg_has_no_suitable_format() {
     let capabilities = [
@@ -202,9 +259,13 @@ fn forced_output_fails_instead_of_falling_back() {
         None
     );
 
-    let error =
-        select_required_surface_candidate(&capabilities, OutputMode::Hlg, SourceDynamicRange::Sdr)
-            .unwrap_err();
+    let error = select_required_surface_candidate(
+        &capabilities,
+        OutputMode::Hlg,
+        SourceDynamicRange::Sdr,
+        &wgpu::DisplayHdrInfo::default(),
+    )
+    .unwrap_err();
     assert_eq!(
         error,
         SurfaceOutputError::RequestedModeUnavailable(OutputMode::Hlg)
@@ -217,8 +278,13 @@ fn forced_output_fails_instead_of_falling_back() {
 
 #[test]
 fn automatic_output_reports_a_distinct_missing_surface_pair() {
-    let error = select_required_surface_candidate(&[], OutputMode::Auto, SourceDynamicRange::Sdr)
-        .unwrap_err();
+    let error = select_required_surface_candidate(
+        &[],
+        OutputMode::Auto,
+        SourceDynamicRange::Sdr,
+        &wgpu::DisplayHdrInfo::default(),
+    )
+    .unwrap_err();
 
     assert_eq!(error, SurfaceOutputError::NoUsablePair);
     assert_eq!(

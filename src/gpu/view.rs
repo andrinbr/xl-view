@@ -82,11 +82,21 @@ impl ViewTransform {
         }
     }
 
-    pub fn zoom_at(&mut self, cursor: PhysicalPosition<f64>, factor: f64) {
+    /// Returns whether this zoom snapped to the fit stop.
+    pub fn zoom_at(&mut self, cursor: PhysicalPosition<f64>, factor: f64) -> bool {
         if !factor.is_finite() || factor <= 0.0 {
-            return;
+            return false;
         }
         let old_scale = self.scale;
+        let fit_scale = self.fit_scale();
+        let requested_scale = old_scale * factor;
+        // Make fit an exact zoom stop instead of skipping across its arbitrary scale.
+        if (old_scale > fit_scale && requested_scale <= fit_scale)
+            || (old_scale < fit_scale && requested_scale >= fit_scale)
+        {
+            self.set_fit();
+            return true;
+        }
         let image_at_cursor = PhysicalPosition::new(
             self.center.x + (cursor.x - f64::from(self.viewport.width) / 2.0) / old_scale,
             self.center.y + (cursor.y - f64::from(self.viewport.height) / 2.0) / old_scale,
@@ -94,13 +104,15 @@ impl ViewTransform {
         // Fit can already exceed the usual absolute limit for tiny images. Base the manual limit
         // on both values so the first zoom-in never makes a fitted image smaller.
         let maximum_scale = self.maximum_manual_scale().max(old_scale);
-        self.scale = (old_scale * factor).clamp(MIN_SCALE, maximum_scale);
+        // Keep fit reachable when a very large image needs a scale below the usual minimum.
+        self.scale = requested_scale.clamp(MIN_SCALE.min(fit_scale), maximum_scale);
         self.center = PhysicalPosition::new(
             image_at_cursor.x - (cursor.x - f64::from(self.viewport.width) / 2.0) / self.scale,
             image_at_cursor.y - (cursor.y - f64::from(self.viewport.height) / 2.0) / self.scale,
         );
         self.mode = ViewMode::Manual;
         self.clamp_center();
+        false
     }
 
     pub fn pan_by(&mut self, delta_x: f64, delta_y: f64) {
@@ -181,6 +193,70 @@ mod tests {
         view.zoom_at(PhysicalPosition::new(750.0, 500.0), 2.0);
         assert_near(view.scale(), 2.0);
         assert_eq!(view.center(), PhysicalPosition::new(625.0, 500.0));
+    }
+
+    #[test]
+    fn zoom_out_from_one_to_one_stops_at_fit() {
+        let mut view =
+            ViewTransform::fit(PhysicalSize::new(3000, 2000), PhysicalSize::new(1000, 1000));
+        view.set_one_to_one(1.0);
+
+        for _ in 0..4 {
+            view.zoom_at(PhysicalPosition::new(500.0, 500.0), 0.8);
+        }
+        assert_near(view.scale(), 0.4096);
+
+        assert!(view.zoom_at(PhysicalPosition::new(500.0, 500.0), 0.8));
+
+        assert_near(view.scale(), 1.0 / 3.0);
+        assert_eq!(view.center(), PhysicalPosition::new(1500.0, 1000.0));
+        assert_eq!(view.mode, ViewMode::Fit);
+    }
+
+    #[test]
+    fn zoom_in_stops_at_fit_when_starting_below_it() {
+        let mut view =
+            ViewTransform::fit(PhysicalSize::new(2000, 1000), PhysicalSize::new(1000, 1000));
+        view.zoom_at(PhysicalPosition::new(500.0, 500.0), 0.5);
+        assert_near(view.scale(), 0.25);
+
+        assert!(view.zoom_at(PhysicalPosition::new(500.0, 500.0), 3.0));
+
+        assert_near(view.scale(), 0.5);
+        assert_eq!(view.mode, ViewMode::Fit);
+    }
+
+    #[test]
+    fn zoom_can_continue_past_the_fit_stop() {
+        let mut view =
+            ViewTransform::fit(PhysicalSize::new(3000, 2000), PhysicalSize::new(1000, 1000));
+        view.set_one_to_one(1.0);
+        assert!(view.zoom_at(PhysicalPosition::new(500.0, 500.0), 0.3));
+        assert_eq!(view.mode, ViewMode::Fit);
+
+        assert!(!view.zoom_at(PhysicalPosition::new(500.0, 500.0), 0.8));
+
+        assert_near(view.scale(), (1.0 / 3.0) * 0.8);
+        assert_eq!(view.mode, ViewMode::Manual);
+    }
+
+    #[test]
+    fn fit_stop_remains_reachable_below_the_usual_manual_minimum() {
+        let mut view = ViewTransform::fit(
+            PhysicalSize::new(100_000, 1000),
+            PhysicalSize::new(1000, 1000),
+        );
+        view.set_one_to_one(1.0);
+
+        for _ in 0..32 {
+            view.zoom_at(PhysicalPosition::new(500.0, 500.0), 0.8);
+            if view.mode == ViewMode::Fit {
+                break;
+            }
+        }
+
+        assert_near(view.scale(), 0.01);
+        assert_eq!(view.mode, ViewMode::Fit);
     }
 
     #[test]

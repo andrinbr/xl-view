@@ -15,7 +15,7 @@ use winit::cursor::CursorIcon;
 use winit::data_transfer::{DataTransferId, TypeHint, TypedData};
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{
-    ButtonSource, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+    ButtonSource, ElementState, KeyEvent, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent,
 };
 use winit::event_loop::run_on_demand::EventLoopExtRunOnDemand;
 use winit::event_loop::{
@@ -73,6 +73,12 @@ use self::session::{
 
 const FULLSCREEN_CURSOR_HIDE_DELAY: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PinchDirection {
+    In,
+    Out,
+}
+
 struct Application {
     background: BackgroundMode,
     cursor_hide_deadline: Option<Instant>,
@@ -93,6 +99,7 @@ struct Application {
     modifiers: ModifiersState,
     output_mode: OutputMode,
     pending_drop: Option<PendingDrop>,
+    pinch_fit_block: Option<PinchDirection>,
     session: ImageSession,
     gpu_memory_limit_bytes: u64,
     window: Option<Arc<dyn Window>>,
@@ -848,12 +855,49 @@ impl Application {
         }
     }
 
-    fn handle_pinch_gesture(&mut self, delta: f64) {
-        self.note_pointer_activity(Instant::now());
+    fn apply_pinch_delta(&mut self, delta: f64) {
+        let factor = 1.0 + delta;
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+
+        let direction = if factor > 1.0 {
+            PinchDirection::In
+        } else if factor < 1.0 {
+            PinchDirection::Out
+        } else {
+            return;
+        };
+
+        // Continuing into the stop stays at fit; reversing releases it.
+        if self.pinch_fit_block == Some(direction) {
+            return;
+        }
+        self.pinch_fit_block = None;
+
         let anchor = self.zoom_anchor();
-        if let (Some(gpu), Some(anchor)) = (self.gpu.as_mut(), anchor) {
-            // Winit reports an additive magnification delta; zoom_at expects a factor.
-            gpu.zoom_at(anchor, 1.0 + delta);
+        if let (Some(gpu), Some(anchor)) = (self.gpu.as_mut(), anchor)
+            && gpu.zoom_at(anchor, factor)
+        {
+            self.pinch_fit_block = Some(direction);
+        }
+    }
+
+    // A single pinch may return from fit, but cannot cross through it.
+    fn handle_pinch_gesture(&mut self, delta: f64, phase: TouchPhase) {
+        self.note_pointer_activity(Instant::now());
+
+        if phase == TouchPhase::Started {
+            self.pinch_fit_block = None;
+        }
+
+        // Started and Ended may carry real magnification on macOS; Wayland sends zero there.
+        if phase != TouchPhase::Cancelled {
+            self.apply_pinch_delta(delta);
+        }
+
+        if matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            self.pinch_fit_block = None;
         }
     }
 
@@ -1136,7 +1180,9 @@ impl ApplicationHandler for Application {
                 self.handle_pointer_button(state, &button);
             }
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
-            WindowEvent::PinchGesture { delta, .. } => self.handle_pinch_gesture(delta),
+            WindowEvent::PinchGesture { delta, phase, .. } => {
+                self.handle_pinch_gesture(delta, phase);
+            }
             WindowEvent::PanGesture { delta, .. } => self.handle_pan_gesture(delta),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } => {
@@ -1197,6 +1243,7 @@ pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
         modifiers: ModifiersState::empty(),
         output_mode: cli.output,
         pending_drop: None,
+        pinch_fit_block: None,
         session: ImageSession::new(decoded_cache_bytes, decode_coordinator),
         gpu_memory_limit_bytes: cli.gpu_memory.saturating_mul(1024 * 1024),
         window: None,

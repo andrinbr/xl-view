@@ -73,6 +73,13 @@ pub(super) fn is_hdr_color_space(color_space: SurfaceColorSpace) -> bool {
     )
 }
 
+/// Whether HDR should be considered enabled for output selection. Only an
+/// explicitly reported SDR state disables HDR; an unavailable state is not
+/// evidence that HDR is disabled.
+pub(super) fn display_hdr_enabled(hdr_info: &wgpu::DisplayHdrInfo) -> bool {
+    hdr_info.coarse.and_then(|coarse| coarse.high_dynamic_range) != Some(false)
+}
+
 pub(super) fn surface_configuration(
     candidate: SurfaceCandidate,
     size: PhysicalSize<u32>,
@@ -208,8 +215,14 @@ pub(super) fn select_required_surface_candidate(
     capabilities: &[SurfaceFormatCapabilities],
     output_mode: OutputMode,
     source_dynamic_range: SourceDynamicRange,
+    hdr_info: &wgpu::DisplayHdrInfo,
 ) -> Result<SurfaceCandidate, SurfaceOutputError> {
-    select_surface_candidate(capabilities, output_mode, source_dynamic_range).ok_or(
+    let selection_mode = if output_mode == OutputMode::Auto && !display_hdr_enabled(hdr_info) {
+        OutputMode::Sdr
+    } else {
+        output_mode
+    };
+    select_surface_candidate(capabilities, selection_mode, source_dynamic_range).ok_or(
         match output_mode {
             OutputMode::Auto => SurfaceOutputError::NoUsablePair,
             forced => SurfaceOutputError::RequestedModeUnavailable(forced),
