@@ -28,10 +28,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pin current master (2026-07-23)
-        with:
-          toolchain: "1.97"
-          components: clippy,rustfmt,llvm-tools-preview
+        run: rustup toolchain install
 
       - name: Install Cargo tools
         uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # pin v2.84.1
@@ -60,6 +57,10 @@ jobs:
 
       - name: Lint shell scripts
         run: shellcheck scripts/*.sh packaging/linux/appimage/*.sh
+
+      - name: Lint PowerShell scripts
+        shell: pwsh
+        run: Invoke-ScriptAnalyzer -Path packaging/windows -Recurse -EnableExit
 
       - name: Install Vulkan SDK and Lavapipe
         uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # pin v1.6.0
@@ -109,9 +110,12 @@ jobs:
 
       - name: Verify release version
         run: |
+          appimage="target/appimage/xl-view-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
+          test -f "$appimage" ||
+            { echo "::error::No AppImage matches release tag $GITHUB_REF_NAME"; exit 1; }
           actual_version=$(
             APPIMAGE_EXTRACT_AND_RUN=1 \
-              target/appimage/xl-view-x86_64.AppImage --version
+              "$appimage" --version
           )
           test "$actual_version" = "xl-view ${GITHUB_REF_NAME#v}" ||
             { echo "::error::AppImage reports '$actual_version', tag is '$GITHUB_REF_NAME'"; exit 1; }
@@ -120,13 +124,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          appimage="target/appimage/xl-view-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" \
-              target/appimage/xl-view-x86_64.AppImage \
+              "$appimage" \
               --clobber
           else
             gh release create "$GITHUB_REF_NAME" \
-              target/appimage/xl-view-x86_64.AppImage \
+              "$appimage" \
               --generate-notes \
               --verify-tag
           fi
+
+  windows:
+    name: Build and publish Windows packages
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: appimage
+    runs-on: windows-latest
+    permissions:
+      contents: write # needed to upload files to the GitHub release
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin v7.0.1
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Install cargo-packager
+        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # pin v2.84.1
+        with:
+          tool: cargo-packager@0.11.8
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # pin v2.9.1
+
+      - name: Build Windows packages
+        shell: pwsh
+        run: ./packaging/windows/build-windows.ps1
+
+      - name: Publish Windows packages
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release upload $env:GITHUB_REF_NAME `
+              "target/windows/xl-view-$tag-windows-x86_64-portable.zip" `
+              "target/windows/xl-view-$tag-windows-x86_64-setup.exe" `
+              --clobber

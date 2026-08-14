@@ -1,0 +1,4 @@
+# Statically link the MSVC runtime across the dependency graph so portable builds
+# do not require the Visual C++ Redistributable.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

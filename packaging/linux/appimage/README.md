@@ -16,10 +16,10 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 --volume "$PWD:/work:Z" xl-vi
 ```
 
 The container compiles, packages, and audits the mounted source tree. The result
-is written to `target/appimage/xl-view-x86_64.AppImage`.
+is written to `target/appimage/xl-view-vX.Y.Z-linux-x86_64.AppImage`.
 
 Verify that it starts with:
 
 ```console
-target/appimage/xl-view-x86_64.AppImage --version
+target/appimage/xl-view-vX.Y.Z-linux-x86_64.AppImage --version
 ```

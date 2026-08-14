@@ -1,0 +1,32 @@
+# Standalone Packager files do not inherit Cargo.toml metadata. Keep duplicated
+# fields such as the version in sync with Cargo.toml.
+name = "xl-view"
+product-name = "XL-View"
+version = "0.1.0"
+identifier = "io.github.andrinbr.xl_view"
+description = "A minimalist HDR image viewer optimized for large images"
+authors = ["Andrin Brunner"]
+publisher = "Andrin Brunner"
+copyright = "Copyright 2026 Andrin Brunner and contributors"
+license-file = "../../LICENSE"
+icons = ["../../assets/icons/io.github.andrinbr.xl_view.ico"]
+formats = ["nsis"]
+
+binaries = [
+    { path = "xl-view", main = true },
+]
+file-associations = [
+    { extensions = ["jxl"], mime-type = "image/jxl", description = "JPEG XL image", name = "JPEG XL image", role = "viewer" },
+]
+
+# Keep these resources in sync with build-windows.ps1's portable license list.
+resources = [
+    { src = "../../LICENSE", target = "licenses/LICENSE" },
+    { src = "../../COPYRIGHT", target = "licenses/COPYRIGHT" },
+    { src = "../../docs/legal/THIRD-PARTY-LICENSES.html", target = "licenses/THIRD-PARTY-LICENSES.html" },
+    { src = "../../assets/fonts/AdwaitaSans-LICENSE.txt", target = "licenses/AdwaitaSans-LICENSE.txt" },
+]
+
+[nsis]
+installer-icon = "../../assets/icons/io.github.andrinbr.xl_view.ico"
+installer-mode = "currentUser"

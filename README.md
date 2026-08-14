@@ -13,14 +13,15 @@
   ![XL-View showing an example image](docs/screenshots/xl-view-example-image.png)
 </div>
 
-XL-View is an HDR still-image viewer for Linux, built on native Wayland and
-Vulkan. It preserves the full HDR range of an image when HDR output is
-available, targets JPEG XL, and handles large images such as panoramas.
+XL-View is a lightweight, native HDR still-image viewer for Linux and Windows,
+built with Rust and Vulkan. It preserves the full HDR range of an image when
+HDR output is available, targets JPEG XL, and handles large images such as
+panoramas.
 
 ## Features
 
-- **HDR output:** view images in PQ, HLG, scRGB, or SDR, selecting the closest display mode automatically
-- **Accurate color:** preserve the image's full HDR range for the compositor to map to the display
+- **HDR output:** display images through PQ, HLG, scRGB, or SDR, automatically selecting the closest available output mode
+- **Accurate color:** preserve the image's full HDR range through the display pipeline
 - **Responsive large-image viewing:** open panoramas and other large images without blocking the UI, with smooth panning
 - **Sharp scaling:** high-quality resampling for a detailed view
 - **Image cache and preloading:** keep recent images in memory and preload adjacent files for faster browsing
@@ -31,20 +32,29 @@ available, targets JPEG XL, and handles large images such as panoramas.
 
 ## Installation
 
-### AppImage
+Prebuilt packages are available from the
+[releases page](https://github.com/andrinbr/xl-view/releases).
 
-Download the AppImage from the [releases page](https://github.com/andrinbr/xl-view/releases),
-make it executable, and run it:
+### Linux
+
+Download the AppImage, make it executable, and run it:
 
 ```console
-chmod +x xl-view-x86_64.AppImage
-./xl-view-x86_64.AppImage path/to/image.jxl
+chmod +x xl-view-vX.Y.Z-linux-x86_64.AppImage
+./xl-view-vX.Y.Z-linux-x86_64.AppImage path/to/image.jxl
 ```
 
 As an alternative to running it directly, you can integrate the AppImage into
 your desktop with an AppImage manager such as
 [Gear Lever](https://github.com/mijorus/gearlever). Point Gear Lever at the
 downloaded file and it handles installation and the menu entry.
+
+### Windows
+
+Download either the Setup executable or the portable ZIP. Setup installs
+XL-View for the current user. The portable ZIP can be extracted anywhere and
+run without installation. The Windows binaries are currently unsigned, so
+Windows may show a SmartScreen warning when they are first run.
 
 ### Building from source
 
@@ -54,30 +64,29 @@ The required Rust compiler is configured in
 ```console
 git clone https://github.com/andrinbr/xl-view.git
 cd xl-view
-cargo build --release
+cargo build --release --locked
 ./target/release/xl-view path/to/image.jxl
 ```
 
 Or install it into your Cargo bin directory:
 
 ```console
-cargo install --path .
+cargo install --locked --path .
 ```
 
-To build the AppImage yourself, follow the container build instructions in
-[packaging/linux/appimage/README.md](packaging/linux/appimage/README.md).
+To build release packages yourself, follow the instructions for the
+[AppImage](packaging/linux/appimage/README.md) or the
+[Windows packages](packaging/windows/README.md).
 
 ## Requirements
 
-- **Modern Linux:** HDR output requires a compositor with HDR and
-  Wayland color-management support, available in recent KDE Plasma and GNOME
-  releases.
-- **A native Wayland session:** There is no X11 or OpenGL fallback.
-- **A Vulkan-capable GPU and driver:** Vulkan drivers are available for
-  recent AMD, Intel, and NVIDIA GPUs.
-- **An HDR display:** for the full experience. SDR displays still work, but an
-  HDR image shown on an SDR surface is tone-mapped down to SDR rather than shown
-  in HDR.
+- **A Vulkan-capable GPU and current driver:** there is no OpenGL or DirectX
+  fallback.
+- **A native Wayland session on Linux:** there is no X11 fallback. HDR output
+  additionally requires compositor HDR and Wayland color-management support.
+- **HDR support:** an HDR-capable display and compatible display environment
+  are required for the full experience. SDR displays still work, but HDR images
+  are tone-mapped down to SDR.
 
 ## Usage
 
@@ -106,9 +115,6 @@ By default, the viewer tries to use an output surface that matches the source
 (SDR, PQ, or HLG), then chooses the closest available alternative. Use
 `--output` to force a specific encoding, `--background` to change what shows
 behind transparent pixels, and `--cache` / `--gpu-memory` to tune memory use.
-
-For debug logging, set `RUST_LOG`, e.g.
-`RUST_LOG=xl_view=debug cargo run -- --diagnostics`.
 
 ## Controls
 
@@ -147,19 +153,19 @@ Currently JPEG XL (`.jxl`) only. Additional codecs may be implemented in the fut
 
 ## Troubleshooting
 
-- **No HDR or washed-out colors:** make sure HDR is enabled in your compositor
-  and that your display actually supports it.
-- **Check the pipeline:** run `xl-view --diagnostics` to see the selected output
-  surface, whether `VK_EXT_hdr_metadata` is enabled, and whether metadata
-  reached the swapchain.
+- **No HDR or washed-out colors:** make sure HDR is enabled in your display
+  environment and that your display actually supports it.
+- **Check the pipeline:** press `I` to inspect the output surface, HDR mapping,
+  and HDR metadata status, or run `xl-view --diagnostics` for a detailed report.
 - **Wrong surface selected:** override automatic selection with
   `--output pq|hlg|scrgb|sdr`.
-- **It won't start:** confirm you are on a native Wayland session with a working Vulkan driver. 
+- **It won't start:** on Linux, confirm you are using a native Wayland session.
+  Also confirm that a working Vulkan driver is installed.
 - **More detail:** set `RUST_LOG=xl_view=debug` for debug logging to stderr.
 
 ## Roadmap
 
-- Cross-platform support (Windows and macOS)
+- macOS support
 - Support for gain maps
 - Additional codec support (primarily AVIF and JPEG)
 - Switch to `jxl-rs` once it becomes stable
@@ -178,7 +184,8 @@ XL-View works like this (simplified):
 4. **Draw:** The GPU displays the image while a higher-quality CPU resize
    produces a sharp result once you stop panning.
 5. **Display:** The image is sent to the display using the appropriate HDR or
-  SDR encoding, and the compositor handles the final mapping to the screen.
+   SDR encoding, and the display pipeline handles the final mapping to the
+   screen.
 
 ## Contributing
 
@@ -186,7 +193,8 @@ Feedback and questions are welcome in
 [GitHub Discussions](https://github.com/andrinbr/xl-view/discussions), and bug
 reports belong in [Issues](https://github.com/andrinbr/xl-view/issues). This is
 a small open-source project, so please keep reports focused and include your
-compositor, GPU/driver, and `--diagnostics` output where relevant.
+operating system, display environment, GPU/driver, and `--diagnostics` output
+where relevant.
 
 ## License
 

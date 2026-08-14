@@ -1,0 +1,34 @@
+# Standalone Packager files do not inherit Cargo.toml metadata. Keep duplicated
+# fields such as the version in sync with Cargo.toml.
+name = "xl-view"
+product-name = "XL-View"
+version = "0.1.0"
+identifier = "io.github.andrinbr.xl_view"
+description = "A minimalist HDR image viewer optimized for large images"
+authors = ["Andrin Brunner"]
+copyright = "Copyright 2026 Andrin Brunner and contributors"
+license-file = "../../LICENSE"
+icons = ["../../assets/icons/io.github.andrinbr.xl_view.png"]
+formats = ["appimage"]
+
+# The main-binary alias makes cargo-packager use the desktop application ID
+# while the desktop entry continues to launch xl-view.
+binaries = [
+    { path = "io.github.andrinbr.xl_view.bin", main = true },
+    { path = "xl-view" },
+]
+file-associations = [
+    { extensions = ["jxl"], mime-type = "image/jxl", description = "JPEG XL image", name = "JPEG XL image", role = "viewer" },
+]
+
+[deb]
+desktop-template = "io.github.andrinbr.xl_view.desktop"
+
+[appimage.files]
+"io.github.andrinbr.xl_view.appdata.xml" = "usr/share/metainfo/io.github.andrinbr.xl_view.appdata.xml"
+"../../assets/icons/io.github.andrinbr.xl_view.svg" = "usr/share/icons/hicolor/scalable/apps/io.github.andrinbr.xl_view.svg"
+"../../COPYRIGHT" = "usr/share/licenses/xl-view/COPYRIGHT"
+"../../LICENSE" = "usr/share/licenses/xl-view/LICENSE"
+"../../docs/legal/THIRD-PARTY-LICENSES.html" = "usr/share/licenses/xl-view/THIRD-PARTY-LICENSES.html"
+"../../assets/fonts/AdwaitaSans-LICENSE.txt" = "usr/share/licenses/xl-view/AdwaitaSans-LICENSE.txt"
+"appimage/AppImage-RUNTIME-LICENSE.txt" = "usr/share/licenses/xl-view/AppImage-RUNTIME-LICENSE.txt"

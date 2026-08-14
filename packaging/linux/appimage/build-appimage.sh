@@ -3,30 +3,36 @@ set -eu
 
 # Use the fixed paths provided by the builder image.
 APPLICATION_ID=io.github.andrinbr.xl_view
-OUTPUT=/work/target/appimage/xl-view-x86_64.AppImage
+OUTPUT_DIR=/work/target/appimage
+PACKAGER_CONFIG=packaging/linux/Packager.toml
 release_dir=${CARGO_TARGET_DIR:?CARGO_TARGET_DIR must be set by the builder image}/release
 
 # Create an isolated workspace for packaging and inspection.
 staging_root=$(mktemp -d)
 trap 'rm -rf "$staging_root"' EXIT HUP INT TERM
+package_dir="$staging_root/package"
+audit_dir="$staging_root/audit"
+mkdir -p "$package_dir" "$audit_dir"
 
 # Compile the release binary into the mounted target directory.
 cd /work
 cargo build --release --locked
 
-# cargo-packager uses the main binary name for the desktop file name.
-ln -f \
+# Stage the binary and desktop-ID alias where cargo-packager expects them.
+install -m 0755 \
     "$release_dir/xl-view" \
-    "$release_dir/$APPLICATION_ID.bin"
+    "$package_dir/xl-view"
+ln -f \
+    "$package_dir/xl-view" \
+    "$package_dir/$APPLICATION_ID.bin"
 
 # Package the binaries and metadata as an AppImage.
 APPIMAGE_EXTRACT_AND_RUN=1 cargo packager \
-    --release \
-    --formats appimage \
-    --out-dir "$staging_root"
+    --config "$PACKAGER_CONFIG" \
+    --out-dir "$package_dir"
 
 # Select the single AppImage produced by cargo-packager.
-set -- "$staging_root"/*.AppImage
+set -- "$package_dir"/*.AppImage
 if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
     echo "cargo-packager did not produce exactly one AppImage" >&2
     exit 1
@@ -35,12 +41,12 @@ appimage=$1
 
 # Extract the finished package and validate its important integration points.
 (
-    cd "$staging_root"
+    cd "$audit_dir"
     "$appimage" --appimage-extract >/dev/null
 )
 
 # Locate the packaged files used by the audit.
-appdir="$staging_root/squashfs-root"
+appdir="$audit_dir/squashfs-root"
 binary="$appdir/usr/bin/xl-view"
 desktop="$appdir/usr/share/applications/$APPLICATION_ID.desktop"
 appdata="$appdir/usr/share/metainfo/$APPLICATION_ID.appdata.xml"
@@ -65,14 +71,14 @@ grep -Fqx "Icon=$APPLICATION_ID" "$desktop"
 grep -Fq "<launchable type=\"desktop-id\">$APPLICATION_ID.desktop</launchable>" "$appdata"
 
 # Display and GPU libraries must come from the host.
-dynamic_info="$staging_root/dynamic.txt"
+dynamic_info="$audit_dir/dynamic.txt"
 readelf -d "$binary" > "$dynamic_info"
 if grep -qE 'NEEDED.*(libX11|libGL|libEGL|libGLES|libvulkan|libwayland)' "$dynamic_info"; then
     echo "binary has a forbidden direct display/GPU dependency" >&2
     exit 1
 fi
 
-library_paths="$staging_root/libraries.txt"
+library_paths="$audit_dir/libraries.txt"
 find "$appdir" -name '*.so*' > "$library_paths"
 if grep -qE '/(libX11|libGL|libEGL|libGLES|libvulkan|libwayland|libdrm|libgbm)[^/]*\.so' "$library_paths"; then
     echo "AppImage bundles a forbidden host display/GPU library" >&2
@@ -84,15 +90,17 @@ if grep -aqE 'VK_(ICD_FILENAMES|LAYER_PATH)' "$appdir/AppRun"; then
     exit 1
 fi
 
-# Confirm that the executable and AppStream versions agree.
-version_output=$(APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version)
-case "$version_output" in
-    "xl-view "*) version=${version_output#xl-view } ;;
-    *) echo "unexpected version output: $version_output" >&2; exit 1 ;;
-esac
-grep -Fq "<release version=\"$version\"" "$appdata"
+# The binary's --version reflects Cargo.toml. The Packager config and the
+# AppStream release entry must agree with it.
+version=$(APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version)
+version=${version#xl-view }
+grep -Fqx "version = \"$version\"" "$PACKAGER_CONFIG" \
+    || { echo "$PACKAGER_CONFIG version does not match xl-view $version" >&2; exit 1; }
+grep -Fq "<release version=\"$version\"" "$appdata" \
+    || { echo "$appdata has no <release version=\"$version\"> entry" >&2; exit 1; }
 
 # Publish only the audited AppImage to the mounted source tree.
-mkdir -p /work/target/appimage
+OUTPUT="$OUTPUT_DIR/xl-view-v${version}-linux-x86_64.AppImage"
+mkdir -p "$OUTPUT_DIR"
 install -m 0755 "$appimage" "$OUTPUT"
 printf '%s\n' "AppImage built and audited: $OUTPUT"
