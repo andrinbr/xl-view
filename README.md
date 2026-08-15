@@ -13,14 +13,13 @@
   ![XL-View showing an example image](docs/screenshots/xl-view-example-image.png)
 </div>
 
-XL-View is a lightweight, native HDR still-image viewer for Linux and Windows,
-built with Rust and Vulkan. It preserves the full HDR range of an image when
-HDR output is available, targets JPEG XL, and handles large images such as
-panoramas.
+XL-View is a native HDR still-image viewer for Linux and Windows, built with
+Rust and Vulkan. It preserves the full HDR range of an image when HDR output is
+available, targets JPEG XL, and handles large images such as panoramas.
 
 ## Features
 
-- **HDR output:** display images through PQ, HLG, scRGB, or SDR, automatically selecting the closest available output mode
+- **HDR output:** display images through PQ, HLG, scRGB, or SDR, with automatic output mode selection and manual overrides
 - **Accurate color:** preserve the image's full HDR range through the display pipeline
 - **Responsive large-image viewing:** open panoramas and other large images without blocking the UI, with smooth panning
 - **Sharp scaling:** high-quality resampling for a detailed view
