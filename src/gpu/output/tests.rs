@@ -37,7 +37,7 @@ fn pq_ten_bit_beats_advertised_eight_bit_and_other_color_spaces() {
 }
 
 #[test]
-fn automatic_output_prefers_the_matching_source_encoding() {
+fn automatic_output_prefers_pq_for_sdr_and_matches_native_hdr_encodings() {
     let capabilities = [
         capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_PQ),
         capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_HLG),
@@ -47,8 +47,8 @@ fn automatic_output_prefers_the_matching_source_encoding() {
     for (source_dynamic_range, format, color_space) in [
         (
             SourceDynamicRange::Sdr,
-            TextureFormat::Bgra8UnormSrgb,
-            SurfaceColorSpace::Srgb,
+            TextureFormat::Rgb10a2Unorm,
+            SurfaceColorSpace::Bt2100Pq,
         ),
         (
             SourceDynamicRange::Pq,
@@ -344,23 +344,17 @@ fn hdr_peaks_are_container_defined_and_sdr_uses_fixed_reference_white() {
 }
 
 #[test]
-fn hdr_mapping_summary_distinguishes_surface_and_source_roles() {
+fn tone_mapping_summary_reports_viewer_tone_mapping() {
+    assert_eq!(tone_mapping_summary(true, SourceDynamicRange::Hlg), "None");
     assert_eq!(
-        hdr_mapping_summary(true, SourceDynamicRange::Hlg),
-        "Compositor"
+        tone_mapping_summary(true, SourceDynamicRange::Sdr),
+        "SDR to HDR"
     );
     assert_eq!(
-        hdr_mapping_summary(true, SourceDynamicRange::Sdr),
-        "Compositor"
+        tone_mapping_summary(false, SourceDynamicRange::Pq),
+        "HDR to SDR"
     );
-    assert_eq!(
-        hdr_mapping_summary(false, SourceDynamicRange::Pq),
-        "Application tone mapping to SDR"
-    );
-    assert_eq!(
-        hdr_mapping_summary(false, SourceDynamicRange::Sdr),
-        "Not required"
-    );
+    assert_eq!(tone_mapping_summary(false, SourceDynamicRange::Sdr), "None");
 }
 
 #[test]

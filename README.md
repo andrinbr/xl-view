@@ -111,10 +111,11 @@ the window, or pressing `O` / `Ctrl+O` to use the file picker. With no image
 argument, the viewer shows a welcome screen. Use `--diagnostics` to display
 the color-bar test pattern instead.
 
-By default, the viewer tries to use an output surface that matches the source
-(SDR, PQ, or HLG), then chooses the closest available alternative. Use
-`--output` to force a specific encoding, `--background` to change what shows
-behind transparent pixels, and `--cache` / `--gpu-memory` to tune memory use.
+By default, the viewer prefers an HDR output surface when one is available. PQ
+is preferred for SDR and PQ sources, while HLG is preferred for HLG sources.
+Each falls back through the other HDR encodings and finally sRGB. Use `--output`
+to force a specific encoding, `--background` to change what shows behind
+transparent pixels, and `--cache` / `--gpu-memory` to tune memory use.
 
 ## Controls
 
@@ -155,7 +156,7 @@ Currently JPEG XL (`.jxl`) only. Additional codecs may be implemented in the fut
 
 - **No HDR or washed-out colors:** make sure HDR is enabled in your display
   environment and that your display actually supports it.
-- **Check the pipeline:** press `I` to inspect the output surface, HDR mapping,
+- **Check the pipeline:** press `I` to inspect the output surface, tone mapping,
   and HDR metadata status, or run `xl-view --diagnostics` for a detailed report.
 - **Wrong surface selected:** override automatic selection with
   `--output pq|hlg|scrgb|sdr`.

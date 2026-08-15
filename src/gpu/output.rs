@@ -170,16 +170,14 @@ pub(super) fn quantization_bits(format: TextureFormat) -> u8 {
     }
 }
 
-pub(super) fn hdr_mapping_summary(
+pub(super) fn tone_mapping_summary(
     hdr_surface: bool,
     source_dynamic_range: SourceDynamicRange,
 ) -> &'static str {
-    if hdr_surface {
-        "Compositor"
-    } else if source_dynamic_range.is_hdr() {
-        "Application tone mapping to SDR"
-    } else {
-        "Not required"
+    match (source_dynamic_range.is_hdr(), hdr_surface) {
+        (false, true) => "SDR to HDR",
+        (true, false) => "HDR to SDR",
+        _ => "None",
     }
 }
 
@@ -247,11 +245,14 @@ fn select_surface_candidate(
         SurfaceColorSpace::ExtendedSrgbLinear,
         SurfaceColorSpace::Srgb,
     ];
+    // Keep SDR on an HDR presentation pair when one is available. This avoids
+    // unnecessary HDR-to-SDR surface reconfiguration, which can retain stale HDR
+    // state and clip subsequent SDR output on Windows with Intel Vulkan drivers.
     const AUTO_SDR_PRIORITY: [SurfaceColorSpace; 4] = [
-        SurfaceColorSpace::Srgb,
         SurfaceColorSpace::Bt2100Pq,
         SurfaceColorSpace::Bt2100Hlg,
         SurfaceColorSpace::ExtendedSrgbLinear,
+        SurfaceColorSpace::Srgb,
     ];
     const PQ_ONLY: [SurfaceColorSpace; 1] = [SurfaceColorSpace::Bt2100Pq];
     const HLG_ONLY: [SurfaceColorSpace; 1] = [SurfaceColorSpace::Bt2100Hlg];

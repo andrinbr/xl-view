@@ -25,9 +25,9 @@ use super::output::{
 };
 use super::output::{
     FALLBACK_HDR_SOURCE_PEAK_NITS, RenderingOptions, SurfaceCandidate, SurfaceOutputError,
-    finite_non_negative, hdr_mapping_summary, is_hdr_color_space, quantization_bits,
-    resolved_output_peak_nits, resolved_ui_white_nits, select_required_surface_candidate,
-    shader_mode, surface_configuration, surface_hdr_metadata,
+    finite_non_negative, is_hdr_color_space, quantization_bits, resolved_output_peak_nits,
+    resolved_ui_white_nits, select_required_surface_candidate, shader_mode, surface_configuration,
+    surface_hdr_metadata, tone_mapping_summary,
 };
 #[cfg(test)]
 use super::presentation::{PARAM_BUFFER_USAGE, presentation_shader_source};
@@ -538,8 +538,8 @@ impl GpuState {
         }
         rows.extend([
             (
-                "HDR mapping".to_owned(),
-                hdr_mapping_summary(self.is_hdr_surface(), self.source_dynamic_range()).to_owned(),
+                "Tone mapping".to_owned(),
+                tone_mapping_summary(self.is_hdr_surface(), self.source_dynamic_range()).to_owned(),
             ),
             (
                 "HDR metadata".to_owned(),
