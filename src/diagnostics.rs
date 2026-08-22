@@ -9,7 +9,7 @@ use crate::APPLICATION_NAME;
 use crate::error::{AppError, RuntimeError};
 use crate::gpu::GpuInitializationError;
 
-const DEFAULT_LOG_FILTER: &str = "xl_view=info,vulkan_hdr_metadata=warn";
+const DEFAULT_LOG_FILTER: &str = "xl_view=info";
 
 pub fn initialize_logging() {
     let (filter, invalid_filter) = match std::env::var(EnvFilter::DEFAULT_ENV) {
@@ -170,10 +170,9 @@ mod tests {
     use crate::error::RuntimeError;
 
     #[test]
-    fn default_filter_covers_the_application_and_hdr_bridge() {
+    fn default_filter_covers_the_application() {
         assert!(EnvFilter::try_new(DEFAULT_LOG_FILTER).is_ok());
         assert!(DEFAULT_LOG_FILTER.contains("xl_view=info"));
-        assert!(DEFAULT_LOG_FILTER.contains("vulkan_hdr_metadata=warn"));
     }
 
     #[test]
@@ -199,7 +198,10 @@ mod tests {
     #[test]
     fn backend_unavailable_dialog_is_limited_to_desktop_launches() {
         let error = AppError::from(RuntimeError::from(
-            GpuInitializationError::backend_unavailable(wgpu::RequestAdapterError::EnvNotSet),
+            GpuInitializationError::backend_unavailable(
+                crate::gpu::native_backend_order()[0].unavailable_message(),
+                wgpu::RequestAdapterError::EnvNotSet,
+            ),
         ));
 
         assert!(should_show_startup_error_dialog(&error, false, false));

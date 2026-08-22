@@ -6,6 +6,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -53,8 +54,8 @@ mod session;
 
 use self::decoded_cache::automatic_decoded_cache_bytes;
 use self::files::{
-    FilePickerResult, FolderDirection, NeighborPaths, adjacent_image_path, first_image_path,
-    neighboring_image_paths, select_image_file,
+    FilePickerResult, FolderDirection, NeighborPaths, adjacent_image_path, dropped_file_paths,
+    first_image_path, neighboring_image_paths, select_image_file,
 };
 #[cfg(test)]
 use self::files::{choose_adjacent_path, file_name};
@@ -72,11 +73,20 @@ use self::session::{
 };
 
 const FULLSCREEN_CURSOR_HIDE_DELAY: Duration = Duration::from_secs(2);
+const DISPLAY_METADATA_REFRESH_DELAY: Duration = Duration::from_millis(150);
+#[cfg(target_os = "linux")]
+const WAYLAND_MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PinchDirection {
     In,
     Out,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupDiagnosticsState {
+    Pending,
+    Finished,
 }
 
 struct Application {
@@ -85,22 +95,25 @@ struct Application {
     cursor_position: Option<PhysicalPosition<f64>>,
     cursor_visibility: CursorVisibility,
     diagnostics: bool,
+    display_change_pending: Arc<AtomicBool>,
+    startup_diagnostics: StartupDiagnosticsState,
     fatal_error: Option<RuntimeError>,
     event_receiver: Receiver<UserEvent>,
     event_sender: UserEventSender,
     file_picker_state: FilePickerState,
     fullscreen: FullscreenState,
     gpu: Option<gpu::GpuState>,
-    instance: wgpu::Instance,
     is_dragging: bool,
     last_drag_position: Option<PhysicalPosition<f64>>,
     last_primary_click: Option<Instant>,
+    metadata_refresh_deadline: Option<Instant>,
     metadata_visible: bool,
     modifiers: ModifiersState,
     output_mode: OutputMode,
     pending_drop: Option<PendingDrop>,
     pinch_fit_block: Option<PinchDirection>,
     session: ImageSession,
+    title_hdr_surface: Option<bool>,
     gpu_memory_limit_bytes: u64,
     window: Option<Arc<dyn Window>>,
 }
@@ -365,7 +378,7 @@ impl Application {
         self.note_pointer_activity(Instant::now());
     }
 
-    fn update_window_title(&self) {
+    fn update_window_title(&mut self) {
         let Some(window) = self.window.as_ref() else {
             return;
         };
@@ -387,6 +400,13 @@ impl Application {
             format!("{APPLICATION_NAME} - No image open")
         };
         window.set_title(&title);
+        self.title_hdr_surface = self.gpu.as_ref().map(gpu::GpuState::is_hdr_surface);
+    }
+
+    fn sync_window_title_to_surface(&mut self) {
+        if self.gpu.as_ref().map(gpu::GpuState::is_hdr_surface) != self.title_hdr_surface {
+            self.update_window_title();
+        }
     }
 
     fn metadata_sections(&self) -> Vec<gpu::OverlaySection> {
@@ -417,7 +437,7 @@ impl Application {
                     ),
                     ("Color space".to_owned(), image.source_color_space.clone()),
                     (
-                        "Intensity target".to_owned(),
+                        "Source peak".to_owned(),
                         format!("{:.0} nits", image.source_intensity_nits),
                     ),
                 ],
@@ -426,10 +446,7 @@ impl Application {
         let display_rows = if let Some(gpu) = self.gpu.as_ref() {
             gpu.ui_summary_rows()
         } else {
-            vec![
-                ("Output surface".to_owned(), "pending".to_owned()),
-                ("HDR metadata".to_owned(), "Metadata pending".to_owned()),
-            ]
+            vec![("Output surface".to_owned(), "pending".to_owned())]
         };
         sections.push(gpu::OverlaySection {
             title: "DISPLAY & VIEWER",
@@ -454,6 +471,7 @@ impl Application {
     }
 
     fn refresh_metadata_overlay(&mut self) {
+        self.metadata_refresh_deadline = None;
         if !self.session.has_loaded_image() && !self.diagnostics {
             if let Some(gpu) = self.gpu.as_mut()
                 && let Err(error) = gpu.set_empty_state()
@@ -477,6 +495,12 @@ impl Application {
             self.session
                 .set_status_message(format!("Cannot update metadata overlay: {error}"));
             self.update_window_title();
+        }
+    }
+
+    fn schedule_metadata_refresh(&mut self, refresh: gpu::DisplayRefresh) {
+        if refresh.target_changed && self.metadata_visible {
+            self.metadata_refresh_deadline = Some(Instant::now() + DISPLAY_METADATA_REFRESH_DELAY);
         }
     }
 
@@ -575,12 +599,30 @@ impl Application {
                 self.fatal_error = Some(failure.into());
                 event_loop.exit();
             }
+            UserEvent::DisplayChanged => {
+                self.display_change_pending.store(false, Ordering::Relaxed);
+                // EDR headroom can change at display cadence, so do not
+                // rerasterize the metadata overlay until the changes settle.
+                let Some(refresh) = self.try_refresh_display_state(
+                    event_loop,
+                    "display parameters changed",
+                    gpu::SurfaceCapabilities::Unchanged,
+                    RuntimeError::DisplayChange,
+                ) else {
+                    return;
+                };
+                self.schedule_metadata_refresh(refresh);
+            }
             UserEvent::GpuWorkReady => {
                 if let Some(gpu) = self.gpu.as_mut()
                     && let Err(error) = gpu.process_background_work()
                 {
                     self.fatal_error = Some(RuntimeError::GpuBackgroundWork(error));
                     event_loop.exit();
+                    return;
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
                 }
             }
         }
@@ -737,12 +779,44 @@ impl Application {
         }
     }
 
-    fn handle_window_moved(&mut self, event_loop: &dyn ActiveEventLoop) {
-        if let Some(gpu) = self.gpu.as_mut()
-            && let Err(error) = gpu.refresh_display("window moved to another output")
+    fn try_refresh_display_state(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        reason: &str,
+        capabilities: gpu::SurfaceCapabilities,
+        error_context: fn(gpu::GpuOperationError) -> RuntimeError,
+    ) -> Option<gpu::DisplayRefresh> {
+        let Some(gpu) = self.gpu.as_mut() else {
+            return Some(gpu::DisplayRefresh::default());
+        };
+        let refresh = match gpu.refresh_display(reason, capabilities) {
+            Ok(refresh) => refresh,
+            Err(error) => {
+                self.fatal_error = Some(error_context(error));
+                event_loop.exit();
+                return None;
+            }
+        };
+        self.sync_window_title_to_surface();
+        if refresh.render_changed
+            && let Some(window) = self.window.as_ref()
         {
-            self.fatal_error = Some(RuntimeError::DisplayMove(error));
-            event_loop.exit();
+            window.request_redraw();
+        }
+        Some(refresh)
+    }
+
+    fn handle_window_moved(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self
+            .try_refresh_display_state(
+                event_loop,
+                "window moved to another output",
+                gpu::SurfaceCapabilities::MayHaveChanged,
+                RuntimeError::DisplayMove,
+            )
+            .is_none()
+        {
+            return;
         }
         self.refresh_metadata_overlay();
     }
@@ -752,13 +826,17 @@ impl Application {
             self.handle_pointer_departure();
             return;
         }
-        if let Some(gpu) = self.gpu.as_mut()
-            && let Err(error) = gpu.refresh_display("window regained focus")
+        if self
+            .try_refresh_display_state(
+                event_loop,
+                "window regained focus",
+                gpu::SurfaceCapabilities::MayHaveChanged,
+                RuntimeError::DisplayFocus,
+            )
+            .is_none()
         {
-            self.fatal_error = Some(RuntimeError::DisplayFocus(error));
-            event_loop.exit();
+            return;
         }
-        self.update_window_title();
         self.refresh_metadata_overlay();
         self.note_pointer_activity(Instant::now());
     }
@@ -792,9 +870,14 @@ impl Application {
             && pending.id == id
             && pending.fetch_serial == serial
         {
-            pending.data = match value.try_as_file_paths() {
+            pending.data = match dropped_file_paths(value) {
                 Ok(paths) => first_image_path(&paths)
                     .map_or(PendingDropData::Unsupported, PendingDropData::Path),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    // winit re-delivers DataTransferReceived. A new drag replaces pending state.
+                    // ErrorKind::Deadlock is also retryable but unstable on pinned Rust 1.97.
+                    return;
+                }
                 Err(error) => {
                     tracing::warn!(%error, "cannot decode dropped file paths");
                     PendingDropData::Unsupported
@@ -942,14 +1025,24 @@ impl Application {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
-        match gpu.render() {
+        let render_result = gpu.render();
+        if self.startup_diagnostics == StartupDiagnosticsState::Pending
+            && let Some(report) = gpu.startup_diagnostics_report()
+        {
+            diagnostics::print_report("startup", &report);
+            self.startup_diagnostics = StartupDiagnosticsState::Finished;
+        }
+        let display_refresh = match render_result {
             Err(error) => {
                 self.fatal_error = Some(RuntimeError::Render(error));
                 self.session.cancel_pending_presentation();
                 event_loop.exit();
+                None
             }
-            Ok(true) => {
-                if let Some((path, opening)) = self.session.finish_presentation() {
+            Ok(outcome) => {
+                if outcome.presented
+                    && let Some((path, opening)) = self.session.finish_presentation()
+                {
                     let opening_time = opening.started.elapsed();
                     tracing::info!(
                         path = %path.display(),
@@ -980,9 +1073,13 @@ impl Application {
                         diagnostics::print_report("image-presented", &report);
                     }
                 }
+                Some(outcome.display_refresh)
             }
-            Ok(false) => {}
+        };
+        if let Some(refresh) = display_refresh {
+            self.schedule_metadata_refresh(refresh);
         }
+        self.sync_window_title_to_surface();
     }
 
     fn shutdown(&mut self) {
@@ -1022,11 +1119,16 @@ fn fullscreen_cursor_hide_deadline(
 fn next_wake_deadline(
     prefetch_deadline: Option<Instant>,
     cursor_hide_deadline: Option<Instant>,
+    metadata_refresh_deadline: Option<Instant>,
 ) -> Option<Instant> {
-    [prefetch_deadline, cursor_hide_deadline]
-        .into_iter()
-        .flatten()
-        .min()
+    [
+        prefetch_deadline,
+        cursor_hide_deadline,
+        metadata_refresh_deadline,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 #[derive(Debug)]
@@ -1044,6 +1146,7 @@ enum UserEvent {
         anchor_key: ImageKey,
         result: Result<NeighborPaths, String>,
     },
+    DisplayChanged,
     GpuFailure(gpu::GpuFailure),
     GpuWorkReady,
 }
@@ -1078,24 +1181,37 @@ impl ApplicationHandler for Application {
         };
 
         let event_sender = self.event_sender.clone();
-        let report_failure = Arc::new(move |failure| {
+        let report_failure: gpu::FailureReporter = Arc::new(move |failure| {
             event_sender.send(UserEvent::GpuFailure(failure));
         });
         let work_event_sender = self.event_sender.clone();
-        let notify_work_ready = Arc::new(move || {
+        let notify_work_ready: gpu::WorkReadyNotifier = Arc::new(move || {
             work_event_sender.send(UserEvent::GpuWorkReady);
         });
+        let display_event_sender = self.event_sender.clone();
+        let display_change_pending = Arc::clone(&self.display_change_pending);
+        let notify_display_changed: gpu::DisplayChangeNotifier = Arc::new(move || {
+            // Preserve the latest provider state without building an event backlog.
+            if !display_change_pending.swap(true, Ordering::Relaxed) {
+                display_event_sender.send(UserEvent::DisplayChanged);
+            }
+        });
         match gpu::initialize(
-            &self.instance,
-            Arc::clone(&window),
+            || {
+                wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
+                    event_loop.owned_display_handle(),
+                ))
+            },
+            &window,
             self.output_mode,
             gpu::RenderingOptions {
                 exposure_stops: 0.0,
                 background: self.background,
             },
             self.diagnostics,
-            report_failure,
-            notify_work_ready,
+            &report_failure,
+            &notify_work_ready,
+            &notify_display_changed,
             self.gpu_memory_limit_bytes,
         ) {
             Ok(mut gpu) => {
@@ -1106,9 +1222,6 @@ impl ApplicationHandler for Application {
                     self.session.cancel_pending_presentation();
                     event_loop.exit();
                     return;
-                }
-                if self.diagnostics {
-                    diagnostics::print_report("startup", &gpu.startup_diagnostics_report());
                 }
                 window.request_redraw();
                 self.gpu = Some(gpu);
@@ -1134,6 +1247,19 @@ impl ApplicationHandler for Application {
     }
 
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        #[cfg(target_os = "linux")]
+        if self
+            .gpu
+            .as_ref()
+            .is_some_and(gpu::GpuState::wayland_monitor_changed)
+        {
+            // Wayland has no move event for same-scale output transitions. Winit
+            // updates current_monitor() on surface enter/leave, but does not expose
+            // that update as an application event. The poll deadline below ensures
+            // this comparison still runs while the window is otherwise idle.
+            self.handle_window_moved(event_loop);
+        }
+
         let now = Instant::now();
         if self
             .session
@@ -1143,9 +1269,39 @@ impl ApplicationHandler for Application {
             self.start_neighbor_lookup();
         }
         self.hide_fullscreen_cursor_if_due(now);
+        if self
+            .metadata_refresh_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.refresh_metadata_overlay();
+        }
 
         let prefetch_deadline = self.session.prefetch_deadline();
-        match next_wake_deadline(prefetch_deadline, self.cursor_hide_deadline) {
+        let next_deadline = next_wake_deadline(
+            prefetch_deadline,
+            self.cursor_hide_deadline,
+            self.metadata_refresh_deadline,
+        );
+
+        #[cfg(target_os = "linux")]
+        let monitor_poll_needed = self.window.as_ref().is_some_and(|window| {
+            self.startup_diagnostics == StartupDiagnosticsState::Pending
+                || (self.output_mode != OutputMode::Sdr && window.has_focus())
+        });
+        #[cfg(target_os = "linux")]
+        let next_deadline = if monitor_poll_needed {
+            // Only Auto and PQ depend on the active monitor's HDR information.
+            // Polling only while focused catches interactive window moves without
+            // waking an idle background window or rendering on every poll. The
+            // one-shot startup report also polls until Wayland identifies the
+            // window's output, including for an explicitly selected SDR surface.
+            let monitor_deadline = now + WAYLAND_MONITOR_POLL_INTERVAL;
+            Some(next_deadline.map_or(monitor_deadline, |deadline| deadline.min(monitor_deadline)))
+        } else {
+            next_deadline
+        };
+
+        match next_deadline {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
@@ -1167,6 +1323,14 @@ impl ApplicationHandler for Application {
             }
             WindowEvent::Moved(_) => self.handle_window_moved(event_loop),
             WindowEvent::Focused(focused) => self.handle_focus_changed(event_loop, focused),
+            WindowEvent::Occluded(false) => {
+                if self.metadata_visible {
+                    self.refresh_metadata_overlay();
+                }
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::DragEntered { id, .. } => self.begin_file_drop(event_loop, id),
             WindowEvent::DragDropped { id, .. } => self.handle_file_dropped(id),
             WindowEvent::DragLeft { id } => self.handle_file_drag_left(id),
@@ -1207,11 +1371,6 @@ pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
     event_loop_builder.with_wayland();
     let mut event_loop = event_loop_builder.build()?;
 
-    let mut gpu_descriptor = wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
-        event_loop.owned_display_handle(),
-    ));
-    gpu_descriptor.backends = gpu::native_backends();
-
     let (event_sender, event_receiver) = mpsc::channel();
     let event_sender = UserEventSender {
         sender: event_sender,
@@ -1229,22 +1388,29 @@ pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
         cursor_position: None,
         cursor_visibility: CursorVisibility::Visible,
         diagnostics: cli.diagnostics,
+        display_change_pending: Arc::new(AtomicBool::new(false)),
+        startup_diagnostics: if cli.diagnostics {
+            StartupDiagnosticsState::Pending
+        } else {
+            StartupDiagnosticsState::Finished
+        },
         fatal_error: None,
         event_receiver,
         event_sender,
         file_picker_state: FilePickerState::Closed,
         fullscreen: FullscreenState::Windowed,
         gpu: None,
-        instance: wgpu::Instance::new(gpu_descriptor),
         is_dragging: false,
         last_drag_position: None,
         last_primary_click: None,
+        metadata_refresh_deadline: None,
         metadata_visible: false,
         modifiers: ModifiersState::empty(),
         output_mode: cli.output,
         pending_drop: None,
         pinch_fit_block: None,
         session: ImageSession::new(decoded_cache_bytes, decode_coordinator),
+        title_hdr_surface: None,
         gpu_memory_limit_bytes: cli.gpu_memory.saturating_mul(1024 * 1024),
         window: None,
     };

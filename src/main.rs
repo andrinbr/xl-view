@@ -10,6 +10,8 @@ mod cli;
 mod diagnostics;
 mod error;
 mod gpu;
+#[cfg(test)]
+mod test_utils;
 mod units;
 
 use std::process::ExitCode;

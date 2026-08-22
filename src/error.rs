@@ -36,6 +36,9 @@ pub enum RuntimeError {
     #[error("failed to refresh the surface after a possible display change: {0}")]
     DisplayFocus(#[source] GpuOperationError),
 
+    #[error("failed to refresh the surface after display parameters changed: {0}")]
+    DisplayChange(#[source] GpuOperationError),
+
     #[error("failed to render the frame: {0}")]
     Render(#[source] GpuOperationError),
 }
@@ -53,6 +56,7 @@ impl RuntimeError {
             Self::SurfaceScaleFactor(_) => "surface_scale_factor",
             Self::DisplayMove(_) => "display_move",
             Self::DisplayFocus(_) => "display_focus",
+            Self::DisplayChange(_) => "display_change",
             Self::Render(_) => "render",
         }
     }
@@ -112,8 +116,10 @@ mod tests {
 
     #[test]
     fn backend_discovery_failure_has_its_own_runtime_category() {
-        let initialization =
-            GpuInitializationError::backend_unavailable(wgpu::RequestAdapterError::EnvNotSet);
+        let initialization = GpuInitializationError::backend_unavailable(
+            crate::gpu::native_backend_order()[0].unavailable_message(),
+            wgpu::RequestAdapterError::EnvNotSet,
+        );
         let error = AppError::from(RuntimeError::from(initialization));
 
         assert_eq!(error.category(), "gpu_backend_unavailable");
@@ -148,6 +154,13 @@ mod tests {
         assert_eq!(
             validation.to_string(),
             "failed to render the frame: surface texture acquisition failed validation"
+        );
+
+        let display_change = RuntimeError::DisplayChange(GpuOperationError::SurfaceValidation);
+        assert_eq!(display_change.category(), "display_change");
+        assert_eq!(
+            display_change.to_string(),
+            "failed to refresh the surface after display parameters changed: surface texture acquisition failed validation"
         );
     }
 }

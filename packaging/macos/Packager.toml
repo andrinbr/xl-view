@@ -1,0 +1,28 @@
+# Standalone Packager files do not inherit Cargo.toml metadata. Keep duplicated
+# fields such as the version in sync with Cargo.toml.
+name = "xl-view"
+product-name = "XL-View"
+version = "0.3.0"
+# Apple bundle identifiers cannot contain underscores, so macOS intentionally
+# uses a hyphen where the Linux and Windows application ID uses an underscore.
+identifier = "io.github.andrinbr.xl-view"
+description = "A minimalist HDR image viewer optimized for large images"
+authors = ["Andrin Brunner"]
+copyright = "Copyright 2026 Andrin Brunner and contributors"
+icons = ["../../assets/icons/io.github.andrinbr.xl_view.icns"]
+formats = ["dmg"]
+
+binaries = [
+    { path = "xl-view", main = true },
+]
+
+# Finder sends associated documents through macOS open-document events, which
+# XL-View does not handle yet. Do not advertise a broken file association.
+# `license-file` is also intentionally omitted because cargo-packager maps it to
+# a click-through DMG EULA; the license files are bundled as resources instead.
+resources = [
+    { src = "../../LICENSE", target = "licenses/LICENSE" },
+    { src = "../../COPYRIGHT", target = "licenses/COPYRIGHT" },
+    { src = "../../docs/legal/THIRD-PARTY-LICENSES.html", target = "licenses/THIRD-PARTY-LICENSES.html" },
+    { src = "../../assets/fonts/AdwaitaSans-LICENSE.txt", target = "licenses/AdwaitaSans-LICENSE.txt" },
+]

@@ -1361,6 +1361,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     use super::*;
+    use crate::test_utils::request_native_test_gpu;
 
     fn resample_test_pixels(
         dimensions: (u32, u32),
@@ -1446,21 +1447,6 @@ mod tests {
             generation: 0,
             phase: ResamplerPhase::Inactive,
         })
-    }
-
-    fn native_test_device() -> wgpu::Device {
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = crate::gpu::native_backends();
-        let instance = wgpu::Instance::new(descriptor);
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: None,
-            force_fallback_adapter: false,
-            ..Default::default()
-        }))
-        .expect("resampling lifecycle test requires a native GPU adapter");
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-            .unwrap()
-            .0
     }
 
     #[test]
@@ -1618,7 +1604,11 @@ mod tests {
     #[test]
     #[ignore = "requires a native GPU adapter for viewport texture lifecycle"]
     fn viewport_resampler_rejects_stale_results_and_handles_failures() {
-        let device = native_test_device();
+        let (device, _) = request_native_test_gpu(
+            crate::gpu::native_backends(),
+            wgpu::Features::empty(),
+            "resampling lifecycle test requires a native GPU adapter",
+        );
         let (result_sender, results) = mpsc::channel();
         let mut resampler = ViewportResampler::fallback(&device, 64 * 1024 * 1024);
         resampler.lifecycle = available_test_lifecycle(results);
@@ -1715,7 +1705,11 @@ mod tests {
     #[test]
     #[ignore = "requires a native GPU adapter for viewport texture lifecycle"]
     fn worker_disconnection_releases_a_retained_viewport_texture() {
-        let device = native_test_device();
+        let (device, _) = request_native_test_gpu(
+            crate::gpu::native_backends(),
+            wgpu::Features::empty(),
+            "resampling lifecycle test requires a native GPU adapter",
+        );
         let (result_sender, results) = mpsc::channel();
         let mut resampler = ViewportResampler::fallback(&device, 64 * 1024 * 1024);
         resampler.lifecycle = available_test_lifecycle(results);

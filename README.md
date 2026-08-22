@@ -13,13 +13,13 @@
   ![XL-View showing an example image](docs/screenshots/xl-view-example-image.png)
 </div>
 
-XL-View is a native HDR still-image viewer for Linux and Windows, built with
-Rust and Vulkan. It preserves the full HDR range of an image when HDR output is
-available, targets JPEG XL, and handles large images such as panoramas.
+XL-View is a native HDR still-image viewer for Linux, Windows, and macOS. It
+preserves the full HDR range of an image when HDR output is available, targets
+JPEG XL, and handles large images such as panoramas.
 
 ## Features
 
-- **HDR output:** display images through PQ, HLG, scRGB, or SDR, with automatic output mode selection and manual overrides
+- **HDR output:** present SDR, PQ, and HLG source images through BT.2100 PQ on HDR displays or sRGB on SDR displays
 - **Accurate color:** preserve the image's full HDR range through the display pipeline
 - **Responsive large-image viewing:** open panoramas and other large images without blocking the UI, with smooth panning
 - **Sharp scaling:** high-quality resampling for a detailed view
@@ -48,6 +48,20 @@ your desktop with an AppImage manager such as
 [Gear Lever](https://github.com/mijorus/gearlever). Point Gear Lever at the
 downloaded file and it handles installation and the menu entry.
 
+### macOS
+
+The prebuilt macOS package supports Apple silicon (ARM64) only. Download the DMG
+and drag XL-View into Applications. XL-View is currently unsigned, so macOS may
+block it on first launch. Remove its quarantine attribute before opening it:
+
+```console
+xattr -dr com.apple.quarantine /Applications/XL-View.app
+```
+
+The macOS app cannot currently open an image directly from Finder, including
+through **Open With** or by double-clicking the image. Launch XL-View first and
+drag the image into its window instead.
+
 ### Windows
 
 Download either the Setup executable or the portable ZIP. Setup installs
@@ -74,13 +88,14 @@ cargo install --locked --path .
 ```
 
 To build release packages yourself, follow the instructions for the
-[AppImage](packaging/linux/appimage/README.md) or the
+[AppImage](packaging/linux/appimage/README.md), the
+[macOS package](packaging/macos/README.md), or the
 [Windows packages](packaging/windows/README.md).
 
 ## Requirements
 
-- **A Vulkan-capable GPU and current driver:** there is no OpenGL or DirectX
-  fallback.
+- **A compatible graphics backend:** XL-View uses Vulkan on Linux, Vulkan or
+  DirectX 12 on Windows, and Metal on macOS.
 - **A native Wayland session on Linux:** there is no X11 fallback. HDR output
   additionally requires compositor HDR and Wayland color-management support.
 - **HDR support:** an HDR-capable display and compatible display environment
@@ -97,7 +112,7 @@ Arguments:
 
 Options:
       --diagnostics              Show a test pattern and print runtime/display diagnostics
-      --output <OUTPUT>          Select the display output encoding [default: auto] [possible values: auto, pq, hlg, scrgb, sdr]
+      --output <OUTPUT>          Select the display output encoding [default: auto] [possible values: auto, pq, sdr]
       --background <BACKGROUND>  Select the background used outside and behind transparent image pixels [default: black] [possible values: black, middle-gray, white, checkerboard]
       --cache <MIB>              Decoded-image cache budget in MiB [default: 25% of system RAM, at least 2048, a value of 0 disables the cache]
       --gpu-memory <MIB>         Maximum GPU image memory in MiB [default: 1024]
@@ -110,11 +125,11 @@ the window, or pressing `O` / `Ctrl+O` to use the file picker. With no image
 argument, the viewer shows a welcome screen. Use `--diagnostics` to display
 the color-bar test pattern instead.
 
-By default, the viewer prefers an HDR output surface when one is available. PQ
-is preferred for SDR and PQ sources, while HLG is preferred for HLG sources.
-Each falls back through the other HDR encodings and finally sRGB. Use `--output`
-to force a specific encoding, `--background` to change what shows behind
-transparent pixels, and `--cache` / `--gpu-memory` to tune memory use.
+By default, the viewer uses HDR output when the display supports it and sRGB
+otherwise. SDR, PQ, and HLG images are supported in either mode. Use
+`--output pq` or `--output sdr` to require a mode, `--background` to change what
+shows behind transparent pixels, and `--cache` / `--gpu-memory` to tune memory
+use.
 
 ## Controls
 
@@ -155,20 +170,21 @@ Currently JPEG XL (`.jxl`) only. Additional codecs may be implemented in the fut
 
 - **No HDR or washed-out colors:** make sure HDR is enabled in your display
   environment and that your display actually supports it.
-- **Check the pipeline:** press `I` to inspect the output surface, tone mapping,
-  and HDR metadata status, or run `xl-view --diagnostics` for a detailed report.
-- **Wrong surface selected:** override automatic selection with
-  `--output pq|hlg|scrgb|sdr`.
+- **Check the display details:** press `I` to inspect the selected output and
+  image information, or run `xl-view --diagnostics` for a detailed report.
+- **Wrong output selected:** use `--output pq` or `--output sdr` to override
+  automatic selection. If PQ output is unavailable, XL-View reports why.
 - **It won't start:** on Linux, confirm you are using a native Wayland session.
   Also confirm that a working Vulkan driver is installed.
 - **More detail:** set `RUST_LOG=xl_view=debug` for debug logging to stderr.
 
 ## Roadmap
 
-- macOS support
+- Open files directly from Finder in the macOS app
 - Support for gain maps
 - Additional codec support (primarily AVIF and JPEG)
 - Switch to `jxl-rs` once it becomes stable
+- Support for linear HDR and scRGB images
 
 ## Architecture
 
@@ -183,9 +199,8 @@ XL-View works like this (simplified):
    browsing feels instant.
 4. **Draw:** The GPU displays the image while a higher-quality CPU resize
    produces a sharp result once you stop panning.
-5. **Display:** The image is sent to the display using the appropriate HDR or
-   SDR encoding, and the display pipeline handles the final mapping to the
-   screen.
+5. **Display:** The image is prepared for the active display and shown in HDR
+   or SDR as appropriate.
 
 ## Contributing
 

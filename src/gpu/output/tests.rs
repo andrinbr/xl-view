@@ -1,10 +1,5 @@
 use super::*;
-use xl_view::color::HDR_REFERENCE_WHITE_NITS;
-
-const RENDERING_OPTIONS: RenderingOptions = RenderingOptions {
-    exposure_stops: 0.0,
-    background: BackgroundMode::Black,
-};
+use crate::gpu::display_target::HdrUnavailableReason;
 
 fn capability(
     format: TextureFormat,
@@ -16,466 +11,149 @@ fn capability(
     }
 }
 
-#[test]
-fn pq_ten_bit_beats_advertised_eight_bit_and_other_color_spaces() {
-    let capabilities = [
-        capability(TextureFormat::Rgba8Unorm, SurfaceColorSpaces::BT2100_PQ),
-        capability(
-            TextureFormat::Rgba16Float,
-            SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
-        ),
-        capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_PQ),
-    ];
-
-    assert_eq!(
-        select_surface_candidate(&capabilities, OutputMode::Auto, SourceDynamicRange::Pq),
-        Some(SurfaceCandidate {
-            format: TextureFormat::Rgb10a2Unorm,
-            color_space: SurfaceColorSpace::Bt2100Pq,
-        })
-    );
+fn unavailable_target() -> HdrTarget {
+    Err(HdrUnavailableReason::MissingDisplayInformation)
 }
 
 #[test]
-fn automatic_output_prefers_pq_for_sdr_and_matches_native_hdr_encodings() {
-    let capabilities = [
-        capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_PQ),
-        capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_HLG),
-        capability(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
-    ];
-
-    for (source_dynamic_range, format, color_space) in [
-        (
-            SourceDynamicRange::Sdr,
-            TextureFormat::Rgb10a2Unorm,
-            SurfaceColorSpace::Bt2100Pq,
-        ),
-        (
-            SourceDynamicRange::Pq,
-            TextureFormat::Rgb10a2Unorm,
-            SurfaceColorSpace::Bt2100Pq,
-        ),
-        (
-            SourceDynamicRange::Hlg,
-            TextureFormat::Rgb10a2Unorm,
-            SurfaceColorSpace::Bt2100Hlg,
-        ),
-    ] {
-        assert_eq!(
-            select_surface_candidate(&capabilities, OutputMode::Auto, source_dynamic_range,),
-            Some(SurfaceCandidate {
-                color_space,
-                format
-            })
-        );
-    }
-}
-
-fn display_hdr_info(high_dynamic_range: Option<bool>) -> wgpu::DisplayHdrInfo {
-    wgpu::DisplayHdrInfo {
-        coarse: Some(wgpu::DisplayCoarseRange {
-            high_dynamic_range,
-            gamut: None,
-        }),
-        ..Default::default()
-    }
-}
-
-#[test]
-fn automatic_output_uses_sdr_when_display_reports_hdr_disabled() {
+fn automatic_output_requires_both_target_and_pq_pair() {
     let capabilities = [
         capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_PQ),
         capability(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
     ];
-
-    let hdr_disabled = display_hdr_info(Some(false));
-    let selected = select_required_surface_candidate(
-        &capabilities,
-        OutputMode::Auto,
-        SourceDynamicRange::Hlg,
-        &hdr_disabled,
-    )
-    .unwrap();
-
-    assert_eq!(selected.color_space, SurfaceColorSpace::Srgb);
     assert_eq!(
-        select_required_surface_candidate(
-            &capabilities[..1],
-            OutputMode::Auto,
-            SourceDynamicRange::Hlg,
-            &hdr_disabled,
-        ),
-        Err(SurfaceOutputError::NoUsablePair)
-    );
-    assert_eq!(
-        select_required_surface_candidate(
-            &capabilities,
-            OutputMode::Pq,
-            SourceDynamicRange::Hlg,
-            &hdr_disabled,
+        select_required_surface(&capabilities, OutputMode::Auto, Ok(600.0)).unwrap(),
+        SurfaceSelection::pq(
+            SurfaceCandidate {
+                color_space: SurfaceColorSpace::Bt2100Pq,
+                format: TextureFormat::Rgb10a2Unorm,
+            },
+            600.0,
         )
-        .unwrap()
-        .color_space,
-        SurfaceColorSpace::Bt2100Pq
-    );
-}
-
-#[test]
-fn display_hdr_enabled_only_rejects_an_explicit_sdr_state() {
-    assert!(display_hdr_enabled(&display_hdr_info(Some(true))));
-    assert!(!display_hdr_enabled(&display_hdr_info(Some(false))));
-    assert!(display_hdr_enabled(&display_hdr_info(None)));
-    assert!(display_hdr_enabled(&wgpu::DisplayHdrInfo::default()));
-}
-
-#[test]
-fn hlg_falls_back_to_pq_when_hlg_has_no_suitable_format() {
-    let capabilities = [
-        capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_PQ),
-        capability(TextureFormat::Rgba8Unorm, SurfaceColorSpaces::BT2100_HLG),
-    ];
-
-    assert_eq!(
-        select_surface_candidate(&capabilities, OutputMode::Auto, SourceDynamicRange::Hlg),
-        Some(SurfaceCandidate {
-            format: TextureFormat::Rgb10a2Unorm,
-            color_space: SurfaceColorSpace::Bt2100Pq,
-        })
-    );
-}
-
-#[test]
-fn format_and_color_space_capabilities_are_never_mixed_across_pairs() {
-    let capabilities = [
-        capability(TextureFormat::Rgba8Unorm, SurfaceColorSpaces::BT2100_PQ),
-        capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::SRGB),
-    ];
-
-    assert_eq!(
-        select_surface_candidate(&capabilities, OutputMode::Auto, SourceDynamicRange::Hlg),
-        Some(SurfaceCandidate {
-            format: TextureFormat::Rgb10a2Unorm,
-            color_space: SurfaceColorSpace::Srgb,
-        })
     );
     assert_eq!(
-        select_surface_candidate(&capabilities, OutputMode::Pq, SourceDynamicRange::Sdr),
-        None
+        select_required_surface(&capabilities, OutputMode::Auto, unavailable_target())
+            .unwrap()
+            .candidate()
+            .color_space,
+        SurfaceColorSpace::Srgb
     );
-}
-
-#[test]
-fn extended_linear_requires_a_float_format() {
-    let capabilities = [
-        capability(
-            TextureFormat::Rgba16Unorm,
-            SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
-        ),
-        capability(
-            TextureFormat::Rgba16Float,
-            SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
-        ),
-    ];
-
     assert_eq!(
-        select_surface_candidate(&capabilities, OutputMode::Auto, SourceDynamicRange::Hlg),
-        Some(SurfaceCandidate {
-            format: TextureFormat::Rgba16Float,
-            color_space: SurfaceColorSpace::ExtendedSrgbLinear,
-        })
+        select_required_surface(&capabilities[1..], OutputMode::Auto, Ok(600.0))
+            .unwrap()
+            .candidate()
+            .color_space,
+        SurfaceColorSpace::Srgb
     );
 }
 
 #[test]
-fn srgb_is_the_final_fallback() {
-    let capabilities = [capability(
+fn forced_modes_are_strict_and_report_distinct_failures() {
+    let pq_only = [capability(
+        TextureFormat::Rgb10a2Unorm,
+        SurfaceColorSpaces::BT2100_PQ,
+    )];
+    let srgb_only = [capability(
         TextureFormat::Bgra8UnormSrgb,
         SurfaceColorSpaces::SRGB,
     )];
-
     assert_eq!(
-        select_surface_candidate(&capabilities, OutputMode::Auto, SourceDynamicRange::Hlg),
-        Some(SurfaceCandidate {
-            format: TextureFormat::Bgra8UnormSrgb,
-            color_space: SurfaceColorSpace::Srgb,
-        })
+        select_required_surface(&pq_only, OutputMode::Pq, unavailable_target()),
+        Err(SurfaceOutputError::HdrTargetUnavailable(
+            unavailable_target().unwrap_err()
+        ))
+    );
+    assert_eq!(
+        select_required_surface(&srgb_only, OutputMode::Pq, Ok(600.0)),
+        Err(SurfaceOutputError::PqSurfaceUnavailable)
+    );
+    assert_eq!(
+        select_required_surface(&pq_only, OutputMode::Sdr, Ok(600.0)),
+        Err(SurfaceOutputError::SrgbSurfaceUnavailable)
     );
 }
 
 #[test]
-fn a_non_srgb_format_is_a_secondary_sdr_fallback() {
+fn legacy_color_spaces_and_formats_are_rejected() {
     let capabilities = [
-        capability(TextureFormat::Rgba16Float, SurfaceColorSpaces::SRGB),
+        capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_HLG),
+        capability(
+            TextureFormat::Rgba16Float,
+            SurfaceColorSpaces::EXTENDED_SRGB_LINEAR,
+        ),
         capability(TextureFormat::Bgra8Unorm, SurfaceColorSpaces::SRGB),
+        capability(TextureFormat::Rgba8Unorm, SurfaceColorSpaces::SRGB),
+        capability(TextureFormat::Rgba16Float, SurfaceColorSpaces::BT2100_PQ),
     ];
-
     assert_eq!(
-        select_surface_candidate(&capabilities, OutputMode::Auto, SourceDynamicRange::Hlg),
-        Some(SurfaceCandidate {
-            format: TextureFormat::Bgra8Unorm,
-            color_space: SurfaceColorSpace::Srgb,
-        })
+        select_required_surface(&capabilities, OutputMode::Auto, Ok(600.0)),
+        Err(SurfaceOutputError::SrgbSurfaceUnavailable)
     );
 }
 
 #[test]
-fn eight_bit_hdr_without_sdr_fallback_is_unusable() {
-    let capabilities = [capability(
-        TextureFormat::Rgba8Unorm,
+fn srgb_format_preference_is_stable() {
+    let capabilities = [
+        capability(TextureFormat::Rgba8UnormSrgb, SurfaceColorSpaces::SRGB),
+        capability(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
+    ];
+    assert_eq!(
+        select_required_surface(&capabilities, OutputMode::Sdr, unavailable_target())
+            .unwrap()
+            .candidate()
+            .format,
+        TextureFormat::Bgra8UnormSrgb
+    );
+}
+
+#[test]
+#[allow(clippy::float_cmp)] // The selected target and fixed white are exact fixtures.
+fn selection_carries_a_validated_presentation_peak() {
+    let pq_capabilities = [capability(
+        TextureFormat::Rgb10a2Unorm,
         SurfaceColorSpaces::BT2100_PQ,
     )];
-
+    let pq = select_required_surface(&pq_capabilities, OutputMode::Pq, Ok(600.0)).unwrap();
+    assert_eq!(pq.output_peak_nits(), 600.0);
+    assert_eq!(pq.display_target(), Ok(600.0));
+    let refreshed_pq = pq.with_display_target(Ok(1_000.0)).unwrap();
+    assert_eq!(refreshed_pq.candidate(), pq.candidate());
+    assert_eq!(refreshed_pq.output_peak_nits(), 1_000.0);
     assert_eq!(
-        select_surface_candidate(&capabilities, OutputMode::Auto, SourceDynamicRange::Hlg),
-        None
+        pq.with_display_target(unavailable_target()),
+        Err(SurfaceOutputError::HdrTargetUnavailable(
+            unavailable_target().unwrap_err()
+        ))
+    );
+
+    let srgb_capabilities = [capability(
+        TextureFormat::Bgra8UnormSrgb,
+        SurfaceColorSpaces::SRGB,
+    )];
+    let srgb =
+        select_required_surface(&srgb_capabilities, OutputMode::Sdr, unavailable_target()).unwrap();
+    assert_eq!(srgb.output_peak_nits(), HDR_REFERENCE_WHITE_NITS);
+    assert_eq!(
+        srgb.with_display_target(Ok(1_000.0))
+            .unwrap()
+            .output_peak_nits(),
+        HDR_REFERENCE_WHITE_NITS
     );
 }
 
 #[test]
-fn forced_sdr_ignores_available_hdr_pairs() {
+fn reselecting_the_same_candidate_does_not_require_surface_reconfiguration() {
     let capabilities = [
         capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_PQ),
         capability(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
     ];
+    let current = select_required_surface(&capabilities, OutputMode::Auto, Ok(600.0)).unwrap();
+    let same = select_required_surface(&capabilities, OutputMode::Auto, Ok(600.0)).unwrap();
+    let new_peak = select_required_surface(&capabilities, OutputMode::Auto, Ok(1_000.0)).unwrap();
+    let sdr =
+        select_required_surface(&capabilities, OutputMode::Auto, unavailable_target()).unwrap();
 
-    assert_eq!(
-        select_surface_candidate(&capabilities, OutputMode::Sdr, SourceDynamicRange::Hlg),
-        Some(SurfaceCandidate {
-            format: TextureFormat::Bgra8UnormSrgb,
-            color_space: SurfaceColorSpace::Srgb,
-        })
-    );
-}
-
-#[test]
-fn forced_output_fails_instead_of_falling_back() {
-    let capabilities = [
-        capability(TextureFormat::Rgb10a2Unorm, SurfaceColorSpaces::BT2100_PQ),
-        capability(TextureFormat::Bgra8UnormSrgb, SurfaceColorSpaces::SRGB),
-    ];
-
-    assert_eq!(
-        select_surface_candidate(&capabilities, OutputMode::Hlg, SourceDynamicRange::Sdr),
-        None
-    );
-
-    let error = select_required_surface_candidate(
-        &capabilities,
-        OutputMode::Hlg,
-        SourceDynamicRange::Sdr,
-        &wgpu::DisplayHdrInfo::default(),
-    )
-    .unwrap_err();
-    assert_eq!(
-        error,
-        SurfaceOutputError::RequestedModeUnavailable(OutputMode::Hlg)
-    );
-    assert_eq!(
-        error.to_string(),
-        "requested HDR output mode 'hlg' is unavailable on this display; use '--output auto' or '--output sdr'"
-    );
-}
-
-#[test]
-fn automatic_output_reports_a_distinct_missing_surface_pair() {
-    let error = select_required_surface_candidate(
-        &[],
-        OutputMode::Auto,
-        SourceDynamicRange::Sdr,
-        &wgpu::DisplayHdrInfo::default(),
-    )
-    .unwrap_err();
-
-    assert_eq!(error, SurfaceOutputError::NoUsablePair);
-    assert_eq!(
-        error.to_string(),
-        "the GPU surface advertises no usable output format/color-space pair; check the display connection and GPU driver"
-    );
-}
-
-#[test]
-fn hdr_peaks_are_container_defined_and_sdr_uses_fixed_reference_white() {
-    let reported = wgpu::DisplayHdrInfo {
-        luminance: Some(wgpu::DisplayLuminance {
-            max_nits: Some(1_500.0),
-            sdr_white_nits: Some(180.0),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    assert_eq!(
-        resolved_output_peak_nits(SurfaceColorSpace::Bt2100Pq).to_bits(),
-        PQ_ENCODING_PEAK_NITS.to_bits(),
-    );
-    assert_eq!(
-        resolved_output_peak_nits(SurfaceColorSpace::Bt2100Hlg).to_bits(),
-        HLG_ENCODING_PEAK_NITS.to_bits(),
-    );
-    assert_eq!(
-        resolved_output_peak_nits(SurfaceColorSpace::ExtendedSrgbLinear).to_bits(),
-        EXTENDED_LINEAR_FALLBACK_PEAK_NITS.to_bits(),
-    );
-    assert_eq!(
-        resolved_output_peak_nits(SurfaceColorSpace::Srgb).to_bits(),
-        HDR_REFERENCE_WHITE_NITS.to_bits(),
-    );
-    assert_eq!(
-        resolved_ui_white_nits(SurfaceColorSpace::Srgb, &reported).to_bits(),
-        HDR_REFERENCE_WHITE_NITS.to_bits()
-    );
-    assert_eq!(
-        resolved_ui_white_nits(SurfaceColorSpace::DisplayP3, &reported).to_bits(),
-        HDR_REFERENCE_WHITE_NITS.to_bits()
-    );
-    assert_eq!(
-        resolved_ui_white_nits(SurfaceColorSpace::Bt2100Pq, &reported).to_bits(),
-        180.0_f32.to_bits()
-    );
-
-    let unknown = wgpu::DisplayHdrInfo::default();
-    assert_eq!(
-        resolved_output_peak_nits(SurfaceColorSpace::Srgb).to_bits(),
-        HDR_REFERENCE_WHITE_NITS.to_bits(),
-    );
-    assert_eq!(
-        resolved_ui_white_nits(SurfaceColorSpace::Bt2100Pq, &unknown).to_bits(),
-        HDR_REFERENCE_WHITE_NITS.to_bits()
-    );
-}
-
-#[test]
-fn tone_mapping_summary_reports_viewer_tone_mapping() {
-    assert_eq!(tone_mapping_summary(true, SourceDynamicRange::Hlg), "None");
-    assert_eq!(
-        tone_mapping_summary(true, SourceDynamicRange::Sdr),
-        "SDR to HDR"
-    );
-    assert_eq!(
-        tone_mapping_summary(false, SourceDynamicRange::Pq),
-        "HDR to SDR"
-    );
-    assert_eq!(tone_mapping_summary(false, SourceDynamicRange::Sdr), "None");
-}
-
-#[test]
-fn pq_surface_metadata_uses_hlg_intensity_target_as_max_cll() {
-    let metadata = surface_hdr_metadata(
-        SurfaceCandidate {
-            color_space: SurfaceColorSpace::Bt2100Pq,
-            format: TextureFormat::Rgb10a2Unorm,
-        },
-        RENDERING_OPTIONS,
-        SourceDynamicRange::Hlg,
-        1_000.0,
-        0.0,
-    );
-    assert_eq!(
-        metadata,
-        Some(HdrMetadata::bt2020(1_000.0, 0.0, 1_000.0, 0.0))
-    );
-}
-
-#[test]
-fn pq_metadata_uses_intensity_target_for_mastering_and_max_cll() {
-    let metadata = surface_hdr_metadata(
-        SurfaceCandidate {
-            color_space: SurfaceColorSpace::Bt2100Pq,
-            format: TextureFormat::Rgb10a2Unorm,
-        },
-        RENDERING_OPTIONS,
-        SourceDynamicRange::Pq,
-        10_000.0,
-        0.005,
-    );
-    assert_eq!(
-        metadata,
-        Some(HdrMetadata::bt2020(10_000.0, 0.005, 10_000.0, 0.0))
-    );
-}
-
-#[test]
-fn exposure_expands_the_signaled_hdr_volume() {
-    let options = RenderingOptions {
-        exposure_stops: 1.0,
-        ..RENDERING_OPTIONS
-    };
-    let metadata = surface_hdr_metadata(
-        SurfaceCandidate {
-            color_space: SurfaceColorSpace::Bt2100Pq,
-            format: TextureFormat::Rgb10a2Unorm,
-        },
-        options,
-        SourceDynamicRange::Hlg,
-        1_000.0,
-        0.0,
-    );
-    assert_eq!(
-        metadata,
-        Some(HdrMetadata::bt2020(2_000.0, 0.0, 2_000.0, 0.0))
-    );
-}
-
-#[test]
-fn invalid_hdr_numbers_fall_back_to_safe_metadata() {
-    let candidate = SurfaceCandidate {
-        color_space: SurfaceColorSpace::Bt2100Pq,
-        format: TextureFormat::Rgb10a2Unorm,
-    };
-    let expected = Some(HdrMetadata::bt2020(
-        FALLBACK_HDR_SOURCE_PEAK_NITS,
-        0.0,
-        FALLBACK_HDR_SOURCE_PEAK_NITS,
-        0.0,
-    ));
-
-    for (exposure_stops, source_peak_nits, source_min_nits) in [
-        (f32::NAN, f32::NAN, f32::NAN),
-        (f32::INFINITY, f32::INFINITY, f32::INFINITY),
-        (f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
-        (f32::NAN, -1.0, -1.0),
-    ] {
-        let options = RenderingOptions {
-            exposure_stops,
-            ..RENDERING_OPTIONS
-        };
-        assert_eq!(
-            surface_hdr_metadata(
-                candidate,
-                options,
-                SourceDynamicRange::Pq,
-                source_peak_nits,
-                source_min_nits,
-            ),
-            expected
-        );
-    }
-}
-
-#[test]
-fn sdr_surfaces_do_not_request_vulkan_hdr_metadata() {
-    assert_eq!(
-        surface_hdr_metadata(
-            SurfaceCandidate {
-                color_space: SurfaceColorSpace::Srgb,
-                format: TextureFormat::Bgra8UnormSrgb,
-            },
-            RENDERING_OPTIONS,
-            SourceDynamicRange::Sdr,
-            HDR_REFERENCE_WHITE_NITS,
-            0.0,
-        ),
-        None
-    );
-}
-
-#[test]
-fn hdr_surface_classification_includes_hdr_encodings_and_scrgb() {
-    for color_space in [
-        SurfaceColorSpace::Bt2100Pq,
-        SurfaceColorSpace::Bt2100Hlg,
-        SurfaceColorSpace::ExtendedSrgbLinear,
-    ] {
-        assert!(is_hdr_color_space(color_space));
-    }
-    assert!(!is_hdr_color_space(SurfaceColorSpace::Srgb));
+    assert!(!same.requires_surface_reconfiguration(current));
+    assert!(!new_peak.requires_surface_reconfiguration(current));
+    assert!(sdr.requires_surface_reconfiguration(current));
 }

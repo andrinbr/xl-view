@@ -1,6 +1,6 @@
 [package]
 name = "xl-view"
-version = "0.2.0"
+version = "0.3.0"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,7 +17,6 @@ LegalCopyright = "Copyright 2026 Andrin Brunner and contributors"
 
 [workspace]
 members = ["crates/vulkan-hdr-metadata"]
-default-members = ["."]
 resolver = "3"
 
 [workspace.package]
@@ -51,15 +50,15 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Temporary until a winit release includes the new drag-and-drop API: https://github.com/rust-windowing/winit/pull/4571
-# Keep upstream master pinned to an exact revision and switch back to a crates.io winit release once the API is released.
+# Keep upstream master pinned to an exact revision, keep direct winit-* dependencies
+# below at the same revision, and switch back to crates.io once the API is released.
 winit = { git = "https://github.com/rust-windowing/winit", rev = "42366231b0d92480a933339bd5eaa7fba8106f42", default-features = false, features = [
     "wayland",
     "wayland-csd-adwaita",
     "wayland-dlopen",
 ] }
 
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-vulkan-hdr-metadata = { path = "crates/vulkan-hdr-metadata" }
+[target.'cfg(target_os = "linux")'.dependencies]
 wgpu = { version = "30.0.0", default-features = false, features = [
     "parking_lot",
     "std",
@@ -67,10 +66,36 @@ wgpu = { version = "30.0.0", default-features = false, features = [
     "wgsl",
 ] }
 
+# wgpu identifies the surface as PQ/BT.2020 but cannot declare its luminance range.
+# Without this bridge, Wayland compositors may assume a 10,000-nit source and tone-map
+# XL-View's already display-mapped output a second time, making the image too dark.
+vulkan-hdr-metadata = { path = "crates/vulkan-hdr-metadata" }
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 winsafe = { version = "0.0.28", features = ["kernel"] }
+wgpu = { version = "30.0.0", default-features = false, features = [
+    "dx12",
+    "parking_lot",
+    "std",
+    "vulkan",
+    "wgsl",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "NSNotification",
+    "NSOperation",
+    "NSString",
+    "NSURL",
+    "block2",
+    "std",
+] }
+winit-common = { git = "https://github.com/rust-windowing/winit", rev = "42366231b0d92480a933339bd5eaa7fba8106f42", features = [
+    "foundation",
+] }
 wgpu = { version = "30.0.0", default-features = false, features = [
     "metal",
     "parking_lot",

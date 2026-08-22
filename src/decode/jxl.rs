@@ -1111,6 +1111,7 @@ fn extract_metadata(image: &JxlImage) -> ImageMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::fixture_path;
 
     struct ChunkedReader<R> {
         inner: R,
@@ -1367,10 +1368,7 @@ mod tests {
 
     #[test]
     fn retained_memory_estimate_matches_completed_storage() {
-        let bytes = fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_pattern-sRGB.jxl"),
-        )
-        .unwrap();
+        let bytes = fs::read(fixture_path("test_pattern-sRGB.jxl")).unwrap();
         let image = decode_memory(&bytes, DecodeLimits::from_memory_ceiling_mib(64)).unwrap();
         assert_eq!(
             estimated_memory_cost_bytes(image.width, image.height).unwrap(),
@@ -1380,10 +1378,7 @@ mod tests {
 
     #[test]
     fn decoder_accepts_streamed_input() {
-        let bytes = fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_pattern-sRGB.jxl"),
-        )
-        .unwrap();
+        let bytes = fs::read(fixture_path("test_pattern-sRGB.jxl")).unwrap();
         let limits = DecodeLimits::from_memory_ceiling_mib(64);
         let mut reader = ChunkedReader {
             inner: Cursor::new(bytes),
@@ -1399,10 +1394,7 @@ mod tests {
 
     #[test]
     fn oversized_prefetch_stops_after_header_inspection() {
-        let bytes = fs::read(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_pattern-sRGB.jxl"),
-        )
-        .unwrap();
+        let bytes = fs::read(fixture_path("test_pattern-sRGB.jxl")).unwrap();
         let limits = DecodeLimits::from_memory_ceiling_mib(64);
         assert!(matches!(
             decode_initialized_image(

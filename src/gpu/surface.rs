@@ -9,25 +9,22 @@ use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use wgpu::SurfaceColorSpace;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-use super::WorkReadyNotifier;
 use super::diagnostics::{self, ImageDiagnostics, ImageWorkDiagnostics};
+#[cfg(target_os = "linux")]
+use super::display_target::HdrUnavailableReason;
+use super::display_target::{DisplayTargetProvider, HdrTarget};
 use super::hdr_metadata::{self, HdrMetadata, HdrSurface, SignalStatus};
 use super::mip::{create_rgba16f_texture, mip_level_count, rgba16f_texture_budget_bytes};
 #[cfg(test)]
 use super::mip::{encode_premultiplied_rgba16f_row, generate_linear_mips_for_layers};
 #[cfg(test)]
+use super::output::SurfaceCandidate;
 use super::output::{
-    EXTENDED_LINEAR_FALLBACK_PEAK_NITS, HLG_ENCODING_PEAK_NITS, PQ_ENCODING_PEAK_NITS,
-};
-use super::output::{
-    FALLBACK_HDR_SOURCE_PEAK_NITS, RenderingOptions, SurfaceCandidate, SurfaceOutputError,
-    finite_non_negative, is_hdr_color_space, quantization_bits, resolved_output_peak_nits,
-    resolved_ui_white_nits, select_required_surface_candidate, shader_mode, surface_configuration,
-    surface_hdr_metadata, tone_mapping_summary,
+    FALLBACK_HDR_SOURCE_PEAK_NITS, RenderingOptions, SurfaceOutputError, SurfaceSelection,
+    is_hdr_color_space, select_required_surface, surface_configuration,
 };
 #[cfg(test)]
 use super::presentation::{PARAM_BUFFER_USAGE, presentation_shader_source};
@@ -43,9 +40,10 @@ use super::tiles::{TileCache, tile_texture_extent, working_set_capacity};
 use super::ui::{OverlayImage, OverlaySection, render_empty_state, render_text_overlay};
 use super::upload::upload_staging_buffer_bytes;
 use super::view::ViewTransform;
+use super::{DisplayChangeNotifier, FailureReporter, NativeBackend, WorkReadyNotifier};
 use crate::cli::{BackgroundMode, OutputMode};
 use crate::units::bytes_to_mib;
-use xl_view::color::HDR_REFERENCE_WHITE_NITS;
+use xl_view::color::{HDR_REFERENCE_WHITE_NITS, pq_oetf};
 use xl_view::decode::{DecodedImage, DecodedTileStore, SourceDynamicRange, TILE_GUTTER, TILE_SIZE};
 
 const HLG_PATTERN_SOURCE_PEAK_NITS: f32 = 1_000.0;
@@ -115,11 +113,11 @@ pub(crate) enum GpuInitializationError {
 }
 
 impl GpuInitializationError {
-    pub(crate) fn backend_unavailable(source: wgpu::RequestAdapterError) -> Self {
-        Self::BackendUnavailable {
-            message: super::backend_unavailable_message(),
-            source,
-        }
+    pub(crate) fn backend_unavailable(
+        message: &'static str,
+        source: wgpu::RequestAdapterError,
+    ) -> Self {
+        Self::BackendUnavailable { message, source }
     }
 
     pub(crate) const fn category(&self) -> &'static str {
@@ -146,7 +144,23 @@ pub(crate) enum GpuOperationError {
     SurfaceValidation,
 }
 
-type FailureReporter = Arc<dyn Fn(GpuFailure) + Send + Sync>;
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DisplayRefresh {
+    pub(crate) render_changed: bool,
+    pub(crate) target_changed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RenderOutcome {
+    pub(crate) display_refresh: DisplayRefresh,
+    pub(crate) presented: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SurfaceCapabilities {
+    Unchanged,
+    MayHaveChanged,
+}
 
 /// Shader-visible resources that exist for both the empty and loaded states.
 ///
@@ -169,9 +183,7 @@ struct ImageState {
     store: Arc<DecodedTileStore>,
     dimensions: (u32, u32),
     view_transform: ViewTransform,
-    source_dynamic_range: SourceDynamicRange,
     source_peak_nits: f32,
-    source_min_nits: f32,
     base_gpu_budget_bytes: u64,
     coarse_gpu_bytes: u64,
     resampling_memory_shortfall: Option<(u64, u64)>,
@@ -222,11 +234,6 @@ enum ResamplingReservation {
     Insufficient { required: u64, available: u64 },
 }
 
-#[derive(Clone, Copy)]
-struct SurfaceSelection {
-    candidate: SurfaceCandidate,
-}
-
 /// A fully validated image transition whose remaining commit steps are infallible.
 ///
 /// Preparation only borrows the renderer, so a failure drops staged resources
@@ -248,11 +255,10 @@ impl ResamplingReservation {
 
 pub struct GpuState {
     adapter: wgpu::Adapter,
-    candidate: SurfaceCandidate,
     config: wgpu::SurfaceConfiguration,
     device: wgpu::Device,
+    display_target_provider: DisplayTargetProvider,
     instance: wgpu::Instance,
-    last_hdr_info: wgpu::DisplayHdrInfo,
     output_mode: OutputMode,
     rendering_options: RenderingOptions,
     queue: wgpu::Queue,
@@ -268,19 +274,24 @@ pub struct GpuState {
     // Keep tile upload transactions atomic relative to presentation submission,
     // and prevent submission while surface configuration waits for idle.
     submission_lock: Arc<Mutex<()>>,
+    selection: SurfaceSelection,
+    #[cfg(target_os = "linux")]
+    monitor_name: Option<String>,
     ui_centered: bool,
     window: Arc<dyn Window>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keeps surface/device/metadata initialization in one fallible transaction.
-pub fn initialize(
+pub(super) fn initialize(
     instance: &wgpu::Instance,
+    backend: NativeBackend,
     window: Arc<dyn Window>,
     output_mode: OutputMode,
     rendering_options: RenderingOptions,
     diagnostics_pattern: bool,
     report_failure: FailureReporter,
     notify_work_ready: WorkReadyNotifier,
+    notify_display_changed: DisplayChangeNotifier,
     gpu_memory_limit_bytes: u64,
 ) -> Result<GpuState, GpuInitializationError> {
     let surface = instance
@@ -291,46 +302,43 @@ pub fn initialize(
         compatible_surface: Some(&surface),
         ..Default::default()
     }))
-    .map_err(GpuInitializationError::backend_unavailable)?;
+    .map_err(|source| {
+        GpuInitializationError::backend_unavailable(backend.unavailable_message(), source)
+    })?;
+    let display_target_provider = DisplayTargetProvider::new(notify_display_changed);
+    #[cfg(target_os = "linux")]
+    let monitor_name = current_monitor_name(window.as_ref());
+    #[cfg(target_os = "linux")]
+    let display_target = display_target_provider.target(monitor_name.as_deref());
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let display_target = display_target_provider.target(&surface.display_hdr_info(&adapter));
     let capabilities = surface.get_capabilities(&adapter);
-    let initial_hdr_info = surface.display_hdr_info(&adapter);
-    let source_dynamic_range = if diagnostics_pattern {
-        SourceDynamicRange::Hlg
-    } else {
-        SourceDynamicRange::Sdr
-    };
-    let candidate = select_required_surface_candidate(
+    let selection = select_surface_with_wayland_bootstrap(
         &capabilities.format_capabilities,
         output_mode,
-        source_dynamic_range,
-        &initial_hdr_info,
+        display_target,
+        #[cfg(target_os = "linux")]
+        monitor_name.as_deref(),
     )?;
+    let candidate = selection.candidate();
     let device_descriptor = viewer_device_descriptor();
-    let (device, queue, hdr_metadata_signaler) =
-        pollster::block_on(hdr_metadata::request_device(&adapter, &device_descriptor))
-            .map_err(|error| GpuInitializationError::DeviceCreation(Box::new(error)))?;
-    let metadata_supported = hdr_metadata_signaler.is_supported();
-    let mut surface = hdr_metadata_signaler.bind_surface(surface);
+    let (device, queue, mut surface) = pollster::block_on(hdr_metadata::request_device(
+        &adapter,
+        &device_descriptor,
+        surface,
+    ))
+    .map_err(|error| GpuInitializationError::DeviceCreation(Box::new(error)))?;
     install_failure_callbacks(&device, report_failure);
     let size = window.surface_size();
     let config = surface_configuration(candidate, size);
-    let initial_metadata = surface_hdr_metadata(
-        candidate,
-        rendering_options,
-        source_dynamic_range,
-        HLG_PATTERN_SOURCE_PEAK_NITS,
-        0.0,
-    );
-    let hdr_metadata_status = surface.configure(&config, initial_metadata);
-    let last_hdr_info = surface.display_hdr_info(&adapter);
+    let hdr_metadata_status = surface.configure(&config, output_hdr_metadata(selection));
     let adapter_info = adapter.get_info();
     tracing::info!(
         adapter = %adapter_info.name,
         device_type = ?adapter_info.device_type,
         backend = ?adapter_info.backend,
-        surface_format = ?candidate.format,
-        color_space = ?candidate.color_space,
-        metadata_supported,
+        initial_surface_format = ?candidate.format,
+        initial_color_space = ?candidate.color_space,
         metadata_status = %hdr_metadata_status,
         "GPU surface initialized"
     );
@@ -355,12 +363,10 @@ pub fn initialize(
     });
     let submission_lock = Arc::new(Mutex::new(()));
     let params = shader_parameters(
-        candidate,
+        selection,
         rendering_options,
-        &last_hdr_info,
         None,
-        source_dynamic_range,
-        HLG_PATTERN_SOURCE_PEAK_NITS,
+        unloaded_source_peak_nits(diagnostics_pattern),
         (config.width, config.height),
         None,
         diagnostics_pattern,
@@ -379,11 +385,10 @@ pub fn initialize(
 
     Ok(GpuState {
         adapter,
-        candidate,
         config,
         device,
+        display_target_provider,
         instance: instance.clone(),
-        last_hdr_info,
         output_mode,
         rendering_options,
         queue,
@@ -397,9 +402,42 @@ pub fn initialize(
         diagnostics_pattern,
         notify_work_ready,
         submission_lock,
+        selection,
+        #[cfg(target_os = "linux")]
+        monitor_name,
         ui_centered: false,
         window,
     })
+}
+
+fn select_surface_with_wayland_bootstrap(
+    capabilities: &[wgpu::SurfaceFormatCapabilities],
+    output_mode: OutputMode,
+    display_target: HdrTarget,
+    #[cfg(target_os = "linux")] monitor_name: Option<&str>,
+) -> Result<SurfaceSelection, SurfaceOutputError> {
+    #[cfg(target_os = "linux")]
+    if output_mode == OutputMode::Pq
+        && monitor_name.is_none()
+        && display_target == Err(HdrUnavailableReason::OutputUnmatched)
+    {
+        // A new Wayland surface has no wl_output association until its first
+        // commit. On multi-output systems that makes strict PQ selection
+        // impossible during synchronous GPU initialization. Configure an sRGB
+        // bootstrap surface so the compositor can identify the output; the
+        // next display refresh then re-runs strict PQ selection before the
+        // startup diagnostics report is emitted.
+        tracing::debug!("waiting for Wayland to identify the window output before selecting PQ");
+        return select_required_surface(capabilities, OutputMode::Sdr, display_target);
+    }
+    select_required_surface(capabilities, output_mode, display_target)
+}
+
+#[cfg(target_os = "linux")]
+fn current_monitor_name(window: &dyn Window) -> Option<String> {
+    window
+        .current_monitor()
+        .and_then(|monitor| monitor.name().map(Into::into))
 }
 
 fn viewer_device_descriptor() -> wgpu::DeviceDescriptor<'static> {
@@ -407,6 +445,11 @@ fn viewer_device_descriptor() -> wgpu::DeviceDescriptor<'static> {
     descriptor.required_features |= wgpu::Features::CLEAR_TEXTURE;
     descriptor.memory_hints = wgpu::MemoryHints::MemoryUsage;
     descriptor
+}
+
+fn output_hdr_metadata(selection: SurfaceSelection) -> Option<HdrMetadata> {
+    is_hdr_color_space(selection.candidate().color_space)
+        .then(|| HdrMetadata::display_mapped_bt2020(selection.output_peak_nits()))
 }
 
 fn install_failure_callbacks(device: &wgpu::Device, report_failure: FailureReporter) {
@@ -461,36 +504,28 @@ fn create_ui_texture(
     )
 }
 
+const fn unloaded_source_peak_nits(diagnostics_pattern: bool) -> f32 {
+    if diagnostics_pattern {
+        HLG_PATTERN_SOURCE_PEAK_NITS
+    } else {
+        HDR_REFERENCE_WHITE_NITS
+    }
+}
+
 impl GpuState {
     fn image_bindings(&self) -> &ImageBindings {
         self.image.bindings()
     }
 
-    fn source_dynamic_range(&self) -> SourceDynamicRange {
-        self.image.loaded().map_or(
-            if self.diagnostics_pattern {
-                SourceDynamicRange::Hlg
-            } else {
-                SourceDynamicRange::Sdr
-            },
-            |image| image.source_dynamic_range,
+    fn source_peak_nits(&self) -> f32 {
+        self.image.loaded().map_or_else(
+            || unloaded_source_peak_nits(self.diagnostics_pattern),
+            |image| image.source_peak_nits,
         )
     }
 
-    fn source_peak_nits(&self) -> f32 {
-        self.image
-            .loaded()
-            .map_or(HLG_PATTERN_SOURCE_PEAK_NITS, |image| image.source_peak_nits)
-    }
-
-    fn source_min_nits(&self) -> f32 {
-        self.image
-            .loaded()
-            .map_or(0.0, |image| image.source_min_nits)
-    }
-
     pub fn is_hdr_surface(&self) -> bool {
-        is_hdr_color_space(self.candidate.color_space)
+        is_hdr_color_space(self.selection.candidate().color_space)
     }
 
     pub fn image_gpu_budget_bytes(&self) -> u64 {
@@ -499,58 +534,43 @@ impl GpuState {
             .map_or(FALLBACK_IMAGE_GPU_BYTES, ImageState::gpu_budget_bytes)
     }
 
-    pub fn hdr_metadata_summary(&self) -> &'static str {
-        match self.hdr_metadata_status {
-            #[cfg(not(target_vendor = "apple"))]
-            SignalStatus::Signaled => "Metadata signaled",
-            SignalStatus::NotRequested => "Metadata not requested",
-            SignalStatus::Unsupported => "Metadata unsupported",
-            #[cfg(not(target_vendor = "apple"))]
-            SignalStatus::SurfaceUnavailable => "Metadata unavailable",
-        }
-    }
-
     pub fn ui_summary_rows(&self) -> Vec<(String, String)> {
-        let display_capability = [
-            self.last_hdr_info
-                .luminance
-                .and_then(|luminance| luminance.max_nits)
-                .map(|nits| format!("peak {nits:.0} nits")),
-            self.last_hdr_info
-                .tone_map_headroom()
-                .map(|value| format!("headroom {value:.2}x")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(", ");
+        let candidate = self.selection.candidate();
         let mut rows = vec![(
             "Output surface".to_owned(),
             format!(
                 "{} selected ({:?}/{:?})",
                 if self.is_hdr_surface() { "HDR" } else { "SDR" },
-                self.candidate.format,
-                self.candidate.color_space,
+                candidate.format,
+                candidate.color_space,
             ),
         )];
-        if !display_capability.is_empty() {
-            rows.push(("Display capability".to_owned(), display_capability));
+        match self.selection.display_target() {
+            Ok(peak_nits) => rows.push(("Display peak".to_owned(), format!("{peak_nits:.0} nits"))),
+            Err(reason) => {
+                rows.push(("Display peak".to_owned(), format!("Unavailable ({reason})")));
+            }
         }
-        rows.extend([
-            (
-                "Tone mapping".to_owned(),
-                tone_mapping_summary(self.is_hdr_surface(), self.source_dynamic_range()).to_owned(),
-            ),
-            (
-                "HDR metadata".to_owned(),
-                self.hdr_metadata_summary().to_owned(),
-            ),
-            (
-                "Exposure".to_owned(),
-                format!("{:+.2} stops", self.rendering_options.exposure_stops),
-            ),
-        ]);
+        #[cfg(target_os = "linux")]
+        rows.push((
+            "HDR metadata".to_owned(),
+            self.hdr_metadata_summary().to_owned(),
+        ));
+        rows.push((
+            "Exposure".to_owned(),
+            format!("{:+.2} stops", self.rendering_options.exposure_stops),
+        ));
         rows
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hdr_metadata_summary(&self) -> &'static str {
+        match self.hdr_metadata_status {
+            SignalStatus::Signaled => "Metadata signaled",
+            SignalStatus::NotRequested => "Metadata not requested",
+            SignalStatus::Unsupported => "Metadata unsupported",
+            SignalStatus::SurfaceUnavailable => "Metadata unavailable",
+        }
     }
 
     pub fn set_metadata_overlay(&mut self, sections: &[OverlaySection]) -> Result<(), io::Error> {
@@ -657,9 +677,7 @@ impl GpuState {
                 store: Arc::clone(store),
                 dimensions: (image.width, image.height),
                 view_transform,
-                source_dynamic_range: image.source_dynamic_range,
                 source_peak_nits,
-                source_min_nits: finite_non_negative(image.metadata.tone_mapping.min_nits),
                 base_gpu_budget_bytes,
                 coarse_gpu_bytes,
                 resampling_memory_shortfall: None,
@@ -683,7 +701,7 @@ impl GpuState {
         );
         let (image_state, resampling_reservation) =
             self.create_image_state(image, view_transform)?;
-        let surface_selection = self.select_surface(image.source_dynamic_range)?;
+        let surface_selection = self.select_surface()?;
         Ok(PreparedImageInstall {
             image: image_state,
             resampling_reservation,
@@ -709,14 +727,20 @@ impl GpuState {
                 .request_view(&self.queue, image.view_transform);
         }
         let _ = self.request_resampling();
-        if surface_selection.candidate.format == self.candidate.format {
+        if surface_selection.candidate().format == self.selection.candidate().format {
             self.rebuild_image_bind_group();
         }
-        if surface_selection.candidate == self.candidate {
+        if surface_selection.candidate() == self.selection.candidate() {
+            let output_peak_changed = surface_selection.display_target()
+                != self.selection.display_target()
+                && is_hdr_color_space(surface_selection.candidate().color_space);
+            self.set_selection(surface_selection, "image changed");
+            if output_peak_changed {
+                self.refresh_hdr_metadata("display target changed while loading image");
+            }
             self.update_params();
-            self.refresh_hdr_metadata("image changed");
         } else {
-            self.configure_surface(surface_selection, "source dynamic range changed");
+            self.configure_surface(surface_selection, "display target changed");
         }
     }
 
@@ -804,7 +828,6 @@ impl GpuState {
         self.rendering_options.exposure_stops =
             (self.rendering_options.exposure_stops + delta_stops).clamp(-10.0, 10.0);
         self.update_params();
-        self.refresh_hdr_metadata("exposure changed");
         self.window.request_redraw();
     }
 
@@ -815,7 +838,6 @@ impl GpuState {
         }
         self.request_view_work();
         self.update_params();
-        self.refresh_hdr_metadata("exposure reset");
         self.window.request_redraw();
     }
 
@@ -825,10 +847,17 @@ impl GpuState {
         self.window.request_redraw();
     }
 
-    pub fn refresh_display(&mut self, reason: &str) -> Result<(), GpuOperationError> {
-        self.reconfigure(reason)?;
-        self.window.request_redraw();
-        Ok(())
+    pub fn refresh_display(
+        &mut self,
+        reason: &str,
+        capabilities: SurfaceCapabilities,
+    ) -> Result<DisplayRefresh, GpuOperationError> {
+        self.refresh_surface_selection(reason, capabilities)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn wayland_monitor_changed(&self) -> bool {
+        self.monitor_name != current_monitor_name(self.window.as_ref())
     }
 
     pub fn process_background_work(&mut self) -> Result<(), io::Error> {
@@ -1010,22 +1039,39 @@ impl GpuState {
         );
     }
 
-    pub fn render(&mut self) -> Result<bool, GpuOperationError> {
+    pub fn render(&mut self) -> Result<RenderOutcome, GpuOperationError> {
+        let display_refresh = if DisplayTargetProvider::QUERY_BEFORE_RENDER {
+            self.refresh_surface_selection(
+                "display target queried before render",
+                SurfaceCapabilities::Unchanged,
+            )?
+        } else {
+            DisplayRefresh::default()
+        };
         let (surface_texture, suboptimal) = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture) => (texture, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(texture) => (texture, true),
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(false);
+                return Ok(RenderOutcome {
+                    display_refresh,
+                    presented: false,
+                });
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
                 self.reconfigure("surface became outdated")?;
                 self.window.request_redraw();
-                return Ok(false);
+                return Ok(RenderOutcome {
+                    display_refresh,
+                    presented: false,
+                });
             }
             wgpu::CurrentSurfaceTexture::Lost => {
                 self.recreate_surface()?;
                 self.window.request_redraw();
-                return Ok(false);
+                return Ok(RenderOutcome {
+                    display_refresh,
+                    presented: false,
+                });
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 return Err(GpuOperationError::SurfaceValidation);
@@ -1075,19 +1121,38 @@ impl GpuState {
             self.window.request_redraw();
         }
 
-        Ok(true)
+        Ok(RenderOutcome {
+            display_refresh,
+            presented: true,
+        })
     }
 
-    pub fn startup_diagnostics_report(&self) -> String {
-        diagnostics::startup_report(
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
+    pub fn startup_diagnostics_report(&self) -> Option<String> {
+        // Windows and macOS expose their native HDR data through wgpu. Wayland
+        // is queried by our separate color-management provider, so using wgpu's
+        // empty DisplayHdrInfo there would hide the data that drove selection.
+        #[cfg(target_os = "linux")]
+        let raw_display_information = {
+            // A Wayland window receives its output association only after the
+            // first surface commit. Before then the report would describe a
+            // potentially unrelated output.
+            let monitor_name = self.monitor_name.as_deref()?;
+            self.display_target_provider
+                .raw_display_information(Some(monitor_name))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let raw_display_information =
+            format!("{:#?}", self.surface.display_hdr_info(&self.adapter));
+        Some(diagnostics::startup_report(
             &self.adapter,
             &self.surface,
             self.output_mode,
-            self.source_dynamic_range(),
-            self.candidate,
+            self.selection,
             self.hdr_metadata_status,
+            &raw_display_information,
             self.diagnostics_pattern,
-        )
+        ))
     }
 
     pub fn image_diagnostics_report(&self) -> String {
@@ -1095,7 +1160,6 @@ impl GpuState {
         diagnostics::image_report(ImageDiagnostics {
             background: self.rendering_options.background.as_str(),
             exposure_stops: self.rendering_options.exposure_stops,
-            hdr_metadata_status: self.hdr_metadata_status,
             cpu_storage_bytes: loaded.map_or(0, |image| image.cpu_storage_bytes),
             upload_staging_buffer_bytes: loaded
                 .map_or(FALLBACK_UPLOAD_STAGING_BUFFER_BYTES, |image| {
@@ -1130,29 +1194,76 @@ impl GpuState {
         self.reconfigure("surface was lost and recreated")
     }
 
-    fn select_surface(
+    fn query_display_target(&self) -> HdrTarget {
+        #[cfg(target_os = "linux")]
+        {
+            self.display_target_provider
+                .target(self.monitor_name.as_deref())
+        }
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            let hdr_info = self.surface.display_hdr_info(&self.adapter);
+            self.display_target_provider.target(&hdr_info)
+        }
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
+    fn refresh_monitor_name(&mut self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let monitor_name = current_monitor_name(self.window.as_ref());
+            let changed = monitor_name != self.monitor_name;
+            self.monitor_name = monitor_name;
+            changed
+        }
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
+    fn select_surface_for_target(
         &self,
-        source_dynamic_range: SourceDynamicRange,
+        display_target: HdrTarget,
     ) -> Result<SurfaceSelection, SurfaceOutputError> {
         let capabilities = self.surface.get_capabilities(&self.adapter);
-        let hdr_info = self.surface.display_hdr_info(&self.adapter);
-        let candidate = select_required_surface_candidate(
+        select_surface_with_wayland_bootstrap(
             &capabilities.format_capabilities,
             self.output_mode,
-            source_dynamic_range,
-            &hdr_info,
-        )?;
-        Ok(SurfaceSelection { candidate })
+            display_target,
+            #[cfg(target_os = "linux")]
+            self.monitor_name.as_deref(),
+        )
+    }
+
+    fn select_surface(&self) -> Result<SurfaceSelection, SurfaceOutputError> {
+        self.select_surface_for_target(self.query_display_target())
+    }
+
+    fn log_display_target_change(&self, display_target: HdrTarget, reason: &str) {
+        let previous_display_target = self.selection.display_target();
+        if display_target != previous_display_target {
+            tracing::debug!(
+                reason,
+                ?previous_display_target,
+                ?display_target,
+                "display target changed"
+            );
+        }
+    }
+
+    fn set_selection(&mut self, selection: SurfaceSelection, reason: &str) {
+        self.log_display_target_change(selection.display_target(), reason);
+        self.selection = selection;
     }
 
     fn configure_surface(&mut self, selection: SurfaceSelection, reason: &str) {
-        let SurfaceSelection { candidate } = selection;
-        let candidate_changed = candidate != self.candidate;
+        let candidate = selection.candidate();
+        let previous_candidate = self.selection.candidate();
+        let candidate_changed = candidate != previous_candidate;
         if candidate_changed {
             tracing::info!(
                 reason,
-                previous_format = ?self.candidate.format,
-                previous_color_space = ?self.candidate.color_space,
+                previous_format = ?previous_candidate.format,
+                previous_color_space = ?previous_candidate.color_space,
                 format = ?candidate.format,
                 color_space = ?candidate.color_space,
                 "surface output changed"
@@ -1168,8 +1279,8 @@ impl GpuState {
             candidate,
             PhysicalSize::new(self.config.width, self.config.height),
         );
-        let format_changed = candidate.format != self.candidate.format;
-        self.candidate = candidate;
+        let format_changed = candidate.format != previous_candidate.format;
+        self.set_selection(selection, reason);
         if format_changed {
             let bindings = self.image.bindings();
             self.presentation.rebuild_pipeline(
@@ -1182,44 +1293,75 @@ impl GpuState {
                 &self.image_sampler,
             );
         }
-        let metadata = self.current_hdr_metadata();
-        let status = {
+        {
             let submission_lock = Arc::clone(&self.submission_lock);
             let _submission_guard = submission_lock
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.surface.configure(&self.config, metadata)
-        };
-        self.set_hdr_metadata_status(status, reason);
-        let hdr_info = self.surface.display_hdr_info(&self.adapter);
-        let hdr_info_changed = hdr_info != self.last_hdr_info;
-        if hdr_info_changed {
-            tracing::info!(reason, hdr_info = ?hdr_info, "display HDR information changed");
+            let metadata = output_hdr_metadata(self.selection);
+            let status = self.surface.configure(&self.config, metadata);
+            self.set_hdr_metadata_status(status, reason);
         }
-        self.last_hdr_info = hdr_info;
         self.update_params();
     }
 
     fn reconfigure(&mut self, reason: &str) -> Result<(), GpuOperationError> {
-        let selection = self.select_surface(self.source_dynamic_range())?;
+        self.refresh_monitor_name();
+        let selection = self.select_surface()?;
         self.configure_surface(selection, reason);
         Ok(())
     }
 
-    fn current_hdr_metadata(&self) -> Option<HdrMetadata> {
-        surface_hdr_metadata(
-            self.candidate,
-            self.rendering_options,
-            self.source_dynamic_range(),
-            self.source_peak_nits(),
-            self.source_min_nits(),
-        )
+    fn refresh_surface_selection(
+        &mut self,
+        reason: &str,
+        capabilities: SurfaceCapabilities,
+    ) -> Result<DisplayRefresh, GpuOperationError> {
+        let monitor_changed = self.refresh_monitor_name();
+        let display_target = self.query_display_target();
+        let target_changed = display_target != self.selection.display_target();
+        if !target_changed && capabilities == SurfaceCapabilities::Unchanged && !monitor_changed {
+            return Ok(DisplayRefresh::default());
+        }
+        let eligibility_changed = display_target.is_ok() != self.selection.display_target().is_ok();
+        let selection = if capabilities == SurfaceCapabilities::MayHaveChanged
+            || monitor_changed
+            || (self.output_mode == OutputMode::Auto && eligibility_changed)
+        {
+            self.select_surface_for_target(display_target)
+        } else {
+            self.selection.with_display_target(display_target)
+        };
+        let selection = match selection {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.log_display_target_change(display_target, reason);
+                return Err(error.into());
+            }
+        };
+        Ok(DisplayRefresh {
+            render_changed: self.apply_surface_selection(selection, reason),
+            target_changed,
+        })
     }
 
-    fn refresh_hdr_metadata(&mut self, reason: &str) {
-        let metadata = self.current_hdr_metadata();
-        let status = self.surface.set_metadata(metadata);
-        self.set_hdr_metadata_status(status, reason);
+    fn apply_surface_selection(&mut self, selection: SurfaceSelection, reason: &str) -> bool {
+        if selection.requires_surface_reconfiguration(self.selection) {
+            self.configure_surface(selection, reason);
+            true
+        } else {
+            // Compare the exact finite value written to the presentation uniform.
+            let peak_changed = selection.output_peak_nits().to_bits()
+                != self.selection.output_peak_nits().to_bits();
+            self.set_selection(selection, reason);
+            if peak_changed {
+                if is_hdr_color_space(selection.candidate().color_space) {
+                    self.refresh_hdr_metadata(reason);
+                }
+                self.update_params();
+            }
+            peak_changed
+        }
     }
 
     fn set_hdr_metadata_status(&mut self, status: SignalStatus, reason: &str) {
@@ -1234,16 +1376,21 @@ impl GpuState {
         self.hdr_metadata_status = status;
     }
 
+    fn refresh_hdr_metadata(&mut self, reason: &str) {
+        let status = self
+            .surface
+            .set_metadata(output_hdr_metadata(self.selection));
+        self.set_hdr_metadata_status(status, reason);
+    }
+
     fn update_params(&self) {
         let image_dimensions = self.image.loaded().map(|image| image.dimensions);
         let view_transform = self.image.loaded().map(|image| image.view_transform);
         let bindings = self.image_bindings();
         let mut params = shader_parameters(
-            self.candidate,
+            self.selection,
             self.rendering_options,
-            &self.last_hdr_info,
             image_dimensions,
-            self.source_dynamic_range(),
             self.source_peak_nits(),
             (self.config.width, self.config.height),
             view_transform,
@@ -1282,44 +1429,42 @@ fn resampling_reservation(
 
 #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)] // GPU uniforms intentionally keep explicit f32 coordinates and rendering inputs.
 fn shader_parameters(
-    candidate: SurfaceCandidate,
+    selection: SurfaceSelection,
     rendering_options: RenderingOptions,
-    hdr_info: &wgpu::DisplayHdrInfo,
     image_dimensions: Option<(u32, u32)>,
-    source_dynamic_range: SourceDynamicRange,
     source_peak_nits: f32,
     viewport_dimensions: (u32, u32),
     view_transform: Option<ViewTransform>,
     diagnostics_pattern: bool,
     ui_centered: bool,
 ) -> PresentationParams {
+    let candidate = selection.candidate();
     let (image_width, image_height) = image_dimensions.unwrap_or((1, 1));
     let center = view_transform.map_or((0.5, 0.5), |view| {
         (view.center().x as f32, view.center().y as f32)
     });
     let view_scale = view_transform.map_or(1.0, |view| view.scale() as f32);
-    let output_peak_nits = resolved_output_peak_nits(candidate.color_space);
+    let output_peak_nits = selection.output_peak_nits();
+    let exposure = rendering_options.exposure_stops.exp2();
+    let effective_source_peak_nits = HDR_REFERENCE_WHITE_NITS.max(source_peak_nits * exposure);
     PresentationParams {
-        mode: shader_mode(candidate.color_space),
-        encode_srgb: candidate.color_space == SurfaceColorSpace::Srgb
-            && !candidate.format.is_srgb(),
-        dither_bits: u32::from(quantization_bits(candidate.format)),
+        pq_output: is_hdr_color_space(candidate.color_space),
         content_mode: image_dimensions.map_or(u32::from(diagnostics_pattern), |_| 2),
+        background_mode: background_shader_mode(rendering_options.background),
         hdr_reference_white_nits: HDR_REFERENCE_WHITE_NITS,
         source_peak_nits,
         output_peak_nits,
         exposure_stops: rendering_options.exposure_stops,
+        effective_source_peak_pq: pq_oetf(effective_source_peak_nits / 10_000.0),
+        output_peak_pq: pq_oetf(output_peak_nits / 10_000.0),
         viewport_width: viewport_dimensions.0,
         viewport_height: viewport_dimensions.1,
         image_width,
         image_height,
-        ui_white_nits: resolved_ui_white_nits(candidate.color_space, hdr_info),
         view_center_x: center.0,
         view_center_y: center.1,
         view_scale,
-        background_mode: background_shader_mode(rendering_options.background),
         center_ui: ui_centered,
-        source_dynamic_range: source_dynamic_range.shader_code(),
         tiled_image: false,
         tile_size: TILE_SIZE,
         tile_columns: 0,

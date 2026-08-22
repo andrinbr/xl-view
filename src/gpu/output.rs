@@ -1,5 +1,4 @@
-//! Pure surface-selection, format-ranking, luminance, and HDR-metadata policy
-//! shared by the stateful GPU renderer.
+//! Pure surface-selection and presentation policy shared by the GPU renderer.
 
 use std::error::Error;
 use std::fmt;
@@ -9,19 +8,12 @@ use wgpu::SurfaceColorSpaces;
 use wgpu::{SurfaceColorSpace, SurfaceFormatCapabilities, TextureFormat};
 use winit::dpi::PhysicalSize;
 
-use super::hdr_metadata::HdrMetadata;
+use super::display_target::{DISPLAY_INFORMATION_SOURCE, HdrTarget, HdrUnavailableReason};
 use crate::cli::{BackgroundMode, OutputMode};
 use xl_view::color::HDR_REFERENCE_WHITE_NITS;
-use xl_view::decode::SourceDynamicRange;
 
-/// Absolute peak of the ST 2084/PQ encoding
-pub(super) const PQ_ENCODING_PEAK_NITS: f32 = 10_000.0;
-/// HLG encoding peak used for system gamma and metadata
-pub(super) const HLG_ENCODING_PEAK_NITS: f32 = 1_000.0;
-/// Source mastering peak used when HDR metadata is missing or invalid
+/// Source mastering peak used when HDR source metadata is missing or invalid.
 pub(super) const FALLBACK_HDR_SOURCE_PEAK_NITS: f32 = 1_000.0;
-/// Working output peak assumed for an extended-linear surface
-pub(super) const EXTENDED_LINEAR_FALLBACK_PEAK_NITS: f32 = 1_000.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderingOptions {
@@ -35,28 +27,80 @@ pub(super) struct SurfaceCandidate {
     pub(super) format: TextureFormat,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct SurfaceSelection {
+    candidate: SurfaceCandidate,
+    display_target: HdrTarget,
+    output_peak_nits: f32,
+}
+
+impl SurfaceSelection {
+    const fn pq(candidate: SurfaceCandidate, peak_nits: f32) -> Self {
+        Self {
+            candidate,
+            display_target: Ok(peak_nits),
+            output_peak_nits: peak_nits,
+        }
+    }
+
+    const fn srgb(candidate: SurfaceCandidate, display_target: HdrTarget) -> Self {
+        Self {
+            candidate,
+            display_target,
+            output_peak_nits: HDR_REFERENCE_WHITE_NITS,
+        }
+    }
+
+    pub(super) const fn candidate(self) -> SurfaceCandidate {
+        self.candidate
+    }
+
+    pub(super) const fn display_target(self) -> HdrTarget {
+        self.display_target
+    }
+
+    pub(super) const fn output_peak_nits(self) -> f32 {
+        self.output_peak_nits
+    }
+
+    pub(super) fn requires_surface_reconfiguration(self, current: Self) -> bool {
+        self.candidate != current.candidate
+    }
+
+    pub(super) fn with_display_target(
+        self,
+        display_target: HdrTarget,
+    ) -> Result<Self, SurfaceOutputError> {
+        if self.candidate.color_space == SurfaceColorSpace::Bt2100Pq {
+            display_target
+                .map(|target| Self::pq(self.candidate, target))
+                .map_err(SurfaceOutputError::HdrTargetUnavailable)
+        } else {
+            Ok(Self::srgb(self.candidate, display_target))
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::enum_variant_names)] // Each planned name identifies the unavailable resource.
 pub(crate) enum SurfaceOutputError {
-    NoUsablePair,
-    RequestedModeUnavailable(OutputMode),
+    PqSurfaceUnavailable,
+    HdrTargetUnavailable(HdrUnavailableReason),
+    SrgbSurfaceUnavailable,
 }
 
 impl fmt::Display for SurfaceOutputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoUsablePair => formatter.write_str(
-                "the GPU surface advertises no usable output format/color-space pair; check the display connection and GPU driver",
+            Self::PqSurfaceUnavailable => formatter.write_str(
+                "requested PQ output is unavailable because the GPU surface does not advertise BT.2100 PQ with Rgb10a2Unorm; use '--output auto' or '--output sdr'",
             ),
-            Self::RequestedModeUnavailable(OutputMode::Sdr) => formatter.write_str(
-                "requested SDR output mode is unavailable on this display; use '--output auto' or check the display and GPU driver",
-            ),
-            Self::RequestedModeUnavailable(OutputMode::Auto) => {
-                unreachable!("automatic output failure uses NoUsablePair")
-            }
-            Self::RequestedModeUnavailable(mode) => write!(
+            Self::HdrTargetUnavailable(reason) => write!(
                 formatter,
-                "requested HDR output mode '{}' is unavailable on this display; use '--output auto' or '--output sdr'",
-                mode.as_str()
+                "requested PQ output is unavailable from {DISPLAY_INFORMATION_SOURCE}: {reason}; use '--output auto' or '--output sdr'",
+            ),
+            Self::SrgbSurfaceUnavailable => formatter.write_str(
+                "sRGB output is unavailable because the GPU surface does not advertise an sRGB 8-bit format/color-space pair; check the display connection and GPU driver",
             ),
         }
     }
@@ -65,19 +109,7 @@ impl fmt::Display for SurfaceOutputError {
 impl Error for SurfaceOutputError {}
 
 pub(super) fn is_hdr_color_space(color_space: SurfaceColorSpace) -> bool {
-    matches!(
-        color_space,
-        SurfaceColorSpace::Bt2100Pq
-            | SurfaceColorSpace::Bt2100Hlg
-            | SurfaceColorSpace::ExtendedSrgbLinear
-    )
-}
-
-/// Whether HDR should be considered enabled for output selection. Only an
-/// explicitly reported SDR state disables HDR; an unavailable state is not
-/// evidence that HDR is disabled.
-pub(super) fn display_hdr_enabled(hdr_info: &wgpu::DisplayHdrInfo) -> bool {
-    hdr_info.coarse.and_then(|coarse| coarse.high_dynamic_range) != Some(false)
+    color_space == SurfaceColorSpace::Bt2100Pq
 }
 
 pub(super) fn surface_configuration(
@@ -97,239 +129,65 @@ pub(super) fn surface_configuration(
     }
 }
 
-pub(super) fn surface_hdr_metadata(
-    candidate: SurfaceCandidate,
-    rendering_options: RenderingOptions,
-    source_dynamic_range: SourceDynamicRange,
-    source_peak_nits: f32,
-    source_min_nits: f32,
-) -> Option<HdrMetadata> {
-    if !is_hdr_color_space(candidate.color_space) {
-        return None;
-    }
-
-    let source_mastering_peak = if source_dynamic_range == SourceDynamicRange::Sdr {
-        HDR_REFERENCE_WHITE_NITS
-    } else if source_peak_nits.is_finite() && source_peak_nits > 0.0 {
-        source_peak_nits
-    } else {
-        FALLBACK_HDR_SOURCE_PEAK_NITS
-    };
-    let exposure = if rendering_options.exposure_stops.is_finite() {
-        rendering_options.exposure_stops.exp2()
-    } else {
-        1.0
-    };
-    // JPEG XL's intensity target is an upper bound rather than a measured
-    // content maximum. Using it avoids another full pass over the decoded
-    // pixels. The surface also carries viewer UI at HDR reference white.
-    let max_cll = (source_mastering_peak * exposure).max(HDR_REFERENCE_WHITE_NITS);
-    let encoding_peak = match candidate.color_space {
-        SurfaceColorSpace::Bt2100Pq => PQ_ENCODING_PEAK_NITS,
-        SurfaceColorSpace::Bt2100Hlg => HLG_ENCODING_PEAK_NITS,
-        SurfaceColorSpace::ExtendedSrgbLinear => f32::INFINITY,
-        _ => return None,
-    };
-    let max_cll = max_cll.min(encoding_peak);
-    let mastering_peak = source_mastering_peak.max(max_cll).min(encoding_peak);
-
-    Some(HdrMetadata::bt2020(
-        mastering_peak,
-        finite_non_negative(source_min_nits),
-        max_cll,
-        0.0,
-    ))
-}
-
-pub(super) fn finite_non_negative(value: f32) -> f32 {
-    if value.is_finite() && value >= 0.0 {
-        value
-    } else {
-        0.0
-    }
-}
-
-pub(super) fn shader_mode(color_space: SurfaceColorSpace) -> u32 {
-    match color_space {
-        SurfaceColorSpace::Srgb => 0,
-        SurfaceColorSpace::ExtendedSrgbLinear => 1,
-        SurfaceColorSpace::Bt2100Pq => 2,
-        SurfaceColorSpace::Bt2100Hlg => 3,
-        _ => unreachable!("surface selection returned an unsupported color space"),
-    }
-}
-
-pub(super) fn quantization_bits(format: TextureFormat) -> u8 {
-    match format {
-        TextureFormat::Rgba8Unorm
-        | TextureFormat::Rgba8UnormSrgb
-        | TextureFormat::Bgra8Unorm
-        | TextureFormat::Bgra8UnormSrgb => 8,
-        TextureFormat::Rgb10a2Unorm => 10,
-        _ => 0,
-    }
-}
-
-pub(super) fn tone_mapping_summary(
-    hdr_surface: bool,
-    source_dynamic_range: SourceDynamicRange,
-) -> &'static str {
-    match (source_dynamic_range.is_hdr(), hdr_surface) {
-        (false, true) => "SDR to HDR",
-        (true, false) => "HDR to SDR",
-        _ => "None",
-    }
-}
-
-pub(super) fn resolved_ui_white_nits(
-    color_space: SurfaceColorSpace,
-    hdr_info: &wgpu::DisplayHdrInfo,
-) -> f32 {
-    if !is_hdr_color_space(color_space) {
-        // Image and UI share a fixed relative-white scale on non-HDR outputs.
-        return HDR_REFERENCE_WHITE_NITS;
-    }
-    hdr_info
-        .luminance
-        .as_ref()
-        .and_then(|luminance| luminance.sdr_white_nits)
-        .filter(|white| white.is_finite() && *white > 0.0)
-        .unwrap_or(HDR_REFERENCE_WHITE_NITS)
-}
-
-pub(super) fn resolved_output_peak_nits(color_space: SurfaceColorSpace) -> f32 {
-    match color_space {
-        // SDR surfaces carry relative values. The OS-reported SDR white is
-        // where an HDR desktop places that surface, not the surface's peak.
-        SurfaceColorSpace::Srgb => HDR_REFERENCE_WHITE_NITS,
-        SurfaceColorSpace::Bt2100Pq => PQ_ENCODING_PEAK_NITS,
-        SurfaceColorSpace::Bt2100Hlg => HLG_ENCODING_PEAK_NITS,
-        SurfaceColorSpace::ExtendedSrgbLinear => EXTENDED_LINEAR_FALLBACK_PEAK_NITS,
-        _ => unreachable!("surface selection returned an unsupported color space"),
-    }
-}
-
-pub(super) fn select_required_surface_candidate(
+pub(super) fn select_required_surface(
     capabilities: &[SurfaceFormatCapabilities],
     output_mode: OutputMode,
-    source_dynamic_range: SourceDynamicRange,
-    hdr_info: &wgpu::DisplayHdrInfo,
-) -> Result<SurfaceCandidate, SurfaceOutputError> {
-    let selection_mode = if output_mode == OutputMode::Auto && !display_hdr_enabled(hdr_info) {
-        OutputMode::Sdr
-    } else {
-        output_mode
-    };
-    select_surface_candidate(capabilities, selection_mode, source_dynamic_range).ok_or(
-        match output_mode {
-            OutputMode::Auto => SurfaceOutputError::NoUsablePair,
-            forced => SurfaceOutputError::RequestedModeUnavailable(forced),
-        },
+    display_target: HdrTarget,
+) -> Result<SurfaceSelection, SurfaceOutputError> {
+    match output_mode {
+        OutputMode::Auto => {
+            if let Ok(target) = display_target
+                && let Some(candidate) = pq_candidate(capabilities)
+            {
+                return Ok(SurfaceSelection::pq(candidate, target));
+            }
+            srgb_candidate(capabilities)
+                .map(|candidate| SurfaceSelection::srgb(candidate, display_target))
+                .ok_or(SurfaceOutputError::SrgbSurfaceUnavailable)
+        }
+        OutputMode::Pq => {
+            let target = display_target.map_err(SurfaceOutputError::HdrTargetUnavailable)?;
+            pq_candidate(capabilities)
+                .map(|candidate| SurfaceSelection::pq(candidate, target))
+                .ok_or(SurfaceOutputError::PqSurfaceUnavailable)
+        }
+        OutputMode::Sdr => srgb_candidate(capabilities)
+            .map(|candidate| SurfaceSelection::srgb(candidate, display_target))
+            .ok_or(SurfaceOutputError::SrgbSurfaceUnavailable),
+    }
+}
+
+fn pq_candidate(capabilities: &[SurfaceFormatCapabilities]) -> Option<SurfaceCandidate> {
+    candidate_with_format(
+        capabilities,
+        SurfaceColorSpace::Bt2100Pq,
+        TextureFormat::Rgb10a2Unorm,
     )
 }
 
-fn select_surface_candidate(
-    capabilities: &[SurfaceFormatCapabilities],
-    output_mode: OutputMode,
-    source_dynamic_range: SourceDynamicRange,
-) -> Option<SurfaceCandidate> {
-    const AUTO_PQ_PRIORITY: [SurfaceColorSpace; 4] = [
-        SurfaceColorSpace::Bt2100Pq,
-        SurfaceColorSpace::Bt2100Hlg,
-        SurfaceColorSpace::ExtendedSrgbLinear,
-        SurfaceColorSpace::Srgb,
-    ];
-    const AUTO_HLG_PRIORITY: [SurfaceColorSpace; 4] = [
-        SurfaceColorSpace::Bt2100Hlg,
-        SurfaceColorSpace::Bt2100Pq,
-        SurfaceColorSpace::ExtendedSrgbLinear,
-        SurfaceColorSpace::Srgb,
-    ];
-    // Keep SDR on an HDR presentation pair when one is available. This avoids
-    // unnecessary HDR-to-SDR surface reconfiguration, which can retain stale HDR
-    // state and clip subsequent SDR output on Windows with Intel Vulkan drivers.
-    const AUTO_SDR_PRIORITY: [SurfaceColorSpace; 4] = [
-        SurfaceColorSpace::Bt2100Pq,
-        SurfaceColorSpace::Bt2100Hlg,
-        SurfaceColorSpace::ExtendedSrgbLinear,
-        SurfaceColorSpace::Srgb,
-    ];
-    const PQ_ONLY: [SurfaceColorSpace; 1] = [SurfaceColorSpace::Bt2100Pq];
-    const HLG_ONLY: [SurfaceColorSpace; 1] = [SurfaceColorSpace::Bt2100Hlg];
-    const SCRGB_ONLY: [SurfaceColorSpace; 1] = [SurfaceColorSpace::ExtendedSrgbLinear];
-    const SDR_ONLY: [SurfaceColorSpace; 1] = [SurfaceColorSpace::Srgb];
-
-    let color_spaces = match output_mode {
-        OutputMode::Auto => match source_dynamic_range {
-            SourceDynamicRange::Sdr => &AUTO_SDR_PRIORITY[..],
-            SourceDynamicRange::Pq => &AUTO_PQ_PRIORITY[..],
-            SourceDynamicRange::Hlg => &AUTO_HLG_PRIORITY[..],
-        },
-        OutputMode::Pq => &PQ_ONLY[..],
-        OutputMode::Hlg => &HLG_ONLY[..],
-        OutputMode::Scrgb => &SCRGB_ONLY[..],
-        OutputMode::Sdr => &SDR_ONLY[..],
-    };
-
-    color_spaces
-        .iter()
-        .copied()
-        .find_map(|color_space| best_format_for_color_space(capabilities, color_space))
+fn srgb_candidate(capabilities: &[SurfaceFormatCapabilities]) -> Option<SurfaceCandidate> {
+    [TextureFormat::Bgra8UnormSrgb, TextureFormat::Rgba8UnormSrgb]
+        .into_iter()
+        .find_map(|format| candidate_with_format(capabilities, SurfaceColorSpace::Srgb, format))
 }
 
-fn best_format_for_color_space(
+fn candidate_with_format(
     capabilities: &[SurfaceFormatCapabilities],
     color_space: SurfaceColorSpace,
+    format: TextureFormat,
 ) -> Option<SurfaceCandidate> {
-    let color_space_flag = color_space
+    let required_color_space = color_space
         .to_color_spaces()
-        .expect("the candidate list must not contain Auto");
-
+        .expect("surface candidates never use the automatic color space");
     capabilities
         .iter()
-        .enumerate()
-        .filter(|(_, capability)| capability.color_spaces.contains(color_space_flag))
-        .filter_map(|(preference, capability)| {
-            format_rank(capability.format, color_space)
-                .map(|format_rank| (format_rank, preference, capability.format))
+        .any(|capability| {
+            capability.format == format && capability.color_spaces.contains(required_color_space)
         })
-        .min_by_key(|(format_rank, preference, _)| (*format_rank, *preference))
-        .map(|(_, _, format)| SurfaceCandidate {
+        .then_some(SurfaceCandidate {
             color_space,
             format,
         })
-}
-
-fn format_rank(format: TextureFormat, color_space: SurfaceColorSpace) -> Option<u8> {
-    match color_space {
-        SurfaceColorSpace::Bt2100Pq | SurfaceColorSpace::Bt2100Hlg => match format {
-            TextureFormat::Rgb10a2Unorm => Some(0),
-            TextureFormat::Rgba16Float => Some(1),
-            TextureFormat::Rgba16Unorm => Some(2),
-            TextureFormat::Rgba32Float => Some(3),
-            _ => None,
-        },
-        SurfaceColorSpace::ExtendedSrgbLinear => match format {
-            TextureFormat::Rgba16Float => Some(0),
-            TextureFormat::Rgba32Float => Some(1),
-            _ => None,
-        },
-        SurfaceColorSpace::Srgb => {
-            if format.is_srgb() {
-                Some(0)
-            } else {
-                match format {
-                    TextureFormat::Bgra8Unorm | TextureFormat::Rgba8Unorm => Some(1),
-                    TextureFormat::Rgb10a2Unorm => Some(2),
-                    TextureFormat::Rgba16Unorm => Some(3),
-                    TextureFormat::Rgba16Float => Some(4),
-                    TextureFormat::Rgba32Float => Some(5),
-                    _ => None,
-                }
-            }
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]

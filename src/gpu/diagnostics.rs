@@ -4,11 +4,12 @@ use std::fmt::Write as _;
 
 use wgpu::{SurfaceColorSpace, SurfaceColorSpaces, TextureFormat};
 
+use super::display_target::DISPLAY_INFORMATION_SOURCE;
 use super::hdr_metadata::{HdrSurface, SignalStatus};
-use super::output::SurfaceCandidate;
+use super::output::SurfaceSelection;
 use crate::cli::OutputMode;
 use crate::units::{bytes_to_mib, u64_from_usize};
-use xl_view::decode::SourceDynamicRange;
+use xl_view::color::HDR_REFERENCE_WHITE_NITS;
 
 const EXPLICIT_COLOR_SPACES: [SurfaceColorSpace; 7] = [
     SurfaceColorSpace::Srgb,
@@ -68,7 +69,6 @@ pub(super) struct ImageWorkDiagnostics {
 pub(super) struct ImageDiagnostics {
     pub(super) background: &'static str,
     pub(super) exposure_stops: f32,
-    pub(super) hdr_metadata_status: SignalStatus,
     pub(super) cpu_storage_bytes: usize,
     pub(super) upload_staging_buffer_bytes: usize,
     pub(super) allocator_report: Option<wgpu::AllocatorReport>,
@@ -76,46 +76,10 @@ pub(super) struct ImageDiagnostics {
     pub(super) work: ImageWorkDiagnostics,
 }
 
-pub(super) fn startup_report(
-    adapter: &wgpu::Adapter,
-    surface: &HdrSurface<'_>,
-    output_mode: OutputMode,
-    source_dynamic_range: SourceDynamicRange,
-    selected: SurfaceCandidate,
-    hdr_metadata_status: SignalStatus,
-    diagnostics_pattern: bool,
-) -> String {
-    let mut report = surface_capabilities_report(
-        adapter,
-        surface,
-        output_mode,
-        source_dynamic_range,
-        selected,
-    );
-    #[cfg(not(target_vendor = "apple"))]
-    writeln!(
-        report,
-        "Vulkan HDR metadata extension: {}",
-        if surface.is_metadata_supported() {
-            "enabled"
-        } else {
-            "unavailable"
-        }
-    )
-    .unwrap();
-    writeln!(report, "HDR metadata state: {hdr_metadata_status}").unwrap();
-    if diagnostics_pattern {
-        writeln!(report).unwrap();
-        report.push_str(HLG_PATTERN_OVERVIEW);
-    }
-    report
-}
-
 pub(super) fn image_report(diagnostics: ImageDiagnostics) -> String {
     let ImageDiagnostics {
         background,
         exposure_stops,
-        hdr_metadata_status,
         cpu_storage_bytes,
         upload_staging_buffer_bytes,
         allocator_report,
@@ -128,7 +92,6 @@ pub(super) fn image_report(diagnostics: ImageDiagnostics) -> String {
     let mut report = String::new();
     writeln!(report, "  background: {background}").unwrap();
     writeln!(report, "  exposure: {exposure_stops:+.2} stops").unwrap();
-    writeln!(report, "  HDR metadata state: {hdr_metadata_status}").unwrap();
     writeln!(
         report,
         "  decoded CPU storage: {cpu_storage_mib:.2} MiB (full-resolution RGBA16F + coarse RGBA32F preview)"
@@ -198,16 +161,17 @@ fn write_image_work_status(
     }
 }
 
-fn surface_capabilities_report(
+pub(super) fn startup_report(
     adapter: &wgpu::Adapter,
     surface: &HdrSurface<'_>,
     output_mode: OutputMode,
-    source_dynamic_range: SourceDynamicRange,
-    selected: SurfaceCandidate,
+    selection: SurfaceSelection,
+    hdr_metadata_status: SignalStatus,
+    raw_display_information: &str,
+    diagnostics_pattern: bool,
 ) -> String {
     let info = adapter.get_info();
     let capabilities = surface.get_capabilities(adapter);
-    let hdr_info = surface.display_hdr_info(adapter);
     let mut report = String::new();
 
     writeln!(report, "GPU adapter:").unwrap();
@@ -251,19 +215,52 @@ fn surface_capabilities_report(
 
     writeln!(report).unwrap();
     writeln!(report, "Requested output mode: {}", output_mode.as_str()).unwrap();
-    if output_mode == OutputMode::Auto {
-        writeln!(report, "Automatic source class: {source_dynamic_range:?}").unwrap();
-    }
     writeln!(
         report,
         "Selected surface pair: {:?} + {:?}",
-        selected.format, selected.color_space
+        selection.candidate().format,
+        selection.candidate().color_space
     )
     .unwrap();
     writeln!(report, "Present modes: {:?}", capabilities.present_modes).unwrap();
     writeln!(report, "Alpha modes: {:?}", capabilities.alpha_modes).unwrap();
     writeln!(report, "Surface usages: {:?}", capabilities.usages).unwrap();
-    writeln!(report, "Display HDR information: {hdr_info:#?}").unwrap();
+    writeln!(
+        report,
+        "Application reference white: {HDR_REFERENCE_WHITE_NITS:.0} nits"
+    )
+    .unwrap();
+    writeln!(
+        report,
+        "Display information source: {DISPLAY_INFORMATION_SOURCE}"
+    )
+    .unwrap();
+    // These normalized rows have identical meaning on every platform. The raw
+    // block below retains the provider-specific evidence used to derive them.
+    match selection.display_target() {
+        Ok(peak_nits) => {
+            writeln!(report, "Display target peak: {peak_nits:.3} nits").unwrap();
+        }
+        Err(reason) => {
+            writeln!(report, "Display target peak: unavailable ({reason})").unwrap();
+        }
+    }
+    writeln!(
+        report,
+        "Output mapping target peak: {:.3} nits",
+        selection.output_peak_nits()
+    )
+    .unwrap();
+    writeln!(report, "HDR metadata: {hdr_metadata_status}").unwrap();
+    writeln!(
+        report,
+        "Raw platform display information: {raw_display_information}"
+    )
+    .unwrap();
+    if diagnostics_pattern {
+        writeln!(report).unwrap();
+        report.push_str(HLG_PATTERN_OVERVIEW);
+    }
     report
 }
 
@@ -323,7 +320,6 @@ mod tests {
         let report = image_report(ImageDiagnostics {
             background: "black",
             exposure_stops: 1.25,
-            hdr_metadata_status: SignalStatus::NotRequested,
             cpu_storage_bytes: usize::try_from(2 * MIB).unwrap(),
             upload_staging_buffer_bytes: usize::try_from(MIB / 2).unwrap(),
             allocator_report: None,
@@ -336,7 +332,6 @@ mod tests {
             concat!(
                 "  background: black\n",
                 "  exposure: +1.25 stops\n",
-                "  HDR metadata state: HDR metadata not requested\n",
                 "  decoded CPU storage: 2.00 MiB ",
                 "(full-resolution RGBA16F + coarse RGBA32F preview)\n",
                 "  temporary CPU-to-GPU upload buffer: up to 0.50 MiB\n",

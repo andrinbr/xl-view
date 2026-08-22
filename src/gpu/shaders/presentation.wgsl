@@ -1,38 +1,28 @@
 struct Params {
-    // 0 = SDR sRGB, 1 = extended-linear scRGB, 2 = HDR10 PQ, 3 = HLG.
-    mode: u32,
-    // Non-sRGB SDR attachments need the shader to apply the sRGB OETF.
-    encode_srgb: u32,
-    // Zero for floating point; otherwise the destination UNORM bit depth.
-    dither_bits: u32,
+    pq_output: u32,
     // 0 = empty state, 1 = diagnostics pattern, 2 = decoded image.
     content_mode: u32,
+    // 0 = black, 1 = checkerboard, 2 = white, 3 = 18% middle gray.
+    background_mode: u32,
     hdr_reference_white_nits: f32,
     source_peak_nits: f32,
     output_peak_nits: f32,
     exposure_stops: f32,
+    effective_source_peak_pq: f32,
+    output_peak_pq: f32,
     viewport_width: u32,
     viewport_height: u32,
     image_width: u32,
     image_height: u32,
-    ui_white_nits: f32,
     view_center_x: f32,
     view_center_y: f32,
     view_scale: f32,
-    // 0 = black, 1 = checkerboard, 2 = white, 3 = 18% middle gray.
-    background_mode: u32,
     center_ui: u32,
-    // 0 = SDR, 1 = PQ, 2 = HLG.
-    source_dynamic_range: u32,
-    _padding_0: u32,
     tiled_image: u32,
     tile_size: u32,
     tile_columns: u32,
     tile_gutter: u32,
     resampled_viewport: u32,
-    _padding_1: u32,
-    _padding_2: u32,
-    _padding_3: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -157,94 +147,43 @@ fn output_transform(canonical: vec4f, ui: vec4f, position: vec2u) -> vec3f {
     ) * exposure;
     let image_alpha = clamp(sanitize(canonical.a), 0.0, 1.0);
     let working = image + background(position) * (1.0 - image_alpha);
+    let effective_source_peak_nits = max(
+        // Must match shader_parameters(), which derives effective_source_peak_pq.
+        params.hdr_reference_white_nits,
+        params.source_peak_nits * exposure,
+    );
+    let mapped_bt2020 = tone_map_bt2020_max_rgb(
+        working * params.hdr_reference_white_nits,
+        effective_source_peak_nits,
+        params.output_peak_nits,
+        params.effective_source_peak_pq,
+        params.output_peak_pq,
+    );
     let ui_alpha = clamp(sanitize(ui.a), 0.0, 1.0);
     let ui_linear_bt709 = vec3f(sanitize(ui.r), sanitize(ui.g), sanitize(ui.b));
 
-    switch params.mode {
-        case 1u: {
-            // scRGB deliberately bypasses tone mapping and positive clamping.
-            let image_nits = gamut_map(
-                BT2020_TO_BT709 * working * params.hdr_reference_white_nits,
-                luma_bt709(BT2020_TO_BT709 * working * params.hdr_reference_white_nits),
-                -1.0,
-            );
-            return (image_nits * (1.0 - ui_alpha)
-                + ui_linear_bt709 * params.ui_white_nits) / 80.0;
-        }
-        case 2u: {
-            let image_nits = bounded_bt2020_nits(
-                working,
-                params.hdr_reference_white_nits,
-                params.output_peak_nits,
-            );
-            let ui_nits = BT709_TO_BT2020 * (ui_linear_bt709 * params.ui_white_nits);
-            let display_nits = image_nits * (1.0 - ui_alpha) + ui_nits;
-            return dither_encoded(
-                pq_oetf(display_nits / 10000.0),
-                position,
-                params.dither_bits,
-            );
-        }
-        case 3u: {
-            let image_nits = bounded_bt2020_nits(
-                working,
-                params.hdr_reference_white_nits,
-                params.output_peak_nits,
-            );
-            let ui_nits = BT709_TO_BT2020 * (ui_linear_bt709 * params.ui_white_nits);
-            let display = (image_nits * (1.0 - ui_alpha) + ui_nits)
-                / params.output_peak_nits;
-            let display_luminance = clamp(luma_bt2020(display), 0.0, 1.0);
-            var scene = vec3f(0.0);
-            if display_luminance > 0.0 {
-                let gamma = hlg_system_gamma(params.output_peak_nits);
-                scene = display / pow(display_luminance, (gamma - 1.0) / gamma);
-            }
-            return dither_encoded(hlg_oetf(scene), position, params.dither_bits);
-        }
-        default: {
-            if params.source_dynamic_range == 0u {
-                let image_bt709 = BT2020_TO_BT709 * working;
-                let image_relative = gamut_map(
-                    image_bt709,
-                    luma_bt709(image_bt709),
-                    1.0,
-                );
-                let linear = clamp(
-                    image_relative * (1.0 - ui_alpha) + ui_linear_bt709,
-                    vec3f(0.0), vec3f(1.0),
-                );
-                let encoded = dither_encoded(srgb_oetf(linear), position, params.dither_bits);
-                if params.encode_srgb == 1u { return encoded; }
-                return srgb_eotf(encoded);
-            }
-            // Keep metadata fixed so exposure moves pixels through the curve
-            // instead of renormalizing its input range.
-            let bt709 = BT2020_TO_BT709 * mapped_bt2020_nits(
-                working,
-                params.hdr_reference_white_nits,
-                params.source_peak_nits,
-                params.output_peak_nits,
-                params.source_dynamic_range,
-            );
-            // Resolve gamut once in destination primaries; channel clipping
-            // avoids adding neutral components to saturated highlights.
-            let image_nits = clamp(
-                bt709,
-                vec3f(0.0),
-                vec3f(params.output_peak_nits),
-            );
-            let linear = clamp(
-                image_nits * (1.0 - ui_alpha) + ui_linear_bt709 * params.ui_white_nits,
-                vec3f(0.0), vec3f(params.output_peak_nits),
-            ) / params.output_peak_nits;
-            let encoded = dither_encoded(srgb_oetf(linear), position, params.dither_bits);
-            if params.encode_srgb == 1u { return encoded; }
-            // The attachment applies the OETF; return an encoded-domain dither
-            // converted back to linear so quantization still receives it once.
-            return srgb_eotf(encoded);
-        }
+    if params.pq_output != 0u {
+        // PQ retains the BT.2020 destination gamut. Only apply its final
+        // numerical safety projection.
+        let image_nits = bound_rgb_preserving_luminance(
+            mapped_bt2020,
+            luma_bt2020(mapped_bt2020),
+            params.output_peak_nits,
+        );
+        let ui_nits = BT709_TO_BT2020
+            * (ui_linear_bt709 * params.hdr_reference_white_nits);
+        let display_nits = image_nits * (1.0 - ui_alpha) + ui_nits;
+        return dither_encoded(pq_oetf(display_nits / 10000.0), position, 10u);
     }
+
+    // SDR changes destination gamut to BT.709 and needs perceptual mapping.
+    let image_nits = gamut_map_bt2020_to_bt709_ictcp_hard(
+        mapped_bt2020,
+        params.output_peak_nits,
+    );
+    return (image_nits * (1.0 - ui_alpha)
+        + ui_linear_bt709 * params.hdr_reference_white_nits)
+        / params.output_peak_nits;
 }
 
 @fragment

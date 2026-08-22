@@ -307,7 +307,7 @@ fn icc_profile_is_reported_and_applied() {
     assert_eq!((icc.width, icc.height), (3, 2));
     for (actual, expected) in pixels(&icc).chunks_exact(4).zip([
         [0.877_19, 0.096_56, 0.022_83, 1.0],
-        [0.077_64, 0.891_48, 0.042_97, 1.0],
+        [0.077_64_f32, 0.891_48, 0.042_97, 1.0],
         [0.045_05, 0.011_72, 0.933_59, 1.0],
     ]) {
         for channel in 0..4 {
@@ -325,7 +325,7 @@ fn animation_first_frame_pixels_are_stable() {
     .unwrap();
     assert_eq!((animation.width, animation.height), (2, 2));
     for pixel in pixels(&animation).chunks_exact(4) {
-        for (actual, expected) in pixel.iter().zip([0.043_32, 0.011_36, 0.895_61, 1.0]) {
+        for (actual, expected) in pixel.iter().zip([0.043_32_f32, 0.011_36, 0.895_61, 1.0]) {
             assert_near(*actual, expected, 0.001);
         }
     }

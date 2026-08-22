@@ -2,7 +2,18 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use rfd::FileDialog;
+#[cfg(not(target_os = "macos"))]
+use winit::data_transfer::TypedData;
 use winit::window::Window;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub(super) use self::macos::dropped_file_paths;
+#[cfg(not(target_os = "macos"))]
+pub(super) fn dropped_file_paths(value: &dyn TypedData) -> std::io::Result<Vec<PathBuf>> {
+    value.try_as_file_paths()
+}
 
 #[derive(Debug)]
 pub(super) enum FilePickerResult {
@@ -155,6 +166,7 @@ pub(super) fn choose_adjacent_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::TestTempDir;
 
     #[test]
     fn dot_prefixed_names_are_hidden_on_every_platform() {
@@ -165,18 +177,10 @@ mod tests {
 
     #[test]
     fn folder_neighbors_exclude_hidden_images_but_retain_a_hidden_anchor() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "xl-view-hidden-navigation-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let hidden = directory.join("._sidecar.jxl");
-        let first = directory.join("a.jxl");
-        let second = directory.join("b.jxl");
+        let directory = TestTempDir::new("xl-view-hidden-navigation");
+        let hidden = directory.path().join("._sidecar.jxl");
+        let first = directory.path().join("a.jxl");
+        let second = directory.path().join("b.jxl");
         for path in [&hidden, &first, &second] {
             std::fs::write(path, []).unwrap();
         }
@@ -188,8 +192,6 @@ mod tests {
         let hidden_neighbors = neighboring_image_paths(&hidden).unwrap();
         assert_eq!(hidden_neighbors.previous, None);
         assert_eq!(hidden_neighbors.next, Some(first));
-
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(windows)]
@@ -198,10 +200,8 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
 
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
-        let path = std::env::temp_dir().join(format!(
-            "xl-view-hidden-attribute-{}.jxl",
-            std::process::id()
-        ));
+        let directory = TestTempDir::new("xl-view-hidden-attribute");
+        let path = directory.path().join("image.jxl");
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -209,6 +209,5 @@ mod tests {
             .open(&path)
             .unwrap();
         assert!(is_hidden_path(&path));
-        std::fs::remove_file(path).unwrap();
     }
 }

@@ -3,13 +3,8 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::*;
+use crate::test_utils::fixture_path;
 use xl_view::decode::{DecodeLimits, decode_file};
-
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name)
-}
 
 #[derive(Debug)]
 struct FakeDecodeState {
@@ -103,7 +98,7 @@ impl DecodeQueue for FakeDecodeQueue {
 }
 
 fn decoded_fixture() -> (PathBuf, ImageKey, Arc<DecodedImage>) {
-    let path = fixture("ramp-pq-1000.jxl");
+    let path = fixture_path("ramp-pq-1000.jxl");
     let key = ImageKey::from_path(&path).unwrap();
     let image = decode_file(&path, DecodeLimits::from_memory_ceiling_mib(3)).unwrap();
     (path, key, image)
@@ -117,8 +112,8 @@ fn session_with_queued_neighbors() -> (
     PathBuf,
 ) {
     let (anchor_path, anchor_key, image) = decoded_fixture();
-    let preferred = fixture("alpha.jxl");
-    let secondary = fixture("grayscale.jxl");
+    let preferred = fixture_path("alpha.jxl");
+    let secondary = fixture_path("grayscale.jxl");
     let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
     let queue_state = Arc::clone(&queue.state);
     let mut session = ImageSession::with_decode_queue(64 * 1024 * 1024, queue);
@@ -208,7 +203,7 @@ fn invalid_source_path_reports_status_without_queueing_decode() {
     let mut session = ImageSession::with_decode_queue(64 * 1024 * 1024, queue);
 
     assert!(matches!(
-        session.select_path(fixture("missing.jxl"), None),
+        session.select_path(fixture_path("missing.jxl"), None),
         SelectionEffect::StatusChanged
     ));
     assert!(session.pending_open.is_none());
@@ -570,7 +565,7 @@ fn navigation_results_ignore_stale_work_and_report_end_or_failure() {
             request.generation.wrapping_sub(1),
             request.direction,
             &request.source_path,
-            Ok(Some(fixture("alpha.jxl"))),
+            Ok(Some(fixture_path("alpha.jxl"))),
         ),
         NavigationEffect::None
     ));
@@ -579,7 +574,7 @@ fn navigation_results_ignore_stale_work_and_report_end_or_failure() {
             request.generation,
             request.direction,
             &request.source_path,
-            Ok(Some(fixture("alpha.jxl"))),
+            Ok(Some(fixture_path("alpha.jxl"))),
         ),
         NavigationEffect::Select {
             direction: FolderDirection::Next,

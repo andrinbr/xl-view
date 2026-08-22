@@ -1,69 +1,38 @@
-//! Platform adapter for optional HDR metadata signaling.
+//! Platform adapter for Linux's optional HDR metadata bridge.
+//!
+//! Windows and macOS consume XL-View's already mapped output through their PQ
+//! surface color space, so requesting another tone-mapping hint is unnecessary.
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(target_os = "linux")]
 pub(super) use vulkan_hdr_metadata::{HdrMetadata, HdrSurface, SignalStatus, request_device};
 
-#[cfg(target_vendor = "apple")]
-mod apple {
+#[cfg(not(target_os = "linux"))]
+// Mirror the Linux bridge API so the renderer has one surface lifecycle.
+// This adapter delegates to wgpu without emitting HDR metadata.
+mod passthrough {
     use std::fmt;
 
-    /// HDR luminance values retained for future `CAEDRMetadata` integration.
     #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct HdrMetadata {
-        _mastering_max: f32,
-        _mastering_min: f32,
-        _max_cll: f32,
-        _max_fall: f32,
-    }
+    pub struct HdrMetadata;
 
     impl HdrMetadata {
-        pub fn bt2020(
-            mastering_max_luminance_nits: f32,
-            mastering_min_luminance_nits: f32,
-            max_content_light_level_nits: f32,
-            max_frame_average_light_level_nits: f32,
-        ) -> Self {
-            Self {
-                _mastering_max: mastering_max_luminance_nits,
-                _mastering_min: mastering_min_luminance_nits,
-                _max_cll: max_content_light_level_nits,
-                _max_fall: max_frame_average_light_level_nits,
-            }
+        pub const fn display_mapped_bt2020(_peak_nits: f32) -> Self {
+            Self
         }
     }
 
-    /// Result of attempting to associate HDR metadata with a Metal surface.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum SignalStatus {
         NotRequested,
-        Unsupported,
+        NotRequired,
     }
 
     impl fmt::Display for SignalStatus {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str(match self {
                 Self::NotRequested => "HDR metadata not requested",
-                Self::Unsupported => "HDR metadata signaling unsupported",
+                Self::NotRequired => "HDR metadata not required on this platform",
             })
-        }
-    }
-
-    #[derive(Debug)]
-    pub struct HdrMetadataSignaler {
-        device: wgpu::Device,
-        supported: bool,
-    }
-
-    impl HdrMetadataSignaler {
-        pub const fn is_supported(&self) -> bool {
-            self.supported
-        }
-
-        pub fn bind_surface(self, surface: wgpu::Surface<'_>) -> HdrSurface<'_> {
-            HdrSurface {
-                surface,
-                device: self.device,
-            }
         }
     }
 
@@ -82,7 +51,7 @@ mod apple {
             self.surface.display_hdr_info(adapter)
         }
 
-        pub fn get_current_texture(&self) -> wgpu::CurrentSurfaceTexture {
+        pub fn get_current_texture(&mut self) -> wgpu::CurrentSurfaceTexture {
             self.surface.get_current_texture()
         }
 
@@ -99,31 +68,32 @@ mod apple {
             Self::metadata_status(metadata)
         }
 
-        #[allow(clippy::unused_self)] // Mirrors the platform surface interface used by the renderer.
-        pub fn set_metadata(&self, metadata: Option<HdrMetadata>) -> SignalStatus {
+        #[allow(clippy::unused_self)]
+        pub fn set_metadata(&mut self, metadata: Option<HdrMetadata>) -> SignalStatus {
             Self::metadata_status(metadata)
         }
 
-        fn metadata_status(metadata: Option<HdrMetadata>) -> SignalStatus {
+        const fn metadata_status(metadata: Option<HdrMetadata>) -> SignalStatus {
             match metadata {
-                Some(_) => SignalStatus::Unsupported,
+                Some(_) => SignalStatus::NotRequired,
                 None => SignalStatus::NotRequested,
             }
         }
     }
 
-    pub async fn request_device(
+    pub async fn request_device<'window>(
         adapter: &wgpu::Adapter,
         descriptor: &wgpu::DeviceDescriptor<'_>,
-    ) -> Result<(wgpu::Device, wgpu::Queue, HdrMetadataSignaler), wgpu::RequestDeviceError> {
+        surface: wgpu::Surface<'window>,
+    ) -> Result<(wgpu::Device, wgpu::Queue, HdrSurface<'window>), wgpu::RequestDeviceError> {
         let (device, queue) = adapter.request_device(descriptor).await?;
-        let signaler = HdrMetadataSignaler {
+        let hdr_surface = HdrSurface {
+            surface,
             device: device.clone(),
-            supported: false,
         };
-        Ok((device, queue, signaler))
+        Ok((device, queue, hdr_surface))
     }
 }
 
-#[cfg(target_vendor = "apple")]
-pub(super) use apple::{HdrMetadata, HdrSurface, SignalStatus, request_device};
+#[cfg(not(target_os = "linux"))]
+pub(super) use passthrough::{HdrMetadata, HdrSurface, SignalStatus, request_device};

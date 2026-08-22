@@ -36,8 +36,6 @@ pub enum OutputMode {
     #[default]
     Auto,
     Pq,
-    Hlg,
-    Scrgb,
     Sdr,
 }
 
@@ -66,8 +64,6 @@ impl OutputMode {
         match self {
             Self::Auto => "auto",
             Self::Pq => "pq",
-            Self::Hlg => "hlg",
-            Self::Scrgb => "scrgb",
             Self::Sdr => "sdr",
         }
     }
@@ -93,13 +89,13 @@ mod tests {
         for (argument, expected) in [
             ("auto", OutputMode::Auto),
             ("pq", OutputMode::Pq),
-            ("hlg", OutputMode::Hlg),
-            ("scrgb", OutputMode::Scrgb),
             ("sdr", OutputMode::Sdr),
         ] {
             let cli = Cli::try_parse_from(["xl-view", "--output", argument]).unwrap();
             assert_eq!(cli.output, expected);
         }
+        assert!(Cli::try_parse_from(["xl-view", "--output", "hlg"]).is_err());
+        assert!(Cli::try_parse_from(["xl-view", "--output", "scrgb"]).is_err());
     }
 
     #[test]

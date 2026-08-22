@@ -5,34 +5,32 @@ use super::tiles::TileCache;
 
 pub(super) const PARAM_BUFFER_USAGE: wgpu::BufferUsages =
     wgpu::BufferUsages::UNIFORM.union(wgpu::BufferUsages::COPY_DST);
-const PRESENTATION_PARAM_WORD_COUNT: usize = 28;
+const PRESENTATION_PARAM_WORD_COUNT: usize = 22;
 
 /// Named CPU representation of the WGSL `Params` uniform.
 ///
 /// [`Self::to_words`] is the single source of truth for the cross-language
-/// field order and inserts the padding required by the shader layout.
-#[allow(clippy::struct_excessive_bools)] // These are four independent WGSL flags serialized as u32 words, not overlapping state.
+/// field order and representation.
+#[allow(clippy::struct_excessive_bools)] // These are independent WGSL flags serialized as u32 words, not overlapping state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct PresentationParams {
-    pub(super) mode: u32,
-    pub(super) encode_srgb: bool,
-    pub(super) dither_bits: u32,
+    pub(super) pq_output: bool,
     pub(super) content_mode: u32,
+    pub(super) background_mode: u32,
     pub(super) hdr_reference_white_nits: f32,
     pub(super) source_peak_nits: f32,
     pub(super) output_peak_nits: f32,
     pub(super) exposure_stops: f32,
+    pub(super) effective_source_peak_pq: f32,
+    pub(super) output_peak_pq: f32,
     pub(super) viewport_width: u32,
     pub(super) viewport_height: u32,
     pub(super) image_width: u32,
     pub(super) image_height: u32,
-    pub(super) ui_white_nits: f32,
     pub(super) view_center_x: f32,
     pub(super) view_center_y: f32,
     pub(super) view_scale: f32,
-    pub(super) background_mode: u32,
     pub(super) center_ui: bool,
-    pub(super) source_dynamic_range: u32,
     pub(super) tiled_image: bool,
     pub(super) tile_size: u32,
     pub(super) tile_columns: u32,
@@ -43,34 +41,28 @@ pub(super) struct PresentationParams {
 impl PresentationParams {
     fn to_words(self) -> [u32; PRESENTATION_PARAM_WORD_COUNT] {
         [
-            self.mode,
-            u32::from(self.encode_srgb),
-            self.dither_bits,
+            u32::from(self.pq_output),
             self.content_mode,
+            self.background_mode,
             self.hdr_reference_white_nits.to_bits(),
             self.source_peak_nits.to_bits(),
             self.output_peak_nits.to_bits(),
             self.exposure_stops.to_bits(),
+            self.effective_source_peak_pq.to_bits(),
+            self.output_peak_pq.to_bits(),
             self.viewport_width,
             self.viewport_height,
             self.image_width,
             self.image_height,
-            self.ui_white_nits.to_bits(),
             self.view_center_x.to_bits(),
             self.view_center_y.to_bits(),
             self.view_scale.to_bits(),
-            self.background_mode,
             u32::from(self.center_ui),
-            self.source_dynamic_range,
-            0,
             u32::from(self.tiled_image),
             self.tile_size,
             self.tile_columns,
             self.tile_gutter,
             u32::from(self.resampled_viewport),
-            0,
-            0,
-            0,
         ]
     }
 

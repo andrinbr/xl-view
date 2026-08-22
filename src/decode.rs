@@ -479,6 +479,7 @@ pub type DecodeResult = Result<Arc<DecodedImage>, DecodeError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{TestTempDir, fixture_path};
 
     #[test]
     fn ceiling_conversion_saturates_safely() {
@@ -569,17 +570,9 @@ mod tests {
 
     #[test]
     fn image_key_includes_file_identity() {
-        let fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test_pattern-sRGB.jxl");
-        let mut bytes = std::fs::read(fixture).unwrap();
-        let unique = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "xl-view-image-key-{}-{unique}.jxl",
-            std::process::id()
-        ));
+        let mut bytes = std::fs::read(fixture_path("test_pattern-sRGB.jxl")).unwrap();
+        let directory = TestTempDir::new("xl-view-image-key");
+        let path = directory.path().join("image.jxl");
         std::fs::write(&path, &bytes).unwrap();
 
         let original = ImageKey::from_path(&path).unwrap();
@@ -590,6 +583,5 @@ mod tests {
             jxl::decode_file_for_key(&original, DecodeLimits::from_memory_ceiling_mib(64), None,),
             Err(DecodeError::SourceChanged { .. })
         ));
-        let _ = std::fs::remove_file(path);
     }
 }

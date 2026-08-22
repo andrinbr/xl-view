@@ -271,12 +271,17 @@ fn event_loop_uses_earliest_pending_deadline() {
     let now = Instant::now();
     let prefetch = now + Duration::from_millis(250);
     let cursor = now + FULLSCREEN_CURSOR_HIDE_DELAY;
+    let metadata = now + DISPLAY_METADATA_REFRESH_DELAY;
     assert_eq!(
-        next_wake_deadline(Some(prefetch), Some(cursor)),
+        next_wake_deadline(Some(prefetch), Some(cursor), Some(metadata)),
+        Some(metadata)
+    );
+    assert_eq!(
+        next_wake_deadline(Some(prefetch), Some(cursor), None),
         Some(prefetch)
     );
-    assert_eq!(next_wake_deadline(None, Some(cursor)), Some(cursor));
-    assert_eq!(next_wake_deadline(None, None), None);
+    assert_eq!(next_wake_deadline(None, Some(cursor), None), Some(cursor));
+    assert_eq!(next_wake_deadline(None, None, None), None);
 }
 
 #[test]
