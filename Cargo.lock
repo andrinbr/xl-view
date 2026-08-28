@@ -3070,6 +3070,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "winit-macos-open"
+version = "0.1.0"
+dependencies = [
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "winit-orbital"
 version = "0.31.0-beta.2"
 source = "git+https://github.com/rust-windowing/winit?rev=42366231b0d92480a933339bd5eaa7fba8106f42#42366231b0d92480a933339bd5eaa7fba8106f42"
@@ -3229,7 +3238,7 @@ checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "xl-view"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "fontdue",
@@ -3256,6 +3265,7 @@ dependencies = [
  "wgpu",
  "winit",
  "winit-common",
+ "winit-macos-open",
  "winresource",
  "winsafe",
 ]

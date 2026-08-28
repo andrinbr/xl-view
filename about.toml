@@ -27,6 +27,9 @@ accepted = ["GPL-3.0-only"]
 [vulkan-hdr-metadata]
 accepted = ["GPL-3.0-only"]
 
+[winit-macos-open]
+accepted = ["GPL-3.0-only"]
+
 # Workaround to get a more deterministic output from cargo-about
 # https://github.com/EmbarkStudios/cargo-about/issues/202 
 [rfd.clarify]

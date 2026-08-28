@@ -58,10 +58,6 @@ block it on first launch. Remove its quarantine attribute before opening it:
 xattr -dr com.apple.quarantine /Applications/XL-View.app
 ```
 
-The macOS app cannot currently open an image directly from Finder, including
-through **Open With** or by double-clicking the image. Launch XL-View first and
-drag the image into its window instead.
-
 ### Windows
 
 Download either the Setup executable or the portable ZIP. Setup installs
@@ -177,14 +173,6 @@ Currently JPEG XL (`.jxl`) only. Additional codecs may be implemented in the fut
 - **It won't start:** on Linux, confirm you are using a native Wayland session.
   Also confirm that a working Vulkan driver is installed.
 - **More detail:** set `RUST_LOG=xl_view=debug` for debug logging to stderr.
-
-## Roadmap
-
-- Open files directly from Finder in the macOS app
-- Support for gain maps
-- Additional codec support (primarily AVIF and JPEG)
-- Switch to `jxl-rs` once it becomes stable
-- Support for linear HDR and scRGB images
 
 ## Architecture
 

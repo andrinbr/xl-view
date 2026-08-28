@@ -354,10 +354,90 @@ fn folder_navigation_chooses_neighbors_without_wrapping() {
 }
 
 #[test]
-fn double_click_only_depends_on_the_click_interval() {
+fn primary_click_tracker_uses_a_300_millisecond_interval() {
     let start = Instant::now();
-    assert!(is_double_click(start, start + Duration::from_millis(250)));
-    assert!(!is_double_click(start, start + Duration::from_millis(500)));
+    for (interval, is_double_click) in [(299, true), (300, true), (301, false)] {
+        let mut tracker = PrimaryClickTracker::default();
+        tracker.press(start, Some(PhysicalPosition::new(0.0, 0.0)), 1.0);
+        assert!(!tracker.release());
+        tracker.press(
+            start + Duration::from_millis(interval),
+            Some(PhysicalPosition::new(0.0, 0.0)),
+            1.0,
+        );
+        assert_eq!(tracker.release(), is_double_click);
+    }
+}
+
+#[test]
+fn primary_click_tracker_uses_logical_distance_from_the_press() {
+    let start = Instant::now();
+    let origin = PhysicalPosition::new(100.0, 100.0);
+    let mut tracker = PrimaryClickTracker::default();
+    tracker.press(start, Some(origin), 2.0);
+    assert!(!tracker.release());
+
+    tracker.press(start + Duration::from_millis(250), Some(origin), 2.0);
+    tracker.move_to(PhysicalPosition::new(106.0, 107.0));
+    assert!(tracker.release());
+}
+
+#[test]
+fn hovering_between_clicks_does_not_cancel_the_sequence() {
+    let start = Instant::now();
+    let origin = PhysicalPosition::new(100.0, 100.0);
+    let mut tracker = PrimaryClickTracker::default();
+    tracker.press(start, Some(origin), 1.0);
+    assert!(!tracker.release());
+
+    tracker.move_to(PhysicalPosition::new(500.0, 500.0));
+    tracker.press(start + Duration::from_millis(250), Some(origin), 1.0);
+    assert!(tracker.release());
+}
+
+#[test]
+fn unmatched_release_cancels_the_click_sequence() {
+    let start = Instant::now();
+    let origin = PhysicalPosition::new(100.0, 100.0);
+    let mut tracker = PrimaryClickTracker::default();
+    tracker.press(start, Some(origin), 1.0);
+    assert!(!tracker.release());
+
+    assert!(!tracker.release());
+    tracker.press(start + Duration::from_millis(250), Some(origin), 1.0);
+    assert!(!tracker.release());
+}
+
+#[test]
+fn drag_cancels_a_pending_double_click() {
+    let start = Instant::now();
+    let origin = PhysicalPosition::new(100.0, 100.0);
+    let mut tracker = PrimaryClickTracker::default();
+    tracker.press(start, Some(origin), 1.0);
+    assert!(!tracker.release());
+
+    tracker.press(start + Duration::from_millis(250), Some(origin), 1.0);
+    tracker.move_to(PhysicalPosition::new(103.0, 104.0));
+    assert!(!tracker.release());
+
+    tracker.press(start + Duration::from_millis(275), Some(origin), 1.0);
+    assert!(!tracker.release());
+}
+
+#[test]
+fn movement_without_a_press_origin_cancels_the_click_sequence() {
+    let start = Instant::now();
+    let origin = PhysicalPosition::new(100.0, 100.0);
+    let mut tracker = PrimaryClickTracker::default();
+    tracker.press(start, Some(origin), 1.0);
+    assert!(!tracker.release());
+
+    tracker.press(start + Duration::from_millis(250), None, 1.0);
+    tracker.move_to(origin);
+    assert!(!tracker.release());
+
+    tracker.press(start + Duration::from_millis(275), Some(origin), 1.0);
+    assert!(!tracker.release());
 }
 
 #[test]

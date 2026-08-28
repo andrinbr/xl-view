@@ -60,7 +60,7 @@ use self::files::{
 #[cfg(test)]
 use self::files::{choose_adjacent_path, file_name};
 use self::input::{
-    FullscreenState, KeyboardAction, image_cursor, is_double_click, keyboard_action,
+    FullscreenState, KeyboardAction, PrimaryClickTracker, image_cursor, keyboard_action,
 };
 #[cfg(test)]
 use self::overlay::{DecodeTiming, format_exif_datetime, source_encoding_details, xmp_rating_row};
@@ -105,13 +105,13 @@ struct Application {
     gpu: Option<gpu::GpuState>,
     is_dragging: bool,
     last_drag_position: Option<PhysicalPosition<f64>>,
-    last_primary_click: Option<Instant>,
     metadata_refresh_deadline: Option<Instant>,
     metadata_visible: bool,
     modifiers: ModifiersState,
     output_mode: OutputMode,
     pending_drop: Option<PendingDrop>,
     pinch_fit_block: Option<PinchDirection>,
+    primary_click: PrimaryClickTracker,
     session: ImageSession,
     title_hdr_surface: Option<bool>,
     gpu_memory_limit_bytes: u64,
@@ -571,6 +571,20 @@ impl Application {
         match event {
             UserEvent::DecodeComplete(completion) => self.handle_decode_completion(*completion),
             UserEvent::FilePickerComplete(result) => self.handle_file_picker_result(result),
+            #[cfg(target_os = "macos")]
+            UserEvent::OpenFiles(paths) => {
+                tracing::info!(
+                    path_count = paths.len(),
+                    "received macOS open-document event"
+                );
+                if let Some(path) = first_image_path(&paths) {
+                    self.select_path(path, None);
+                } else {
+                    self.session
+                        .set_status_message("The opened data does not contain a supported image");
+                    self.update_window_title();
+                }
+            }
             UserEvent::FolderNavigationComplete {
                 generation,
                 direction,
@@ -888,6 +902,7 @@ impl Application {
     }
 
     fn handle_pointer_departure(&mut self) {
+        self.primary_click.cancel();
         self.stop_dragging();
         self.show_cursor_without_timeout();
     }
@@ -899,6 +914,7 @@ impl Application {
 
     fn handle_pointer_moved(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_position = Some(position);
+        self.primary_click.move_to(position);
         if self.is_dragging {
             if let (Some(previous), Some(gpu)) = (self.last_drag_position, self.gpu.as_mut()) {
                 gpu.pan_by(position.x - previous.x, position.y - previous.y);
@@ -992,24 +1008,28 @@ impl Application {
     }
 
     fn handle_primary_pointer_button(&mut self, state: ElementState) {
-        if state != ElementState::Pressed {
-            self.stop_dragging();
-            return;
+        match state {
+            ElementState::Pressed => {
+                // Capture the current scale so drag slop stays stable for this press.
+                let scale_factor = self
+                    .window
+                    .as_ref()
+                    .map_or(1.0, |window| window.scale_factor());
+                self.primary_click
+                    .press(Instant::now(), self.cursor_position, scale_factor);
+                self.is_dragging = self.session.has_loaded_image();
+                self.last_drag_position =
+                    self.is_dragging.then_some(self.cursor_position).flatten();
+                self.update_cursor();
+            }
+            ElementState::Released => {
+                // Resolve on release so this press has a chance to become a drag first.
+                self.stop_dragging();
+                if self.primary_click.release() {
+                    self.toggle_fullscreen();
+                }
+            }
         }
-        let now = Instant::now();
-        if self
-            .last_primary_click
-            .is_some_and(|previous| is_double_click(previous, now))
-        {
-            self.last_primary_click = None;
-            self.stop_dragging();
-            self.toggle_fullscreen();
-            return;
-        }
-        self.last_primary_click = Some(now);
-        self.is_dragging = self.session.has_loaded_image();
-        self.last_drag_position = self.is_dragging.then_some(self.cursor_position).flatten();
-        self.update_cursor();
     }
 
     fn handle_keyboard_input(&mut self, event_loop: &dyn ActiveEventLoop, event: &KeyEvent) {
@@ -1135,6 +1155,8 @@ fn next_wake_deadline(
 enum UserEvent {
     DecodeComplete(Box<DecodeCompletion>),
     FilePickerComplete(FilePickerResult),
+    #[cfg(target_os = "macos")]
+    OpenFiles(Vec<PathBuf>),
     FolderNavigationComplete {
         generation: u64,
         direction: FolderDirection,
@@ -1376,6 +1398,17 @@ pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
         sender: event_sender,
         proxy: event_loop.create_proxy(),
     };
+    #[cfg(target_os = "macos")]
+    let _open_files = {
+        let event_sender = event_sender.clone();
+        let open_files = winit_macos_open::OpenFiles::install(move |paths| {
+            event_sender.send(UserEvent::OpenFiles(paths));
+        });
+        if open_files.is_none() {
+            tracing::warn!("macOS open-document handling is unavailable");
+        }
+        open_files
+    };
     let decode_limits = DecodeLimits::default();
     let decode_event_sender = event_sender.clone();
     let decode_coordinator = DecodeCoordinator::spawn(decode_limits, move |completion| {
@@ -1402,13 +1435,13 @@ pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
         gpu: None,
         is_dragging: false,
         last_drag_position: None,
-        last_primary_click: None,
         metadata_refresh_deadline: None,
         metadata_visible: false,
         modifiers: ModifiersState::empty(),
         output_mode: cli.output,
         pending_drop: None,
         pinch_fit_block: None,
+        primary_click: PrimaryClickTracker::default(),
         session: ImageSession::new(decoded_cache_bytes, decode_coordinator),
         title_hdr_surface: None,
         gpu_memory_limit_bytes: cli.gpu_memory.saturating_mul(1024 * 1024),

@@ -29,6 +29,7 @@ confidence-threshold = 0.8
 exceptions = [
     { allow = ["GPL-3.0-only"], crate = "xl-view" },
     { allow = ["GPL-3.0-only"], crate = "vulkan-hdr-metadata" },
+    { allow = ["GPL-3.0-only"], crate = "winit-macos-open" },
 ]
 
 [licenses.private]

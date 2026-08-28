@@ -44,7 +44,6 @@ pub const TILE_SIZE: u32 = 512;
 pub const TILE_GUTTER: u32 = 8;
 pub const CANONICAL_BYTES_PER_PIXEL: usize = 8;
 pub const HALF_CONVERSION_CHUNK_SAMPLES: usize = 1024;
-const AUTOMATIC_MEMORY_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 type CanonicalPixel = [u8; CANONICAL_BYTES_PER_PIXEL];
 type CoarsePixel = [f32; 4];
 
@@ -59,7 +58,7 @@ fn automatic_memory_ceiling_bytes() -> usize {
 }
 
 fn automatic_memory_ceiling_bytes_from_total(total_memory: u64) -> usize {
-    let bytes = (total_memory / 8 * 3).saturating_sub(AUTOMATIC_MEMORY_RESERVE_BYTES);
+    let bytes = total_memory / 4 * 3;
     usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
@@ -488,16 +487,12 @@ mod tests {
     }
 
     #[test]
-    fn automatic_memory_ceiling_subtracts_fixed_reserve_from_three_eighths() {
+    fn automatic_memory_ceiling_is_three_quarters_of_system_memory() {
         const GIB: u64 = 1024 * 1024 * 1024;
 
         assert_eq!(
             automatic_memory_ceiling_bytes_from_total(8 * GIB),
-            usize::try_from(3 * GIB - AUTOMATIC_MEMORY_RESERVE_BYTES).unwrap()
-        );
-        assert_eq!(
-            automatic_memory_ceiling_bytes_from_total(128 * GIB),
-            usize::try_from(48 * GIB - AUTOMATIC_MEMORY_RESERVE_BYTES).unwrap()
+            usize::try_from(6 * GIB).unwrap()
         );
         assert_eq!(automatic_memory_ceiling_bytes_from_total(0), 0);
     }

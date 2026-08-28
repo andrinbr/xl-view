@@ -1,6 +1,6 @@
 [package]
 name = "xl-view"
-version = "0.3.0"
+version = "0.3.1"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +16,7 @@ OriginalFilename = "xl-view.exe"
 LegalCopyright = "Copyright 2026 Andrin Brunner and contributors"
 
 [workspace]
-members = ["crates/vulkan-hdr-metadata"]
+members = ["crates/vulkan-hdr-metadata", "crates/winit-macos-open"]
 resolver = "3"
 
 [workspace.package]
@@ -96,6 +96,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
 winit-common = { git = "https://github.com/rust-windowing/winit", rev = "42366231b0d92480a933339bd5eaa7fba8106f42", features = [
     "foundation",
 ] }
+winit-macos-open = { path = "crates/winit-macos-open" }
 wgpu = { version = "30.0.0", default-features = false, features = [
     "metal",
     "parking_lot",

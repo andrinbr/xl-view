@@ -91,6 +91,8 @@ assert_equal "$(plutil -extract CFBundleExecutable raw "$plist")" \
     "xl-view" "bundle executable"
 assert_equal "$(plutil -extract CFBundleShortVersionString raw "$plist")" \
     "$version" "bundle version"
+assert_equal "$(plutil -extract CFBundleDocumentTypes.0.CFBundleTypeExtensions.0 raw "$plist")" \
+    "jxl" "document type extension"
 
 # Check the icon and license payloads.
 icon_file=$(plutil -extract CFBundleIconFile raw "$plist")
