@@ -14,13 +14,13 @@
 </div>
 
 XL-View is a native HDR still-image viewer for Linux, Windows, and macOS. It
-preserves the full HDR range of an image when HDR output is available, targets
-JPEG XL, and handles large images such as panoramas.
+targets JPEG XL and handles large images such as panoramas.
 
 ## Features
 
-- **HDR output:** present SDR, PQ, and HLG source images through BT.2100 PQ on HDR displays or sRGB on SDR displays
-- **Accurate color:** preserve the image's full HDR range through the display pipeline
+- **HDR output:** present images through BT.2100 PQ on HDR displays or sRGB on SDR displays.
+  HDR images are tone-mapped when they exceed the display's available brightness range.
+- **Accurate color:** preserve HDR and color profile information through the image-processing pipeline
 - **Responsive large-image viewing:** open panoramas and other large images without blocking the UI, with smooth panning
 - **Sharp scaling:** high-quality resampling for a detailed view
 - **Image cache and preloading:** keep recent images in memory and preload adjacent files for faster browsing
@@ -31,7 +31,8 @@ JPEG XL, and handles large images such as panoramas.
 
 ## Installation
 
-Prebuilt packages are available from the
+Prebuilt packages for Linux and Windows (x86_64) and macOS (Apple silicon)
+are available from the
 [releases page](https://github.com/andrinbr/xl-view/releases).
 
 ### Linux
@@ -50,9 +51,9 @@ downloaded file and it handles installation and the menu entry.
 
 ### macOS
 
-The prebuilt macOS package supports Apple silicon (ARM64) only. Download the DMG
-and drag XL-View into Applications. XL-View is currently unsigned, so macOS may
-block it on first launch. Remove its quarantine attribute before opening it:
+Download the DMG and drag XL-View into Applications. XL-View is currently
+unsigned, so macOS may block it on first launch. Remove its quarantine
+attribute before opening it:
 
 ```console
 xattr -dr com.apple.quarantine /Applications/XL-View.app
@@ -62,8 +63,9 @@ xattr -dr com.apple.quarantine /Applications/XL-View.app
 
 Download either the Setup executable or the portable ZIP. Setup installs
 XL-View for the current user. The portable ZIP can be extracted anywhere and
-run without installation. The Windows binaries are currently unsigned, so
-Windows may show a SmartScreen warning when they are first run.
+run without installation.
+The Windows binaries are currently unsigned, so Windows may show a SmartScreen
+warning when they are first run.
 
 ### Building from source
 
@@ -122,10 +124,9 @@ argument, the viewer shows a welcome screen. Use `--diagnostics` to display
 the color-bar test pattern instead.
 
 By default, the viewer uses HDR output when the display supports it and sRGB
-otherwise. SDR, PQ, and HLG images are supported in either mode. Use
-`--output pq` or `--output sdr` to require a mode, `--background` to change what
-shows behind transparent pixels, and `--cache` / `--gpu-memory` to tune memory
-use.
+otherwise. Use `--output pq` or `--output sdr` to require a mode,
+`--background` to change what shows behind transparent pixels, and `--cache` /
+`--gpu-memory` to tune memory use.
 
 ## Controls
 
@@ -160,7 +161,10 @@ use.
 
 ## Supported image formats
 
-Currently JPEG XL (`.jxl`) only. Additional codecs may be implemented in the future (see Roadmap).
+Currently JPEG XL (`.jxl`) only. 
+
+Supported source encodings include SDR, PQ, HLG, and linear RGB (including scRGB).
+All can be displayed in either HDR or SDR mode.
 
 ## Troubleshooting
 
@@ -182,9 +186,8 @@ XL-View works like this (simplified):
    responsive, even for very large images.
 2. **Store:** Each image is converted once into a single high-precision
    (16-bit-per-channel) buffer that the rest of the app draws from.
-3. **Cache:** Recently viewed images are kept within the cache budget, and
-   the next and previous images in the folder are loaded ahead of time so
-   browsing feels instant.
+3. **Cache:** Recently viewed images are cached, and adjacent images are
+   preloaded when the cache budget allows, reducing delays when browsing.
 4. **Draw:** The GPU displays the image while a higher-quality CPU resize
    produces a sharp result once you stop panning.
 5. **Display:** The image is prepared for the active display and shown in HDR

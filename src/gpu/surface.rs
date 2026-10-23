@@ -5,8 +5,6 @@
 use std::error::Error;
 use std::fmt;
 use std::io;
-#[cfg(test)]
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use winit::dpi::PhysicalSize;
@@ -19,36 +17,33 @@ use super::display_target::{DisplayTargetProvider, HdrTarget};
 use super::hdr_metadata::{self, HdrMetadata, HdrSurface, SignalStatus};
 use super::mip::{create_rgba16f_texture, mip_level_count, rgba16f_texture_budget_bytes};
 #[cfg(test)]
-use super::mip::{encode_premultiplied_rgba16f_row, generate_linear_mips_for_layers};
-#[cfg(test)]
 use super::output::SurfaceCandidate;
 use super::output::{
-    FALLBACK_HDR_SOURCE_PEAK_NITS, RenderingOptions, SurfaceOutputError, SurfaceSelection,
-    is_hdr_color_space, select_required_surface, surface_configuration,
+    RenderingOptions, SurfaceOutputError, SurfaceSelection, is_hdr_color_space,
+    select_required_surface, surface_configuration,
 };
-#[cfg(test)]
-use super::presentation::{PARAM_BUFFER_USAGE, presentation_shader_source};
-use super::presentation::{PresentationParams, PresentationResources};
+use super::presentation::{
+    ContentMode, PresentationBindings, PresentationParams, PresentationResources,
+};
 use super::resampling::{ViewportResampler, required_resampling_gpu_bytes};
 #[cfg(test)]
-use super::tiles::{
-    MISSING_TILE_SLOT, TileJob, TileWorkerState, create_tile_array_texture,
-    create_tile_mapping_buffer, interactive_working_set_tiles, maximum_capacity, prioritized_tiles,
-    replace_pending_jobs, same_tile_set, upload_tile_layer,
-};
+use super::tiles::maximum_capacity;
 use super::tiles::{TileCache, tile_texture_extent, working_set_capacity};
 use super::ui::{OverlayImage, OverlaySection, render_empty_state, render_text_overlay};
 use super::upload::upload_staging_buffer_bytes;
 use super::view::ViewTransform;
-use super::{DisplayChangeNotifier, FailureReporter, NativeBackend, WorkReadyNotifier};
+use super::{
+    FailureReporter, GpuCallbacks, GpuOptions, NativeBackend, WorkerContext, lock_unpoisoned,
+};
 use crate::cli::{BackgroundMode, OutputMode};
-use crate::units::bytes_to_mib;
-use xl_view::color::{HDR_REFERENCE_WHITE_NITS, pq_oetf};
-use xl_view::decode::{DecodedImage, DecodedTileStore, SourceDynamicRange, TILE_GUTTER, TILE_SIZE};
+use xl_view::color::{HDR_REFERENCE_WHITE_NITS, PQ_PEAK_NITS, pq_oetf};
+use xl_view::decode::{DecodedImage, DecodedTileStore, TILE_GUTTER, TILE_SIZE};
+use xl_view::units::{BYTES_PER_MIB, bytes_to_mib};
 
 const HLG_PATTERN_SOURCE_PEAK_NITS: f32 = 1_000.0;
 const FALLBACK_IMAGE_GPU_BYTES: u64 = 8;
 const FALLBACK_UPLOAD_STAGING_BUFFER_BYTES: usize = 256;
+const MAX_EXPOSURE_STOPS: f32 = 10.0;
 #[derive(Debug)]
 pub enum GpuFailure {
     DeviceLost {
@@ -173,6 +168,22 @@ struct ImageBindings {
     viewport_resampler: ViewportResampler,
 }
 
+impl ImageBindings {
+    fn presentation<'a>(
+        &'a self,
+        ui_texture: &'a wgpu::Texture,
+        image_sampler: &'a wgpu::Sampler,
+    ) -> PresentationBindings<'a> {
+        PresentationBindings {
+            coarse_texture: &self.coarse_texture,
+            tile_cache: &self.tile_cache,
+            resampled_texture: self.viewport_resampler.texture(),
+            ui_texture,
+            image_sampler,
+        }
+    }
+}
+
 /// All mutable GPU state derived from one installed decoded image.
 ///
 /// Replacing this value commits the store, dimensions, view, bindings, HDR
@@ -186,7 +197,7 @@ struct ImageState {
     source_peak_nits: f32,
     base_gpu_budget_bytes: u64,
     coarse_gpu_bytes: u64,
-    resampling_memory_shortfall: Option<(u64, u64)>,
+    resampling_memory_shortfall_warned: bool,
     cpu_storage_bytes: usize,
     upload_staging_buffer_bytes: usize,
     coarse_mip_levels: u32,
@@ -270,10 +281,7 @@ pub struct GpuState {
     hdr_metadata_status: SignalStatus,
     gpu_memory_limit_bytes: u64,
     diagnostics_pattern: bool,
-    notify_work_ready: WorkReadyNotifier,
-    // Keep tile upload transactions atomic relative to presentation submission,
-    // and prevent submission while surface configuration waits for idle.
-    submission_lock: Arc<Mutex<()>>,
+    workers: WorkerContext,
     selection: SurfaceSelection,
     #[cfg(target_os = "linux")]
     monitor_name: Option<String>,
@@ -281,19 +289,29 @@ pub struct GpuState {
     window: Arc<dyn Window>,
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Keeps surface/device/metadata initialization in one fallible transaction.
+#[expect(clippy::too_many_lines)] // Keeps surface/device/metadata initialization in one fallible transaction.
 pub(super) fn initialize(
     instance: &wgpu::Instance,
     backend: NativeBackend,
     window: Arc<dyn Window>,
-    output_mode: OutputMode,
-    rendering_options: RenderingOptions,
-    diagnostics_pattern: bool,
-    report_failure: FailureReporter,
-    notify_work_ready: WorkReadyNotifier,
-    notify_display_changed: DisplayChangeNotifier,
-    gpu_memory_limit_bytes: u64,
+    options: GpuOptions,
+    callbacks: GpuCallbacks,
 ) -> Result<GpuState, GpuInitializationError> {
+    let GpuOptions {
+        output_mode,
+        background,
+        diagnostics: diagnostics_pattern,
+        memory_limit_bytes: gpu_memory_limit_bytes,
+    } = options;
+    let rendering_options = RenderingOptions {
+        exposure_stops: 0.0,
+        background,
+    };
+    let GpuCallbacks {
+        report_failure,
+        work_ready: notify_work_ready,
+        display_changed: notify_display_changed,
+    } = callbacks;
     let surface = instance
         .create_surface(Arc::clone(&window))
         .map_err(GpuInitializationError::SurfaceCreation)?;
@@ -376,13 +394,15 @@ pub(super) fn initialize(
         &device,
         candidate.format,
         params,
-        &fallback_image_bindings.coarse_texture,
-        &fallback_image_bindings.tile_cache,
-        fallback_image_bindings.viewport_resampler.texture(),
-        &ui_texture,
-        &image_sampler,
+        &fallback_image_bindings.presentation(&ui_texture, &image_sampler),
     );
 
+    let workers = WorkerContext {
+        device: device.clone(),
+        queue: queue.clone(),
+        work_ready: notify_work_ready,
+        submission_lock,
+    };
     Ok(GpuState {
         adapter,
         config,
@@ -400,8 +420,7 @@ pub(super) fn initialize(
         hdr_metadata_status,
         gpu_memory_limit_bytes,
         diagnostics_pattern,
-        notify_work_ready,
-        submission_lock,
+        workers,
         selection,
         #[cfg(target_os = "linux")]
         monitor_name,
@@ -513,10 +532,6 @@ const fn unloaded_source_peak_nits(diagnostics_pattern: bool) -> f32 {
 }
 
 impl GpuState {
-    fn image_bindings(&self) -> &ImageBindings {
-        self.image.bindings()
-    }
-
     fn source_peak_nits(&self) -> f32 {
         self.image.loaded().map_or_else(
             || unloaded_source_peak_nits(self.diagnostics_pattern),
@@ -598,97 +613,6 @@ impl GpuState {
         Ok(())
     }
 
-    fn create_image_state(
-        &self,
-        image: &DecodedImage,
-        view_transform: ViewTransform,
-    ) -> Result<(ImageState, ResamplingReservation), io::Error> {
-        let store = &image.store;
-        let (coarse_width, coarse_height) = store.coarse_dimensions();
-        let coarse_gpu_bytes = rgba16f_texture_budget_bytes(
-            coarse_width,
-            coarse_height,
-            mip_level_count(coarse_width, coarse_height),
-            1,
-        );
-        if coarse_gpu_bytes > self.gpu_memory_limit_bytes {
-            return Err(io::Error::other(format!(
-                "the {} MiB GPU memory budget cannot hold the {:.2} MiB coarse image preview",
-                self.gpu_memory_limit_bytes / (1024 * 1024),
-                bytes_to_mib(coarse_gpu_bytes),
-            )));
-        }
-        let coarse_texture = create_coarse_texture(
-            &self.device,
-            &self.queue,
-            store.coarse_pixels(),
-            coarse_width,
-            coarse_height,
-        )?;
-        let resampling_reservation = resampling_reservation(
-            (self.config.width, self.config.height),
-            Some(view_transform),
-            self.device.limits().max_texture_dimension_2d,
-            self.gpu_memory_limit_bytes.saturating_sub(coarse_gpu_bytes),
-        );
-        let resampling_gpu_bytes = resampling_reservation.bytes();
-        let tile_gpu_bytes = self
-            .gpu_memory_limit_bytes
-            .saturating_sub(coarse_gpu_bytes)
-            .saturating_sub(resampling_gpu_bytes);
-        let tile_cache = TileCache::active(
-            &self.device,
-            &self.queue,
-            Arc::clone(store),
-            tile_gpu_bytes,
-            (self.config.width, self.config.height),
-            Arc::clone(&self.notify_work_ready),
-            Arc::clone(&self.submission_lock),
-        )?;
-        let viewport_resampler = ViewportResampler::active(
-            &self.device,
-            &self.queue,
-            Arc::clone(store),
-            resampling_gpu_bytes,
-            Arc::clone(&self.notify_work_ready),
-            Arc::clone(&self.submission_lock),
-        );
-        let source_peak_nits = if image.source_dynamic_range == SourceDynamicRange::Sdr {
-            HDR_REFERENCE_WHITE_NITS
-        } else {
-            let metadata_peak = image.metadata.tone_mapping.intensity_target_nits;
-            if metadata_peak.is_finite() && metadata_peak > 0.0 {
-                metadata_peak
-            } else {
-                FALLBACK_HDR_SOURCE_PEAK_NITS
-            }
-        };
-        let base_gpu_budget_bytes = coarse_gpu_bytes.saturating_add(tile_cache.gpu_bytes());
-        let tile_extent = tile_texture_extent();
-        let upload_staging_buffer_bytes = upload_staging_buffer_bytes(coarse_width, coarse_height)
-            .max(upload_staging_buffer_bytes(tile_extent, tile_extent));
-        Ok((
-            ImageState {
-                bindings: ImageBindings {
-                    coarse_texture,
-                    tile_cache,
-                    viewport_resampler,
-                },
-                store: Arc::clone(store),
-                dimensions: (image.width, image.height),
-                view_transform,
-                source_peak_nits,
-                base_gpu_budget_bytes,
-                coarse_gpu_bytes,
-                resampling_memory_shortfall: None,
-                cpu_storage_bytes: image.memory_cost_bytes,
-                upload_staging_buffer_bytes,
-                coarse_mip_levels: mip_level_count(coarse_width, coarse_height),
-            },
-            resampling_reservation,
-        ))
-    }
-
     fn prepare_image_install(
         &self,
         image: &DecodedImage,
@@ -699,8 +623,13 @@ impl GpuState {
             PhysicalSize::new(width, height),
             PhysicalSize::new(self.config.width, self.config.height),
         );
-        let (image_state, resampling_reservation) =
-            self.create_image_state(image, view_transform)?;
+        let (image_state, resampling_reservation) = create_image_state(
+            &self.workers,
+            (self.config.width, self.config.height),
+            self.gpu_memory_limit_bytes,
+            image,
+            view_transform,
+        )?;
         let surface_selection = self.select_surface()?;
         Ok(PreparedImageInstall {
             image: image_state,
@@ -730,17 +659,12 @@ impl GpuState {
         if surface_selection.candidate().format == self.selection.candidate().format {
             self.rebuild_image_bind_group();
         }
-        if surface_selection.candidate() == self.selection.candidate() {
-            let output_peak_changed = surface_selection.display_target()
-                != self.selection.display_target()
-                && is_hdr_color_space(surface_selection.candidate().color_space);
-            self.set_selection(surface_selection, "image changed");
-            if output_peak_changed {
-                self.refresh_hdr_metadata("display target changed while loading image");
-            }
+        // The new image needs fresh uniforms even when the output is unchanged.
+        if !self.apply_surface_selection(
+            surface_selection,
+            "display target changed while loading image",
+        ) {
             self.update_params();
-        } else {
-            self.configure_surface(surface_selection, "display target changed");
         }
     }
 
@@ -786,73 +710,53 @@ impl GpuState {
     }
 
     pub fn fit_view(&mut self) {
-        if let Some(image) = self.image.loaded_mut() {
-            image.view_transform.set_fit();
-        }
-        self.request_view_work();
-        self.update_params();
-        self.window.request_redraw();
+        self.change_view(ViewTransform::set_fit);
     }
 
     pub fn one_to_one(&mut self, scale_factor: f64) {
-        if let Some(image) = self.image.loaded_mut() {
-            image.view_transform.set_one_to_one(scale_factor);
-        }
-        self.request_view_work();
-        self.update_params();
-        self.window.request_redraw();
+        self.change_view(|view| view.set_one_to_one(scale_factor));
     }
 
     /// Returns whether this zoom snapped to the fit stop.
     pub fn zoom_at(&mut self, position: winit::dpi::PhysicalPosition<f64>, factor: f64) -> bool {
-        let stopped_at_fit = self
-            .image
-            .loaded_mut()
-            .is_some_and(|image| image.view_transform.zoom_at(position, factor));
-        self.request_view_work();
-        self.update_params();
-        self.window.request_redraw();
-        stopped_at_fit
+        self.change_view(|view| view.zoom_at(position, factor))
+            .unwrap_or(false)
     }
 
     pub fn pan_by(&mut self, delta_x: f64, delta_y: f64) {
-        if let Some(image) = self.image.loaded_mut() {
-            image.view_transform.pan_by(delta_x, delta_y);
-        }
-        self.request_view_work();
-        self.update_params();
-        self.window.request_redraw();
+        self.change_view(|view| view.pan_by(delta_x, delta_y));
     }
 
     pub fn adjust_exposure(&mut self, delta_stops: f32) {
-        self.rendering_options.exposure_stops =
-            (self.rendering_options.exposure_stops + delta_stops).clamp(-10.0, 10.0);
+        self.rendering_options.exposure_stops = (self.rendering_options.exposure_stops
+            + delta_stops)
+            .clamp(-MAX_EXPOSURE_STOPS, MAX_EXPOSURE_STOPS);
         self.update_params();
         self.window.request_redraw();
     }
 
     pub fn reset_view_and_exposure(&mut self) {
         self.rendering_options.exposure_stops = 0.0;
-        if let Some(image) = self.image.loaded_mut() {
-            image.view_transform.set_fit();
-        }
+        self.change_view(ViewTransform::set_fit);
+    }
+
+    /// Applies `change` to the loaded image's view, then schedules the work,
+    /// uniforms, and frame that every view change needs.
+    fn change_view<T>(&mut self, change: impl FnOnce(&mut ViewTransform) -> T) -> Option<T> {
+        let result = self
+            .image
+            .loaded_mut()
+            .map(|image| change(&mut image.view_transform));
         self.request_view_work();
         self.update_params();
         self.window.request_redraw();
+        result
     }
 
     pub fn cycle_background(&mut self) {
         self.rendering_options.background = next_background(self.rendering_options.background);
         self.update_params();
         self.window.request_redraw();
-    }
-
-    pub fn refresh_display(
-        &mut self,
-        reason: &str,
-        capabilities: SurfaceCapabilities,
-    ) -> Result<DisplayRefresh, GpuOperationError> {
-        self.refresh_surface_selection(reason, capabilities)
     }
 
     #[cfg(target_os = "linux")]
@@ -963,7 +867,7 @@ impl GpuState {
                 let Some(image) = self.image.loaded_mut() else {
                     return;
                 };
-                if image.resampling_memory_shortfall.is_none() {
+                if !image.resampling_memory_shortfall_warned {
                     tracing::warn!(
                         viewport_width = viewport_dimensions.0,
                         viewport_height = viewport_dimensions.1,
@@ -972,12 +876,12 @@ impl GpuState {
                         gpu_memory_limit_mib = bytes_to_mib(self.gpu_memory_limit_bytes),
                         "GPU memory budget cannot hold the resampled viewport; using image tiles or the coarse preview"
                     );
+                    image.resampling_memory_shortfall_warned = true;
                 }
-                image.resampling_memory_shortfall = Some((required, available));
             }
             ResamplingReservation::NotRequired | ResamplingReservation::Reserved(_) => {
                 if let Some(image) = self.image.loaded_mut() {
-                    image.resampling_memory_shortfall = None;
+                    image.resampling_memory_shortfall_warned = false;
                 }
             }
         }
@@ -1005,13 +909,10 @@ impl GpuState {
             return false;
         }
         let tile_cache = match TileCache::active(
-            &self.device,
-            &self.queue,
+            &self.workers,
             Arc::clone(&image.store),
             tile_gpu_bytes,
             (self.config.width, self.config.height),
-            Arc::clone(&self.notify_work_ready),
-            Arc::clone(&self.submission_lock),
         ) {
             Ok(cache) => cache,
             Err(error) => {
@@ -1028,15 +929,12 @@ impl GpuState {
     }
 
     fn rebuild_image_bind_group(&mut self) {
-        let bindings = self.image.bindings();
-        self.presentation.rebuild_bind_group(
-            &self.device,
-            &bindings.coarse_texture,
-            &bindings.tile_cache,
-            bindings.viewport_resampler.texture(),
-            &self.ui_texture,
-            &self.image_sampler,
-        );
+        let bindings = self
+            .image
+            .bindings()
+            .presentation(&self.ui_texture, &self.image_sampler);
+        self.presentation
+            .rebuild_bind_group(&self.device, &bindings);
     }
 
     pub fn render(&mut self) -> Result<RenderOutcome, GpuOperationError> {
@@ -1107,10 +1005,7 @@ impl GpuState {
         {
             // Keep presentation submission from splitting a worker's tile
             // upload and mip-generation submission into separate transactions.
-            let _submission_guard = self
-                .submission_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _submission_guard = lock_unpoisoned(&self.workers.submission_lock);
             self.queue.submit([command_buffer]);
             self.window.pre_present_notify();
             self.queue.present(surface_texture);
@@ -1127,7 +1022,7 @@ impl GpuState {
         })
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(clippy::unnecessary_wraps))]
+    #[cfg_attr(not(target_os = "linux"), expect(clippy::unnecessary_wraps))] // Only Wayland can lack an output before the first commit.
     pub fn startup_diagnostics_report(&self) -> Option<String> {
         // Windows and macOS expose their native HDR data through wgpu. Wayland
         // is queried by our separate color-management provider, so using wgpu's
@@ -1176,11 +1071,11 @@ impl GpuState {
     }
 
     fn image_work_diagnostics(&self) -> ImageWorkDiagnostics {
-        let bindings = self.image_bindings();
+        let bindings = self.image.bindings();
         ImageWorkDiagnostics {
             tile_cache: bindings.tile_cache.status(),
-            tile_hits: bindings.tile_cache.hits,
-            tile_misses: bindings.tile_cache.misses,
+            tile_hits: bindings.tile_cache.hits(),
+            tile_misses: bindings.tile_cache.misses(),
             viewport_resampler: bindings.viewport_resampler.status(),
             resampling_scratch_peak_bytes: bindings.viewport_resampler.scratch_peak_bytes(),
             gpu_image_budget_bytes: self.image_gpu_budget_bytes(),
@@ -1207,7 +1102,7 @@ impl GpuState {
         }
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
+    #[cfg_attr(not(target_os = "linux"), expect(clippy::unused_self))] // Only Wayland tracks the window's output name.
     fn refresh_monitor_name(&mut self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -1282,22 +1177,16 @@ impl GpuState {
         let format_changed = candidate.format != previous_candidate.format;
         self.set_selection(selection, reason);
         if format_changed {
-            let bindings = self.image.bindings();
-            self.presentation.rebuild_pipeline(
-                &self.device,
-                candidate.format,
-                &bindings.coarse_texture,
-                &bindings.tile_cache,
-                bindings.viewport_resampler.texture(),
-                &self.ui_texture,
-                &self.image_sampler,
-            );
+            let bindings = self
+                .image
+                .bindings()
+                .presentation(&self.ui_texture, &self.image_sampler);
+            self.presentation
+                .rebuild_pipeline(&self.device, candidate.format, &bindings);
         }
         {
-            let submission_lock = Arc::clone(&self.submission_lock);
-            let _submission_guard = submission_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let submission_lock = Arc::clone(&self.workers.submission_lock);
+            let _submission_guard = lock_unpoisoned(&submission_lock);
             let metadata = output_hdr_metadata(self.selection);
             let status = self.surface.configure(&self.config, metadata);
             self.set_hdr_metadata_status(status, reason);
@@ -1312,7 +1201,7 @@ impl GpuState {
         Ok(())
     }
 
-    fn refresh_surface_selection(
+    pub fn refresh_surface_selection(
         &mut self,
         reason: &str,
         capabilities: SurfaceCapabilities,
@@ -1345,6 +1234,8 @@ impl GpuState {
         })
     }
 
+    /// Returns whether the rendered output changed. Uniforms are already
+    /// updated whenever this returns `true`.
     fn apply_surface_selection(&mut self, selection: SurfaceSelection, reason: &str) -> bool {
         if selection.requires_surface_reconfiguration(self.selection) {
             self.configure_surface(selection, reason);
@@ -1386,7 +1277,7 @@ impl GpuState {
     fn update_params(&self) {
         let image_dimensions = self.image.loaded().map(|image| image.dimensions);
         let view_transform = self.image.loaded().map(|image| image.view_transform);
-        let bindings = self.image_bindings();
+        let bindings = self.image.bindings();
         let mut params = shader_parameters(
             self.selection,
             self.rendering_options,
@@ -1404,6 +1295,82 @@ impl GpuState {
         self.queue
             .write_buffer(&self.presentation.params_buffer, 0, params.as_flattened());
     }
+}
+
+fn create_image_state(
+    workers: &WorkerContext,
+    viewport_dimensions: (u32, u32),
+    gpu_memory_limit_bytes: u64,
+    image: &DecodedImage,
+    view_transform: ViewTransform,
+) -> Result<(ImageState, ResamplingReservation), io::Error> {
+    let WorkerContext { device, queue, .. } = workers;
+    let store = &image.store;
+    let (coarse_width, coarse_height) = store.coarse_dimensions();
+    let coarse_gpu_bytes = rgba16f_texture_budget_bytes(
+        coarse_width,
+        coarse_height,
+        mip_level_count(coarse_width, coarse_height),
+        1,
+    );
+    if coarse_gpu_bytes > gpu_memory_limit_bytes {
+        return Err(io::Error::other(format!(
+            "the {} MiB GPU memory budget cannot hold the {:.2} MiB coarse image preview",
+            gpu_memory_limit_bytes / BYTES_PER_MIB,
+            bytes_to_mib(coarse_gpu_bytes),
+        )));
+    }
+    let coarse_texture = create_coarse_texture(
+        device,
+        queue,
+        store.coarse_pixels(),
+        coarse_width,
+        coarse_height,
+    )?;
+    let resampling_reservation = resampling_reservation(
+        viewport_dimensions,
+        Some(view_transform),
+        device.limits().max_texture_dimension_2d,
+        gpu_memory_limit_bytes.saturating_sub(coarse_gpu_bytes),
+    );
+    let resampling_gpu_bytes = resampling_reservation.bytes();
+    let tile_gpu_bytes = gpu_memory_limit_bytes
+        .saturating_sub(coarse_gpu_bytes)
+        .saturating_sub(resampling_gpu_bytes);
+    let tile_cache = TileCache::active(
+        workers,
+        Arc::clone(store),
+        tile_gpu_bytes,
+        viewport_dimensions,
+    )?;
+    let viewport_resampler =
+        ViewportResampler::active(workers, Arc::clone(store), resampling_gpu_bytes);
+    #[expect(clippy::cast_possible_truncation)] // Validated source peaks originate as f32.
+    let source_peak_nits = image.source_peak.nits() as f32;
+    let base_gpu_budget_bytes = coarse_gpu_bytes.saturating_add(tile_cache.gpu_bytes());
+    let tile_extent = tile_texture_extent();
+    let upload_staging_buffer_bytes = upload_staging_buffer_bytes(coarse_width, coarse_height)
+        .max(upload_staging_buffer_bytes(tile_extent, tile_extent));
+    Ok((
+        ImageState {
+            bindings: ImageBindings {
+                coarse_texture,
+                tile_cache,
+                viewport_resampler,
+            },
+            store: Arc::clone(store),
+            dimensions: (image.width, image.height),
+            view_transform,
+            source_peak_nits,
+            base_gpu_budget_bytes,
+            coarse_gpu_bytes,
+            resampling_memory_shortfall_warned: false,
+            cpu_storage_bytes: image.memory_cost_bytes,
+            upload_staging_buffer_bytes,
+            coarse_mip_levels: mip_level_count(coarse_width, coarse_height),
+        },
+        resampling_reservation,
+    ))
 }
 
 fn resampling_reservation(
@@ -1427,7 +1394,7 @@ fn resampling_reservation(
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)] // GPU uniforms intentionally keep explicit f32 coordinates and rendering inputs.
+#[expect(clippy::cast_possible_truncation, clippy::too_many_arguments)] // GPU uniforms intentionally keep explicit f32 coordinates and rendering inputs.
 fn shader_parameters(
     selection: SurfaceSelection,
     rendering_options: RenderingOptions,
@@ -1449,14 +1416,20 @@ fn shader_parameters(
     let effective_source_peak_nits = HDR_REFERENCE_WHITE_NITS.max(source_peak_nits * exposure);
     PresentationParams {
         pq_output: is_hdr_color_space(candidate.color_space),
-        content_mode: image_dimensions.map_or(u32::from(diagnostics_pattern), |_| 2),
+        content_mode: if image_dimensions.is_some() {
+            ContentMode::DecodedImage
+        } else if diagnostics_pattern {
+            ContentMode::DiagnosticsPattern
+        } else {
+            ContentMode::EmptyState
+        },
         background_mode: background_shader_mode(rendering_options.background),
         hdr_reference_white_nits: HDR_REFERENCE_WHITE_NITS,
         source_peak_nits,
         output_peak_nits,
         exposure_stops: rendering_options.exposure_stops,
-        effective_source_peak_pq: pq_oetf(effective_source_peak_nits / 10_000.0),
-        output_peak_pq: pq_oetf(output_peak_nits / 10_000.0),
+        effective_source_peak_pq: pq_oetf(effective_source_peak_nits / PQ_PEAK_NITS),
+        output_peak_pq: pq_oetf(output_peak_nits / PQ_PEAK_NITS),
         viewport_width: viewport_dimensions.0,
         viewport_height: viewport_dimensions.1,
         image_width,

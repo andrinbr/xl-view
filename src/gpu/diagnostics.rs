@@ -8,8 +8,8 @@ use super::display_target::DISPLAY_INFORMATION_SOURCE;
 use super::hdr_metadata::{HdrSurface, SignalStatus};
 use super::output::SurfaceSelection;
 use crate::cli::OutputMode;
-use crate::units::{bytes_to_mib, u64_from_usize};
 use xl_view::color::HDR_REFERENCE_WHITE_NITS;
+use xl_view::units::{bytes_to_mib, u64_from_usize};
 
 const EXPLICIT_COLOR_SPACES: [SurfaceColorSpace; 7] = [
     SurfaceColorSpace::Srgb,
@@ -297,7 +297,7 @@ fn allocator_memory_status(report: Option<wgpu::AllocatorReport>) -> String {
 mod tests {
     use super::*;
 
-    const MIB: u64 = 1024 * 1024;
+    use xl_view::units::BYTES_PER_MIB as MIB;
 
     #[test]
     fn allocator_diagnostics_distinguish_live_allocations_from_reserved_blocks() {

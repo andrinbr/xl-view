@@ -11,6 +11,15 @@ pub enum ViewMode {
     Manual,
 }
 
+/// Visible image region in image pixels, clamped to the image.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImageBounds {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ViewTransform {
     image: PhysicalSize<u32>,
@@ -44,15 +53,15 @@ impl ViewTransform {
         self.scale
     }
 
-    pub fn visible_image_bounds(self) -> (f64, f64, f64, f64) {
+    pub fn visible_image_bounds(self) -> ImageBounds {
         let half_width = f64::from(self.viewport.width) / self.scale / 2.0;
         let half_height = f64::from(self.viewport.height) / self.scale / 2.0;
-        (
-            (self.center.x - half_width).max(0.0),
-            (self.center.y - half_height).max(0.0),
-            (self.center.x + half_width).min(f64::from(self.image.width)),
-            (self.center.y + half_height).min(f64::from(self.image.height)),
-        )
+        ImageBounds {
+            left: (self.center.x - half_width).max(0.0),
+            top: (self.center.y - half_height).max(0.0),
+            right: (self.center.x + half_width).min(f64::from(self.image.width)),
+            bottom: (self.center.y + half_height).min(f64::from(self.image.height)),
+        }
     }
 
     pub fn set_viewport(&mut self, viewport: PhysicalSize<u32>) {
@@ -350,9 +359,25 @@ mod tests {
     fn visible_bounds_are_clamped_to_the_image() {
         let mut view =
             ViewTransform::fit(PhysicalSize::new(2000, 1000), PhysicalSize::new(1000, 1000));
-        assert_eq!(view.visible_image_bounds(), (0.0, 0.0, 2000.0, 1000.0));
+        assert_eq!(
+            view.visible_image_bounds(),
+            ImageBounds {
+                left: 0.0,
+                top: 0.0,
+                right: 2000.0,
+                bottom: 1000.0,
+            }
+        );
         view.set_one_to_one(1.0);
-        assert_eq!(view.visible_image_bounds(), (500.0, 0.0, 1500.0, 1000.0));
+        assert_eq!(
+            view.visible_image_bounds(),
+            ImageBounds {
+                left: 500.0,
+                top: 0.0,
+                right: 1500.0,
+                bottom: 1000.0,
+            }
+        );
     }
 
     #[test]

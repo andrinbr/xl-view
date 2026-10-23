@@ -9,16 +9,10 @@ pub(super) fn keyboard_action(
     modifiers: ModifiersState,
     fullscreen: FullscreenState,
 ) -> Option<KeyboardAction> {
+    // Shift+O used to cycle output modes. It now does nothing instead of
+    // falling through to Open.
     if modifiers.shift_key() && key == PhysicalKey::Code(KeyCode::KeyO) {
         return None;
-    }
-
-    if modifiers.control_key() {
-        match key {
-            PhysicalKey::Code(KeyCode::KeyQ) => return Some(KeyboardAction::Quit),
-            PhysicalKey::Code(KeyCode::KeyO) => return Some(KeyboardAction::Open),
-            _ => {}
-        }
     }
 
     match key {
@@ -180,5 +174,196 @@ pub(super) fn image_cursor(has_image: bool, is_dragging: bool) -> CursorIcon {
         #[cfg(not(target_os = "windows"))]
         (true, false) => CursorIcon::Grab,
         (false, _) => CursorIcon::Default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_bindings_match_the_interaction_contract() {
+        let bindings = [
+            (KeyCode::KeyF, KeyboardAction::Fit),
+            (KeyCode::Digit1, KeyboardAction::OneToOne),
+            (KeyCode::Numpad1, KeyboardAction::OneToOne),
+            (KeyCode::Equal, KeyboardAction::ZoomIn),
+            (KeyCode::NumpadAdd, KeyboardAction::ZoomIn),
+            (KeyCode::Minus, KeyboardAction::ZoomOut),
+            (KeyCode::NumpadSubtract, KeyboardAction::ZoomOut),
+            (KeyCode::KeyO, KeyboardAction::Open),
+            (KeyCode::KeyQ, KeyboardAction::Quit),
+            (KeyCode::BracketLeft, KeyboardAction::ExposureDown),
+            (KeyCode::BracketRight, KeyboardAction::ExposureUp),
+            (KeyCode::KeyR, KeyboardAction::ResetViewAndExposure),
+            (KeyCode::KeyB, KeyboardAction::CycleBackground),
+            (KeyCode::KeyI, KeyboardAction::ToggleMetadata),
+            (KeyCode::F11, KeyboardAction::ToggleFullscreen),
+            (KeyCode::Enter, KeyboardAction::ToggleFullscreen),
+            (KeyCode::KeyA, KeyboardAction::PanLeft),
+            (KeyCode::KeyD, KeyboardAction::PanRight),
+            (KeyCode::KeyW, KeyboardAction::PanUp),
+            (KeyCode::KeyS, KeyboardAction::PanDown),
+            (KeyCode::ArrowLeft, KeyboardAction::PreviousImage),
+            (KeyCode::ArrowRight, KeyboardAction::NextImage),
+        ];
+        for (key, expected) in bindings {
+            assert_eq!(
+                keyboard_action(
+                    PhysicalKey::Code(key),
+                    ModifiersState::empty(),
+                    FullscreenState::Windowed,
+                ),
+                Some(expected),
+            );
+        }
+
+        assert_eq!(
+            keyboard_action(
+                PhysicalKey::Code(KeyCode::KeyO),
+                ModifiersState::CONTROL,
+                FullscreenState::Windowed,
+            ),
+            Some(KeyboardAction::Open),
+        );
+        assert_eq!(
+            keyboard_action(
+                PhysicalKey::Code(KeyCode::KeyQ),
+                ModifiersState::CONTROL,
+                FullscreenState::Windowed,
+            ),
+            Some(KeyboardAction::Quit),
+        );
+        assert_eq!(
+            keyboard_action(
+                PhysicalKey::Code(KeyCode::Escape),
+                ModifiersState::empty(),
+                FullscreenState::Fullscreen,
+            ),
+            Some(KeyboardAction::LeaveFullscreen),
+        );
+        assert_eq!(
+            keyboard_action(
+                PhysicalKey::Code(KeyCode::Escape),
+                ModifiersState::empty(),
+                FullscreenState::Windowed,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn fullscreen_requested_state_toggles_without_waiting_for_the_compositor() {
+        assert_eq!(
+            FullscreenState::Windowed.toggled(),
+            FullscreenState::Fullscreen
+        );
+        assert_eq!(
+            FullscreenState::Fullscreen.toggled(),
+            FullscreenState::Windowed
+        );
+    }
+
+    #[test]
+    fn primary_click_tracker_uses_a_300_millisecond_interval() {
+        let start = Instant::now();
+        for (interval, is_double_click) in [(299, true), (300, true), (301, false)] {
+            let mut tracker = PrimaryClickTracker::default();
+            tracker.press(start, Some(PhysicalPosition::new(0.0, 0.0)), 1.0);
+            assert!(!tracker.release());
+            tracker.press(
+                start + Duration::from_millis(interval),
+                Some(PhysicalPosition::new(0.0, 0.0)),
+                1.0,
+            );
+            assert_eq!(tracker.release(), is_double_click);
+        }
+    }
+
+    #[test]
+    fn primary_click_tracker_uses_logical_distance_from_the_press() {
+        let start = Instant::now();
+        let origin = PhysicalPosition::new(100.0, 100.0);
+        let mut tracker = PrimaryClickTracker::default();
+        tracker.press(start, Some(origin), 2.0);
+        assert!(!tracker.release());
+
+        tracker.press(start + Duration::from_millis(250), Some(origin), 2.0);
+        tracker.move_to(PhysicalPosition::new(106.0, 107.0));
+        assert!(tracker.release());
+    }
+
+    #[test]
+    fn hovering_between_clicks_does_not_cancel_the_sequence() {
+        let start = Instant::now();
+        let origin = PhysicalPosition::new(100.0, 100.0);
+        let mut tracker = PrimaryClickTracker::default();
+        tracker.press(start, Some(origin), 1.0);
+        assert!(!tracker.release());
+
+        tracker.move_to(PhysicalPosition::new(500.0, 500.0));
+        tracker.press(start + Duration::from_millis(250), Some(origin), 1.0);
+        assert!(tracker.release());
+    }
+
+    #[test]
+    fn unmatched_release_cancels_the_click_sequence() {
+        let start = Instant::now();
+        let origin = PhysicalPosition::new(100.0, 100.0);
+        let mut tracker = PrimaryClickTracker::default();
+        tracker.press(start, Some(origin), 1.0);
+        assert!(!tracker.release());
+
+        assert!(!tracker.release());
+        tracker.press(start + Duration::from_millis(250), Some(origin), 1.0);
+        assert!(!tracker.release());
+    }
+
+    #[test]
+    fn drag_cancels_a_pending_double_click() {
+        let start = Instant::now();
+        let origin = PhysicalPosition::new(100.0, 100.0);
+        let mut tracker = PrimaryClickTracker::default();
+        tracker.press(start, Some(origin), 1.0);
+        assert!(!tracker.release());
+
+        tracker.press(start + Duration::from_millis(250), Some(origin), 1.0);
+        tracker.move_to(PhysicalPosition::new(103.0, 104.0));
+        assert!(!tracker.release());
+
+        tracker.press(start + Duration::from_millis(275), Some(origin), 1.0);
+        assert!(!tracker.release());
+    }
+
+    #[test]
+    fn movement_without_a_press_origin_cancels_the_click_sequence() {
+        let start = Instant::now();
+        let origin = PhysicalPosition::new(100.0, 100.0);
+        let mut tracker = PrimaryClickTracker::default();
+        tracker.press(start, Some(origin), 1.0);
+        assert!(!tracker.release());
+
+        tracker.press(start + Duration::from_millis(250), None, 1.0);
+        tracker.move_to(origin);
+        assert!(!tracker.release());
+
+        tracker.press(start + Duration::from_millis(275), Some(origin), 1.0);
+        assert!(!tracker.release());
+    }
+
+    #[test]
+    fn image_cursor_shows_pan_availability_and_drag_state() {
+        assert_eq!(image_cursor(false, false), CursorIcon::Default);
+        assert_eq!(image_cursor(false, true), CursorIcon::Default);
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(image_cursor(true, false), CursorIcon::Default);
+            assert_eq!(image_cursor(true, true), CursorIcon::Grabbing);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(image_cursor(true, false), CursorIcon::Grab);
+            assert_eq!(image_cursor(true, true), CursorIcon::Grabbing);
+        }
     }
 }

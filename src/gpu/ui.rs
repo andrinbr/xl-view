@@ -1,11 +1,11 @@
 use std::sync::OnceLock;
 
-use fontdue::{Font, FontSettings};
+use fontdue::{Font, FontSettings, LineMetrics};
 use xl_view::color::srgb_eotf;
 
 use crate::APPLICATION_NAME;
 use crate::app_icon;
-use crate::units::usize_from_u32;
+use xl_view::units::usize_from_u32;
 
 const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/AdwaitaSans-Regular.ttf");
 const MAX_CHARACTERS_PER_CELL: usize = 80;
@@ -49,12 +49,8 @@ pub fn render_text_overlay(sections: &[OverlaySection], scale_factor: f64) -> Ov
 
     let font = overlay_font();
     let scale = ui_scale(scale_factor);
-    let line_metrics = font
-        .horizontal_line_metrics(scale.font_px)
-        .expect("Adwaita Sans provides horizontal line metrics");
-    let title_metrics = font
-        .horizontal_line_metrics(scale.title_font_px)
-        .expect("Adwaita Sans provides horizontal line metrics");
+    let line_metrics = font_line_metrics(font, scale.font_px);
+    let title_metrics = font_line_metrics(font, scale.title_font_px);
     let row_height = ceil_to_usize(line_metrics.new_line_size).max(1);
     let title_height = ceil_to_usize(title_metrics.new_line_size).max(1);
     let label_width = sections
@@ -173,12 +169,8 @@ pub fn render_empty_state(scale_factor: f64) -> OverlayImage {
     let title = format!("{APPLICATION_NAME} {}", env!("CARGO_PKG_VERSION"));
     let title_width = text_width(font, &title, scale.title_font_px);
     let help_width = text_width(font, EMPTY_STATE_HELP, scale.help_font_px);
-    let title_metrics = font
-        .horizontal_line_metrics(scale.title_font_px)
-        .expect("Adwaita Sans provides horizontal line metrics");
-    let help_metrics = font
-        .horizontal_line_metrics(scale.help_font_px)
-        .expect("Adwaita Sans provides horizontal line metrics");
+    let title_metrics = font_line_metrics(font, scale.title_font_px);
+    let help_metrics = font_line_metrics(font, scale.help_font_px);
     let title_height = ceil_to_usize(title_metrics.new_line_size).max(1);
     let help_height = ceil_to_usize(help_metrics.new_line_size).max(1);
     let logo_px = usize_from_u32(scale.logo_px);
@@ -228,20 +220,20 @@ struct EmptyStateScale {
     title_help_gap: usize,
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // The scale factor is clamped to 1..=3 before producing small positive pixel sizes.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // The scale factor is clamped to 1..=3 before producing small positive pixel sizes.
 fn empty_state_scale(scale_factor: f64) -> EmptyStateScale {
     let factor = scale_factor.clamp(1.0, 3.0) as f32;
+    let pixels = |base: f32| (base * factor).round() as usize;
     EmptyStateScale {
         help_font_px: 16.0 * factor,
-        horizontal_padding: (8.0 * factor).round() as usize,
+        horizontal_padding: pixels(8.0),
         logo_px: (152.0 * factor).round() as u32,
-        logo_title_gap: (24.0 * factor).round() as usize,
+        logo_title_gap: pixels(24.0),
         title_font_px: 28.0 * factor,
-        title_help_gap: (10.0 * factor).round() as usize,
+        title_help_gap: pixels(10.0),
     }
 }
 
-#[allow(clippy::cast_precision_loss)] // The 3x-clamped empty-state scale produces a logo of at most 456 pixels.
 fn draw_svg_logo(pixels: &mut [f32], canvas_width: usize, x: usize, y: usize, logo_px: u32) {
     let icon_pixels = app_icon::rasterize(logo_px);
 
@@ -275,7 +267,7 @@ fn draw_svg_logo(pixels: &mut [f32], canvas_width: usize, x: usize, y: usize, lo
     }
 }
 
-#[allow(clippy::cast_possible_truncation)] // Eight-bit UI input is converted by the shared f64 reference before RGBA16F storage.
+#[expect(clippy::cast_possible_truncation)] // Eight-bit UI input is converted by the shared f64 reference before RGBA16F storage.
 fn srgb_to_linear(encoded: f32) -> f32 {
     srgb_eotf(f64::from(encoded)) as f32
 }
@@ -291,7 +283,7 @@ struct UiScale {
     title_rule_gap: usize,
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // The scale factor is clamped to 1..=3 before producing small positive pixel sizes.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // The scale factor is clamped to 1..=3 before producing small positive pixel sizes.
 fn ui_scale(scale_factor: f64) -> UiScale {
     let factor = scale_factor.clamp(1.0, 3.0) as f32;
     let pixels = |base: f32| (base * factor).round() as usize;
@@ -315,22 +307,37 @@ fn overlay_font() -> &'static Font {
     })
 }
 
-fn text_width(font: &Font, text: &str, font_px: f32) -> usize {
-    let mut width = 0.0_f32;
+fn font_line_metrics(font: &Font, font_px: f32) -> LineMetrics {
+    font.horizontal_line_metrics(font_px)
+        .expect("Adwaita Sans provides horizontal line metrics")
+}
+
+/// The characters drawn for one cell, each with the kerning applied before it.
+fn kerned_characters<'a>(
+    font: &'a Font,
+    text: &'a str,
+    font_px: f32,
+) -> impl Iterator<Item = (char, f32)> + 'a {
     let mut previous = None;
-    for character in text.chars().take(MAX_CHARACTERS_PER_CELL) {
-        if let Some(previous) = previous {
-            width += font
-                .horizontal_kern(previous, character, font_px)
+    text.chars()
+        .take(MAX_CHARACTERS_PER_CELL)
+        .map(move |character| {
+            let kern = previous
+                .and_then(|previous| font.horizontal_kern(previous, character, font_px))
                 .unwrap_or(0.0);
-        }
-        width += font.metrics(character, font_px).advance_width;
-        previous = Some(character);
-    }
+            previous = Some(character);
+            (character, kern)
+        })
+}
+
+fn text_width(font: &Font, text: &str, font_px: f32) -> usize {
+    let width = kerned_characters(font, text, font_px).fold(0.0_f32, |width, (character, kern)| {
+        width + kern + font.metrics(character, font_px).advance_width
+    });
     ceil_to_usize(width).max(1)
 }
 
-#[allow(clippy::cast_precision_loss)] // Coordinates come from 3x-clamped application layouts with text capped at 80 characters per cell.
+#[expect(clippy::cast_precision_loss)] // Coordinates come from 3x-clamped application layouts with text capped at 80 characters per cell.
 fn draw_text(
     pixels: &mut [f32],
     canvas_width: usize,
@@ -343,13 +350,8 @@ fn draw_text(
     let font = overlay_font();
     let canvas_height = pixels.len() / 4 / canvas_width;
     let mut cursor = x as f32;
-    let mut previous = None;
-    for character in text.chars().take(MAX_CHARACTERS_PER_CELL) {
-        if let Some(previous) = previous {
-            cursor += font
-                .horizontal_kern(previous, character, font_px)
-                .unwrap_or(0.0);
-        }
+    for (character, kern) in kerned_characters(font, text, font_px) {
+        cursor += kern;
         let (metrics, bitmap) = font.rasterize(character, font_px);
         let glyph_x = floor_to_i32(cursor) + metrics.xmin;
         let glyph_y = i32::try_from(baseline).unwrap_or(i32::MAX)
@@ -364,7 +366,6 @@ fn draw_text(
             text_rgb,
         );
         cursor += metrics.advance_width;
-        previous = Some(character);
     }
 }
 
@@ -434,12 +435,12 @@ fn blend_text_pixel(pixel: &mut [f32], text_rgb: [f32; 3], coverage: f32) {
     pixel[3] = output_alpha;
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Layout measurements are finite and non-negative before conversion.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Layout measurements are finite and non-negative before conversion.
 fn ceil_to_usize(value: f32) -> usize {
     value.max(0.0).ceil() as usize
 }
 
-#[allow(clippy::cast_possible_truncation)] // Glyph coordinates remain within practical UI dimensions.
+#[expect(clippy::cast_possible_truncation)] // Glyph coordinates remain within practical UI dimensions.
 fn floor_to_i32(value: f32) -> i32 {
     value.floor() as i32
 }

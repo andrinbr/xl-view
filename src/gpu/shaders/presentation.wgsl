@@ -1,8 +1,16 @@
+// Params.content_mode values, mirrored by ContentMode in presentation.rs.
+const CONTENT_EMPTY_STATE: u32 = 0u;
+const CONTENT_DIAGNOSTICS_PATTERN: u32 = 1u;
+const CONTENT_DECODED_IMAGE: u32 = 2u;
+// Params.background_mode values, mirrored by background_shader_mode in surface.rs.
+const BACKGROUND_BLACK: u32 = 0u;
+const BACKGROUND_CHECKERBOARD: u32 = 1u;
+const BACKGROUND_WHITE: u32 = 2u;
+const BACKGROUND_MIDDLE_GRAY: u32 = 3u;
+
 struct Params {
     pq_output: u32,
-    // 0 = empty state, 1 = diagnostics pattern, 2 = decoded image.
     content_mode: u32,
-    // 0 = black, 1 = checkerboard, 2 = white, 3 = 18% middle gray.
     background_mode: u32,
     hdr_reference_white_nits: f32,
     source_peak_nits: f32,
@@ -47,19 +55,19 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 }
 
 fn background(position: vec2u) -> vec3f {
-    if params.background_mode == 0u { return vec3f(0.0); }
-    if params.background_mode == 2u { return vec3f(1.0); }
-    if params.background_mode == 3u { return vec3f(0.18); }
+    if params.background_mode == BACKGROUND_BLACK { return vec3f(0.0); }
+    if params.background_mode == BACKGROUND_WHITE { return vec3f(1.0); }
+    if params.background_mode == BACKGROUND_MIDDLE_GRAY { return vec3f(0.18); }
     let alternate = ((position.x / 16u) + (position.y / 16u)) & 1u;
     // Neutral values are already linear and relative to HDR reference white.
     return select(vec3f(0.18), vec3f(0.32), alternate == 1u);
 }
 
 fn canonical_input(uv: vec2f, position: vec2u) -> vec4f {
-    if params.content_mode == 0u {
+    if params.content_mode == CONTENT_EMPTY_STATE {
         return vec4f(vec3f(0.012), 1.0);
     }
-    if params.content_mode == 1u {
+    if params.content_mode == CONTENT_DIAGNOSTICS_PATTERN {
         return vec4f(hlg_input_to_canonical(
             bt2111_hlg_signal(uv),
             params.source_peak_nits,
@@ -122,7 +130,7 @@ fn canonical_input(uv: vec2f, position: vec2u) -> vec4f {
     // both operands are canonical linear BT.2020 values. Composite before
     // exposure, tone mapping, gamut mapping, and transfer encoding.
     return vec4f(
-        sanitize(rgba.r), sanitize(rgba.g), sanitize(rgba.b),
+        finite_or_zero(rgba.r), finite_or_zero(rgba.g), finite_or_zero(rgba.b),
         alpha,
     );
 }
@@ -143,7 +151,7 @@ fn ui_input(position: vec2u) -> vec4f {
 fn output_transform(canonical: vec4f, ui: vec4f, position: vec2u) -> vec3f {
     let exposure = exp2(params.exposure_stops);
     let image = vec3f(
-        sanitize(canonical.r), sanitize(canonical.g), sanitize(canonical.b),
+        finite_or_zero(canonical.r), finite_or_zero(canonical.g), finite_or_zero(canonical.b),
     ) * exposure;
     let image_alpha = clamp(sanitize(canonical.a), 0.0, 1.0);
     let working = image + background(position) * (1.0 - image_alpha);
@@ -173,7 +181,7 @@ fn output_transform(canonical: vec4f, ui: vec4f, position: vec2u) -> vec3f {
         let ui_nits = BT709_TO_BT2020
             * (ui_linear_bt709 * params.hdr_reference_white_nits);
         let display_nits = image_nits * (1.0 - ui_alpha) + ui_nits;
-        return dither_encoded(pq_oetf(display_nits / 10000.0), position, 10u);
+        return dither_encoded(pq_oetf(display_nits / PQ_PEAK_NITS), position, 10u);
     }
 
     // SDR changes destination gamut to BT.709 and needs perceptual mapping.

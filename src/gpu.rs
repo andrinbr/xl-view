@@ -10,13 +10,14 @@ mod output;
 mod presentation;
 mod resampling;
 mod surface;
+#[cfg(test)]
+mod test_utils;
 mod tiles;
 mod ui;
 mod upload;
 mod view;
 
-pub use output::RenderingOptions;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 pub(crate) use surface::{
     DisplayRefresh, GpuInitializationError, GpuOperationError, SurfaceCapabilities,
 };
@@ -24,18 +25,47 @@ pub use surface::{GpuFailure, GpuState};
 pub(super) use ui::OverlaySection;
 use winit::window::Window;
 
-use crate::cli::OutputMode;
+use crate::cli::{BackgroundMode, OutputMode};
 
 pub(super) type FailureReporter = Arc<dyn Fn(GpuFailure) + Send + Sync>;
 pub(super) type DisplayChangeNotifier = Arc<dyn Fn() + Send + Sync>;
 pub(super) type WorkReadyNotifier = Arc<dyn Fn() + Send + Sync>;
 
-fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("non-string panic payload")
+/// GPU handles and signals that background upload workers share with the renderer.
+#[derive(Clone)]
+pub(super) struct WorkerContext {
+    pub(super) device: wgpu::Device,
+    pub(super) queue: wgpu::Queue,
+    pub(super) work_ready: WorkReadyNotifier,
+    // Keeps upload transactions atomic relative to presentation submission, and
+    // prevents submission while surface configuration waits for idle.
+    pub(super) submission_lock: Arc<Mutex<()>>,
+}
+
+/// Startup options that configure the renderer.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GpuOptions {
+    pub(super) output_mode: OutputMode,
+    pub(super) background: BackgroundMode,
+    /// `--diagnostics`: shows the BT.2111 pattern until an image loads and
+    /// enables diagnostic reports.
+    pub(super) diagnostics: bool,
+    pub(super) memory_limit_bytes: u64,
+}
+
+/// Callbacks through which the renderer reaches the application event loop.
+#[derive(Clone)]
+pub(super) struct GpuCallbacks {
+    pub(super) report_failure: FailureReporter,
+    pub(super) work_ready: WorkReadyNotifier,
+    pub(super) display_changed: DisplayChangeNotifier,
+}
+
+/// Locks `mutex`, recovering the guard if another thread panicked while holding it.
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub(super) fn create_fullscreen_render_pipeline(
@@ -131,17 +161,11 @@ pub(super) const fn native_backends() -> wgpu::Backends {
     backends
 }
 
-#[allow(clippy::too_many_arguments)] // Keeps initialization dependencies explicit across the backend retry boundary.
 pub(super) fn initialize(
     mut descriptor: impl FnMut() -> wgpu::InstanceDescriptor,
     window: &Arc<dyn Window>,
-    output_mode: OutputMode,
-    rendering_options: RenderingOptions,
-    diagnostics_pattern: bool,
-    report_failure: &FailureReporter,
-    notify_work_ready: &WorkReadyNotifier,
-    notify_display_changed: &DisplayChangeNotifier,
-    gpu_memory_limit_bytes: u64,
+    options: GpuOptions,
+    callbacks: &GpuCallbacks,
 ) -> Result<GpuState, GpuInitializationError> {
     for (index, backend) in native_backend_order().iter().copied().enumerate() {
         let mut descriptor = descriptor();
@@ -151,13 +175,8 @@ pub(super) fn initialize(
             &instance,
             backend,
             Arc::clone(window),
-            output_mode,
-            rendering_options,
-            diagnostics_pattern,
-            Arc::clone(report_failure),
-            Arc::clone(notify_work_ready),
-            Arc::clone(notify_display_changed),
-            gpu_memory_limit_bytes,
+            options,
+            callbacks.clone(),
         ) {
             Ok(gpu) => return Ok(gpu),
             Err(

@@ -9,12 +9,13 @@ use wgpu::util::DeviceExt;
 
 use super::mip::{LinearMipGenerator, mip_level_count, rgba16f_texture_budget_bytes};
 use super::upload::TextureUploadLayout;
-use super::view::ViewTransform;
-use super::{WorkReadyNotifier, panic_payload_message};
-use crate::units::usize_from_u32;
+use super::view::{ImageBounds, ViewTransform};
+use super::{WorkerContext, lock_unpoisoned};
+use crate::diagnostics::panic_payload_message;
 use xl_view::decode::{DecodedTileStore, TILE_GUTTER, TILE_SIZE};
+use xl_view::units::usize_from_u32;
 
-pub(super) const MISSING_TILE_SLOT: u32 = u32::MAX;
+const MISSING_TILE_SLOT: u32 = u32::MAX;
 
 /// GPU tile residency state.
 ///
@@ -25,28 +26,28 @@ pub(super) const MISSING_TILE_SLOT: u32 = u32::MAX;
 /// entry per slot. Generations let the worker reject stale jobs before their
 /// reserved slots can become resident.
 pub(super) struct TileCache {
-    pub(super) texture: wgpu::Texture,
-    pub(super) mapping_buffer: wgpu::Buffer,
-    pub(super) mapping: Vec<u32>,
-    pub(super) slot_tiles: Vec<Option<u32>>,
-    pub(super) last_used: Vec<u64>,
-    pub(super) epoch: u64,
-    pub(super) hits: u64,
-    pub(super) misses: u64,
-    pub(super) tile_columns: u32,
-    pub(super) tile_rows: u32,
-    pub(super) coarse_downsample: u32,
-    pub(super) desired_tiles: Vec<u32>,
-    pub(super) request_generation: u64,
-    pub(super) last_view_center: Option<(f64, f64)>,
-    pub(super) worker: Option<TileWorker>,
+    texture: wgpu::Texture,
+    mapping_buffer: wgpu::Buffer,
+    mapping: Vec<u32>,
+    slot_tiles: Vec<Option<u32>>,
+    last_used: Vec<u64>,
+    epoch: u64,
+    hits: u64,
+    misses: u64,
+    tile_columns: u32,
+    tile_rows: u32,
+    coarse_downsample: u32,
+    desired_tiles: Vec<u32>,
+    request_generation: u64,
+    last_view_center: Option<(f64, f64)>,
+    worker: Option<TileWorker>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct TileJob {
-    pub(super) generation: u64,
-    pub(super) logical_tile: u32,
-    pub(super) slot: u32,
+struct TileJob {
+    generation: u64,
+    logical_tile: u32,
+    slot: u32,
 }
 
 #[derive(Debug)]
@@ -57,13 +58,13 @@ enum TileWorkResult {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct TileWorkerState {
-    pub(super) generation: u64,
-    pub(super) pending: VecDeque<TileJob>,
-    pub(super) shutdown: bool,
+struct TileWorkerState {
+    generation: u64,
+    pending: VecDeque<TileJob>,
+    shutdown: bool,
 }
 
-pub(super) struct TileWorker {
+struct TileWorker {
     state: Arc<(Mutex<TileWorkerState>, Condvar)>,
     results: Receiver<TileWorkResult>,
     thread: Option<JoinHandle<()>>,
@@ -72,12 +73,9 @@ pub(super) struct TileWorker {
 impl TileWorker {
     fn spawn(
         source: Arc<DecodedTileStore>,
-        device: wgpu::Device,
-        queue: wgpu::Queue,
+        context: WorkerContext,
         texture: wgpu::Texture,
         mip_level_count: u32,
-        notify_ready: WorkReadyNotifier,
-        submission_lock: Arc<Mutex<()>>,
     ) -> Result<Self, io::Error> {
         let state = Arc::new((Mutex::new(TileWorkerState::default()), Condvar::new()));
         let worker_state = Arc::clone(&state);
@@ -87,14 +85,11 @@ impl TileWorker {
             .spawn(move || {
                 run_tile_worker(
                     &source,
-                    &device,
-                    &queue,
+                    &context,
                     &texture,
                     mip_level_count,
                     &worker_state,
                     &result_sender,
-                    notify_ready.as_ref(),
-                    &submission_lock,
                 );
             })?;
         Ok(Self {
@@ -106,9 +101,7 @@ impl TileWorker {
 
     fn replace_pending(&self, generation: u64) -> Vec<TileJob> {
         let (state, wake) = self.state.as_ref();
-        let mut state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock_unpoisoned(state);
         let cancelled = replace_pending_jobs(&mut state, generation);
         wake.notify_one();
         cancelled
@@ -119,9 +112,7 @@ impl TileWorker {
             return Vec::new();
         }
         let (state, wake) = self.state.as_ref();
-        let mut state = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock_unpoisoned(state);
         if state.shutdown || state.generation != generation {
             return jobs;
         }
@@ -131,7 +122,7 @@ impl TileWorker {
     }
 }
 
-pub(super) fn replace_pending_jobs(state: &mut TileWorkerState, generation: u64) -> Vec<TileJob> {
+fn replace_pending_jobs(state: &mut TileWorkerState, generation: u64) -> Vec<TileJob> {
     state.generation = generation;
     state.pending.drain(..).collect()
 }
@@ -140,9 +131,7 @@ impl Drop for TileWorker {
     fn drop(&mut self) {
         let (state, wake) = self.state.as_ref();
         {
-            let mut state = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = lock_unpoisoned(state);
             state.shutdown = true;
             state.pending.clear();
             wake.notify_one();
@@ -158,18 +147,20 @@ impl Drop for TileWorker {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // Worker dependencies stay explicit across this single thread boundary.
 fn run_tile_worker(
     source: &DecodedTileStore,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
+    context: &WorkerContext,
     texture: &wgpu::Texture,
     mip_level_count: u32,
     state: &Arc<(Mutex<TileWorkerState>, Condvar)>,
     results: &mpsc::Sender<TileWorkResult>,
-    notify_ready: &(dyn Fn() + Send + Sync),
-    submission_lock: &Mutex<()>,
 ) {
+    let WorkerContext {
+        device,
+        queue,
+        work_ready: notify_ready,
+        submission_lock,
+    } = context;
     let mip_generator = LinearMipGenerator::new(device);
     loop {
         let Some(job) = next_tile_job(state) else {
@@ -182,9 +173,7 @@ fn run_tile_worker(
         let result = if tile_job_is_current(state, job.generation) {
             match pixels {
                 Ok(pixels) => {
-                    let _submission_guard = submission_lock
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _submission_guard = lock_unpoisoned(submission_lock);
                     if let Err(error) = upload_tile_layer(queue, texture, job.slot, &pixels) {
                         TileWorkResult::Failed(job, error)
                     } else {
@@ -217,9 +206,7 @@ fn run_tile_worker(
 
 fn next_tile_job(state: &Arc<(Mutex<TileWorkerState>, Condvar)>) -> Option<TileJob> {
     let (state, wake) = state.as_ref();
-    let mut state = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = lock_unpoisoned(state);
     loop {
         if state.shutdown {
             return None;
@@ -235,9 +222,7 @@ fn next_tile_job(state: &Arc<(Mutex<TileWorkerState>, Condvar)>) -> Option<TileJ
 
 fn tile_job_is_current(state: &Arc<(Mutex<TileWorkerState>, Condvar)>, generation: u64) -> bool {
     let (state, _) = state.as_ref();
-    let state = state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = lock_unpoisoned(state);
     !state.shutdown && state.generation == generation
 }
 
@@ -279,14 +264,12 @@ impl TileCache {
     }
 
     pub(super) fn active(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        context: &WorkerContext,
         source: Arc<DecodedTileStore>,
         maximum_tile_bytes: u64,
         viewport_dimensions: (u32, u32),
-        notify_ready: WorkReadyNotifier,
-        submission_lock: Arc<Mutex<()>>,
     ) -> Result<Self, io::Error> {
+        let WorkerContext { device, queue, .. } = context;
         let logical_tiles = source
             .tile_columns()
             .checked_mul(source.tile_rows())
@@ -308,15 +291,7 @@ impl TileCache {
         let tile_rows = source.tile_rows();
         let coarse_downsample = source.coarse_downsample();
         let mip_level_count = mip_level_count(tile_texture_extent(), tile_texture_extent());
-        let worker = TileWorker::spawn(
-            source,
-            device.clone(),
-            queue.clone(),
-            texture.clone(),
-            mip_level_count,
-            notify_ready,
-            submission_lock,
-        )?;
+        let worker = TileWorker::spawn(source, context.clone(), texture.clone(), mip_level_count)?;
         let mapping = vec![MISSING_TILE_SLOT; usize_from_u32(logical_tiles)];
         let mapping_buffer = create_tile_mapping_buffer(device, &mapping);
         Ok(Self {
@@ -342,13 +317,29 @@ impl TileCache {
         self.tile_columns != 0 && self.tile_rows != 0
     }
 
+    pub(super) fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    pub(super) fn mapping_buffer(&self) -> &wgpu::Buffer {
+        &self.mapping_buffer
+    }
+
+    pub(super) fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    pub(super) fn misses(&self) -> u64 {
+        self.misses
+    }
+
     pub(super) fn tile_columns(&self) -> u32 {
         self.tile_columns
     }
 
     pub(super) fn capacity(&self) -> u32 {
         if self.is_active() {
-            u32::try_from(self.slot_tiles.len()).unwrap_or(u32::MAX)
+            slot_u32(self.slot_tiles.len())
         } else {
             0
         }
@@ -386,8 +377,7 @@ impl TileCache {
     }
 
     fn slot_is_resident(&self, slot: usize, logical_tile: u32) -> bool {
-        self.mapping[usize_from_u32(logical_tile)]
-            == u32::try_from(slot).expect("tile-cache slots are bounded by a u32 capacity")
+        self.mapping[usize_from_u32(logical_tile)] == slot_u32(slot)
     }
 
     pub(super) fn should_sample(&self, view: Option<ViewTransform>) -> bool {
@@ -524,16 +514,16 @@ impl TileCache {
             jobs.push(TileJob {
                 generation,
                 logical_tile,
-                slot: u32::try_from(slot).expect("tile-cache slots are bounded by a u32 capacity"),
+                slot: slot_u32(slot),
             });
         }
         if mapping_changed {
             self.write_mapping(queue);
         }
-        let rejected = self
-            .worker
-            .as_ref()
-            .map_or(jobs.clone(), |worker| worker.append(generation, jobs));
+        let rejected = match self.worker.as_ref() {
+            Some(worker) => worker.append(generation, jobs),
+            None => jobs,
+        };
         for job in rejected {
             self.release_loading_job(job);
         }
@@ -549,16 +539,14 @@ impl TileCache {
     }
 
     fn write_mapping(&self, queue: &wgpu::Queue) {
-        queue.write_buffer(
-            &self.mapping_buffer,
-            0,
-            self.mapping
-                .iter()
-                .flat_map(|slot| slot.to_ne_bytes())
-                .collect::<Vec<_>>()
-                .as_slice(),
-        );
+        queue.write_buffer(&self.mapping_buffer, 0, bytemuck::cast_slice(&self.mapping));
     }
+}
+
+// The slot table is allocated from a u32 capacity, so slot counts and indices
+// always fit.
+fn slot_u32(slot: usize) -> u32 {
+    u32::try_from(slot).expect("tile-cache slots are bounded by a u32 capacity")
 }
 
 pub(super) fn maximum_capacity(
@@ -588,7 +576,7 @@ pub(super) fn maximum_capacity(
 
 /// Holds a 1:1 viewport at the worst tile alignment, plus one
 /// prefetch tile on every side.
-pub(super) fn interactive_working_set_tiles((viewport_width, viewport_height): (u32, u32)) -> u32 {
+fn interactive_working_set_tiles((viewport_width, viewport_height): (u32, u32)) -> u32 {
     if viewport_width == 0 || viewport_height == 0 {
         return 0;
     }
@@ -610,7 +598,7 @@ pub(super) fn working_set_capacity(
     )
 }
 
-pub(super) fn same_tile_set(left: &[u32], right: &[u32]) -> bool {
+fn same_tile_set(left: &[u32], right: &[u32]) -> bool {
     left.len() == right.len() && left.iter().all(|tile| right.contains(tile))
 }
 
@@ -623,8 +611,14 @@ struct TileWindow {
 }
 
 impl TileWindow {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Bounds are clamped to the non-empty u32 tile grid immediately after conversion.
-    fn visible((left, top, right, bottom): (f64, f64, f64, f64), columns: u32, rows: u32) -> Self {
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Bounds are clamped to the non-empty u32 tile grid immediately after conversion.
+    fn visible(bounds: ImageBounds, columns: u32, rows: u32) -> Self {
+        let ImageBounds {
+            left,
+            top,
+            right,
+            bottom,
+        } = bounds;
         let tile_size = f64::from(TILE_SIZE);
         Self {
             first_x: ((left / tile_size).floor() as u32).min(columns - 1),
@@ -676,16 +670,19 @@ fn tile_priority(x: u32, y: u32, visible: TileWindow, direction: (f64, f64)) -> 
     }
 }
 
-pub(super) fn prioritized_tiles(
-    (left, top, right, bottom): (f64, f64, f64, f64),
+fn prioritized_tiles(
+    bounds: ImageBounds,
     columns: u32,
     rows: u32,
     previous_center: Option<(f64, f64)>,
     capacity: usize,
 ) -> (Vec<u32>, (f64, f64)) {
     let tile_size = f64::from(TILE_SIZE);
-    let visible = TileWindow::visible((left, top, right, bottom), columns, rows);
-    let center = ((left + right) * 0.5, (top + bottom) * 0.5);
+    let visible = TileWindow::visible(bounds, columns, rows);
+    let center = (
+        (bounds.left + bounds.right) * 0.5,
+        (bounds.top + bounds.bottom) * 0.5,
+    );
     let direction = previous_center.map_or((0.0, 0.0), |previous| {
         (center.0 - previous.0, center.1 - previous.1)
     });
@@ -717,7 +714,7 @@ pub(super) fn tile_texture_extent() -> u32 {
     TILE_SIZE + TILE_GUTTER * 2
 }
 
-pub(super) fn create_tile_array_texture(device: &wgpu::Device, layers: u32) -> wgpu::Texture {
+fn create_tile_array_texture(device: &wgpu::Device, layers: u32) -> wgpu::Texture {
     let extent = tile_texture_extent();
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("canonical high-resolution tile cache"),
@@ -750,19 +747,15 @@ fn initialize_tile_array_texture(
     queue.submit([encoder.finish()]);
 }
 
-pub(super) fn create_tile_mapping_buffer(device: &wgpu::Device, mapping: &[u32]) -> wgpu::Buffer {
+fn create_tile_mapping_buffer(device: &wgpu::Device, mapping: &[u32]) -> wgpu::Buffer {
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("logical-to-resident tile mapping"),
-        contents: mapping
-            .iter()
-            .flat_map(|slot| slot.to_ne_bytes())
-            .collect::<Vec<_>>()
-            .as_slice(),
+        contents: bytemuck::cast_slice(mapping),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     })
 }
 
-pub(super) fn upload_tile_layer(
+fn upload_tile_layer(
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
     layer: u32,
@@ -774,21 +767,93 @@ pub(super) fn upload_tile_layer(
     let mut staging = upload_layout.allocate_staging();
     for stripe in upload_layout.stripes() {
         upload_layout.copy_stripe(pixels, stripe, &mut staging);
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: stripe.first_row(),
-                    z: layer,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            upload_layout.stripe_data(&staging, stripe),
-            upload_layout.copy_buffer_layout(stripe),
-            upload_layout.copy_extent(stripe),
-        );
+        upload_layout.write_stripe(queue, texture, layer, &staging, stripe);
     }
     Ok(())
 }
+
+#[cfg(test)]
+impl TileCache {
+    /// Builds a fully resident single-row cache from canonical pixels for
+    /// offscreen rendering tests.
+    pub(super) fn from_canonical_pixels(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pixels: &[f32],
+        width: u32,
+        height: u32,
+    ) -> Self {
+        use super::mip::{encode_premultiplied_rgba16f_row, generate_linear_mips_for_layers};
+
+        assert!(height <= TILE_SIZE);
+        assert_eq!(pixels.len(), usize::try_from(width * height * 4).unwrap());
+
+        let extent = usize::try_from(tile_texture_extent()).unwrap();
+        let width = usize::try_from(width).unwrap();
+        let height = usize::try_from(height).unwrap();
+        let gutter = usize::try_from(TILE_GUTTER).unwrap();
+        let tile_size = usize::try_from(TILE_SIZE).unwrap();
+        let columns = width.div_ceil(tile_size);
+        let mut source_row = vec![0.0_f32; extent * 4];
+        let mut encoded_pixels = vec![0_u8; extent * extent * 8];
+        let mapping = (0..u32::try_from(columns).unwrap()).collect::<Vec<_>>();
+        let cache = Self {
+            texture: create_tile_array_texture(device, u32::try_from(columns).unwrap()),
+            mapping_buffer: create_tile_mapping_buffer(device, &mapping),
+            mapping: mapping.clone(),
+            slot_tiles: (0..u32::try_from(columns).unwrap()).map(Some).collect(),
+            last_used: vec![0; columns],
+            epoch: 0,
+            hits: 0,
+            misses: 0,
+            tile_columns: u32::try_from(columns).unwrap(),
+            tile_rows: 1,
+            coarse_downsample: 1,
+            desired_tiles: Vec::new(),
+            request_generation: 0,
+            last_view_center: None,
+            worker: None,
+        };
+        for column in 0..columns {
+            let origin_x = column * tile_size;
+            for tile_y in 0..extent {
+                let source_y = tile_y.saturating_sub(gutter).min(height - 1);
+                for tile_x in 0..extent {
+                    let source_x = origin_x
+                        .saturating_add(tile_x)
+                        .saturating_sub(gutter)
+                        .min(width - 1);
+                    let source_offset = (source_y * width + source_x) * 4;
+                    source_row[tile_x * 4..tile_x * 4 + 4]
+                        .copy_from_slice(&pixels[source_offset..source_offset + 4]);
+                }
+                encode_premultiplied_rgba16f_row(
+                    &source_row,
+                    &mut encoded_pixels[tile_y * extent * 8..(tile_y + 1) * extent * 8],
+                );
+            }
+            upload_tile_layer(
+                queue,
+                &cache.texture,
+                u32::try_from(column).unwrap(),
+                &encoded_pixels,
+            )
+            .unwrap();
+        }
+        let mut mip_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("offscreen tiled fixture mip encoder"),
+        });
+        generate_linear_mips_for_layers(
+            device,
+            &mut mip_encoder,
+            &cache.texture,
+            mip_level_count(tile_texture_extent(), tile_texture_extent()),
+            &mapping,
+        );
+        queue.submit([mip_encoder.finish()]);
+        cache
+    }
+}
+
+#[cfg(test)]
+mod tests;

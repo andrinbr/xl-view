@@ -1,6 +1,6 @@
 use super::*;
-use crate::test_utils::{fixture_path, request_native_test_gpu};
-use std::time::Instant;
+use crate::gpu::test_utils::request_native_test_gpu;
+use crate::test_utils::fixture_path;
 use wgpu::{SurfaceColorSpace, TextureFormat};
 use xl_view::color::{
     HDR_REFERENCE_WHITE_NITS, OutputEncoding, OutputPeak, OutputTransform, SourceIntensityTarget,
@@ -231,9 +231,18 @@ fn diagnostics_pattern_requires_the_explicit_startup_option() {
         )
     };
 
-    assert_eq!(parameters(None, false, true).content_mode, 0);
-    assert_eq!(parameters(None, true, false).content_mode, 1);
-    assert_eq!(parameters(Some((800, 600)), true, false).content_mode, 2);
+    assert_eq!(
+        parameters(None, false, true).content_mode,
+        ContentMode::EmptyState
+    );
+    assert_eq!(
+        parameters(None, true, false).content_mode,
+        ContentMode::DiagnosticsPattern
+    );
+    assert_eq!(
+        parameters(Some((800, 600)), true, false).content_mode,
+        ContentMode::DecodedImage
+    );
     assert!(parameters(None, false, true).center_ui);
 }
 
@@ -251,39 +260,24 @@ fn unloaded_source_peak_matches_the_visible_content() {
 
 #[test]
 fn background_modes_have_stable_shader_values_and_cycle() {
+    let shader = include_str!("../shaders/presentation.wgsl");
     let modes = [
-        (BackgroundMode::Black, 0),
-        (BackgroundMode::MiddleGray, 3),
-        (BackgroundMode::White, 2),
-        (BackgroundMode::Checkerboard, 1),
+        (BackgroundMode::Black, "BACKGROUND_BLACK"),
+        (BackgroundMode::MiddleGray, "BACKGROUND_MIDDLE_GRAY"),
+        (BackgroundMode::White, "BACKGROUND_WHITE"),
+        (BackgroundMode::Checkerboard, "BACKGROUND_CHECKERBOARD"),
     ];
-    for (index, &(mode, shader_value)) in modes.iter().enumerate() {
-        assert_eq!(background_shader_mode(mode), shader_value);
+    for (index, &(mode, shader_name)) in modes.iter().enumerate() {
+        let expected = format!(
+            "const {shader_name}: u32 = {}u;",
+            background_shader_mode(mode)
+        );
+        assert!(
+            shader.contains(&expected),
+            "shader must contain `{expected}`"
+        );
         assert_eq!(next_background(mode), modes[(index + 1) % modes.len()].0);
     }
-}
-
-#[test]
-fn gpu_shaders_parse_and_validate() {
-    for source in [
-        presentation_shader_source(),
-        include_str!("../shaders/mipmap.wgsl").to_owned(),
-    ] {
-        let module = naga::front::wgsl::parse_str(&source)
-            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
-        )
-        .validate(&module)
-        .unwrap();
-    }
-}
-
-#[test]
-fn parameter_buffer_has_uniform_and_copy_destination_usage() {
-    assert!(PARAM_BUFFER_USAGE.contains(wgpu::BufferUsages::UNIFORM));
-    assert!(PARAM_BUFFER_USAGE.contains(wgpu::BufferUsages::COPY_DST));
 }
 
 #[test]
@@ -335,200 +329,6 @@ fn resampling_reserves_gpu_memory_before_tiles() {
 }
 
 #[test]
-fn tile_working_set_covers_a_one_to_one_viewport_with_a_border() {
-    assert_eq!(interactive_working_set_tiles((3840, 1600)), 77);
-    assert_eq!(interactive_working_set_tiles((1024, 682)), 25);
-    assert_eq!(interactive_working_set_tiles((0, 682)), 0);
-
-    assert_eq!(
-        working_set_capacity(247, (3840, 1600), u64::MAX, u32::MAX),
-        77
-    );
-    assert_eq!(
-        working_set_capacity(12, (3840, 1600), u64::MAX, u32::MAX),
-        12
-    );
-}
-
-#[test]
-fn visible_tiles_stay_center_first_and_directional_prefetch_stays_bounded() {
-    let tile_size = f64::from(TILE_SIZE);
-    let bounds = (2.1 * tile_size, 0.0, 2.9 * tile_size, tile_size - 1.0);
-    let (stationary, center) = prioritized_tiles(bounds, 6, 1, None, 6);
-    assert_eq!(stationary, [2, 1, 3]);
-    assert!(same_tile_set(&stationary, &[3, 2, 1]));
-
-    let previous_center = Some((center.0 - tile_size, center.1));
-    let (moving_right, _) = prioritized_tiles(bounds, 6, 1, previous_center, 6);
-    assert_eq!(moving_right, [2, 3, 4, 1]);
-
-    let (budgeted, _) = prioritized_tiles(bounds, 6, 1, previous_center, 2);
-    assert_eq!(budgeted, [2, 3]);
-}
-
-#[test]
-fn newer_tile_generation_discards_queued_stale_work() {
-    let old_jobs = [
-        TileJob {
-            generation: 7,
-            logical_tile: 4,
-            slot: 0,
-        },
-        TileJob {
-            generation: 7,
-            logical_tile: 5,
-            slot: 1,
-        },
-    ];
-    let mut state = TileWorkerState {
-        generation: 7,
-        pending: old_jobs.into(),
-        shutdown: false,
-    };
-
-    assert_eq!(replace_pending_jobs(&mut state, 8), old_jobs);
-    assert_eq!(state.generation, 8);
-    assert!(state.pending.is_empty());
-}
-
-#[test]
-fn upload_repack_premultiplies_linear_rgb() {
-    let mut encoded = [0_u8; 8];
-    encode_premultiplied_rgba16f_row(&[1.0, 0.5, 0.25, 0.5], &mut encoded);
-    let decoded: [f32; 4] = std::array::from_fn(|channel| {
-        let start = channel * 2;
-        half::f16::from_bits(u16::from_le_bytes(
-            encoded[start..start + 2].try_into().unwrap(),
-        ))
-        .to_f32()
-    });
-    for (actual, expected) in decoded.into_iter().zip([0.5, 0.25, 0.125, 0.5]) {
-        assert!((actual - expected).abs() < f32::EPSILON);
-    }
-}
-
-#[test]
-#[ignore = "requires a native GPU adapter for tile upload and mip generation"]
-fn tiled_cache_uploads_one_tile_and_hits_on_repeated_view() {
-    let (device, queue) = request_native_test_gpu(
-        crate::gpu::native_backends(),
-        wgpu::Features::CLEAR_TEXTURE,
-        "tile-cache test requires a native GPU adapter",
-    );
-
-    let fixture = fixture_path("alpha.jxl");
-    let image = decode_file(&fixture, DecodeLimits::from_memory_ceiling_mib(4)).unwrap();
-    let store = Arc::clone(&image.store);
-    let mut cache = TileCache::active(
-        &device,
-        &queue,
-        store,
-        64 * 1024 * 1024,
-        (image.width, image.height),
-        Arc::new(|| {}),
-        Arc::new(Mutex::new(())),
-    )
-    .unwrap();
-    let initialized =
-        read_rgba16f_texture_pixel(&device, &queue, &cache.texture, 3, wgpu::Origin3d::ZERO);
-    assert!(initialized.iter().all(|channel| channel.to_bits() == 0));
-    let mut view = ViewTransform::fit(
-        PhysicalSize::new(image.width, image.height),
-        PhysicalSize::new(image.width, image.height),
-    );
-    view.zoom_at(
-        winit::dpi::PhysicalPosition::new(
-            f64::from(image.width) / 2.0,
-            f64::from(image.height) / 2.0,
-        ),
-        2.0,
-    );
-    cache.request_view(&queue, view);
-    let deadline = Instant::now() + std::time::Duration::from_secs(5);
-    while cache.mapping[0] == MISSING_TILE_SLOT {
-        cache.process_completions(&queue).unwrap();
-        assert!(
-            Instant::now() < deadline,
-            "asynchronous tile upload did not complete"
-        );
-        std::thread::yield_now();
-    }
-    assert_eq!(cache.mapping, [0]);
-    assert_eq!(cache.misses, 1);
-    cache.request_view(&queue, view);
-    assert_eq!(cache.hits, 1);
-
-    let pixel = read_rgba16f_texture_pixel(
-        &device,
-        &queue,
-        &cache.texture,
-        0,
-        wgpu::Origin3d {
-            x: TILE_GUTTER,
-            y: TILE_GUTTER,
-            z: 0,
-        },
-    );
-    assert!((pixel[3] - 1.0).abs() < f32::EPSILON);
-}
-
-fn read_rgba16f_texture_pixel(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    mip_level: u32,
-    origin: wgpu::Origin3d,
-) -> [f32; 4] {
-    const BYTES_PER_ROW: u32 = 256;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("tile-cache test readback"),
-        size: u64::from(BYTES_PER_ROW),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture,
-            mip_level,
-            origin,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(BYTES_PER_ROW),
-                rows_per_image: Some(1),
-            },
-        },
-        wgpu::Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-    );
-    queue.submit([encoder.finish()]);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    readback.map_async(wgpu::MapMode::Read, .., move |result| {
-        sender.send(result).unwrap();
-    });
-    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    receiver.recv().unwrap().unwrap();
-    let mapped = readback.get_mapped_range(..).unwrap();
-    let pixel = std::array::from_fn(|channel| {
-        let offset = channel * 2;
-        half::f16::from_bits(u16::from_le_bytes(
-            mapped[offset..offset + 2].try_into().unwrap(),
-        ))
-        .to_f32()
-    });
-    drop(mapped);
-    readback.unmap();
-    pixel
-}
-
-#[test]
 #[ignore = "requires a native GPU adapter for offscreen tile-boundary execution"]
 fn tiled_shader_matches_continuous_sampling_across_boundaries() {
     const IMAGE_WIDTH: u32 = TILE_SIZE * 2;
@@ -551,7 +351,7 @@ fn tiled_shader_matches_continuous_sampling_across_boundaries() {
         }
     }
     let cache =
-        tile_cache_from_canonical_pixels(&device, &queue, &fixture, IMAGE_WIDTH, IMAGE_HEIGHT);
+        TileCache::from_canonical_pixels(&device, &queue, &fixture, IMAGE_WIDTH, IMAGE_HEIGHT);
 
     for scale in [0.5, 0.75, 1.0, 1.5, 2.0] {
         let mut view = ViewTransform::fit(
@@ -569,7 +369,7 @@ fn tiled_shader_matches_continuous_sampling_across_boundaries() {
             HDR_REFERENCE_WHITE_NITS,
             BackgroundMode::Black,
             0.0,
-            SourceDynamicRange::Sdr,
+            HDR_REFERENCE_WHITE_NITS,
             Some(&fixture),
             None,
             None,
@@ -585,7 +385,7 @@ fn tiled_shader_matches_continuous_sampling_across_boundaries() {
             HDR_REFERENCE_WHITE_NITS,
             BackgroundMode::Black,
             0.0,
-            SourceDynamicRange::Sdr,
+            HDR_REFERENCE_WHITE_NITS,
             None,
             None,
             Some(&cache),
@@ -601,70 +401,6 @@ fn tiled_shader_matches_continuous_sampling_across_boundaries() {
                 );
             }
         }
-    }
-}
-
-#[test]
-#[ignore = "requires a native GPU adapter for mip readback"]
-fn linear_mip_generation_preserves_light_and_premultiplied_alpha() {
-    let (device, queue) = request_native_test_gpu(
-        crate::gpu::native_backends(),
-        wgpu::Features::empty(),
-        "mip readback test requires a native GPU adapter",
-    );
-
-    // Transparent white must contribute no RGB after premultiplication. The
-    // 50% linear red result also distinguishes linear averaging from an
-    // encoded-sRGB average decoded back to roughly 21.4% linear light.
-    let pixels = [
-        1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0,
-    ];
-    let texture = create_coarse_texture(&device, &queue, &pixels, 2, 2).unwrap();
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("linear mip readback"),
-        size: 256,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.copy_texture_to_buffer(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 1,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::TexelCopyBufferInfo {
-            buffer: &readback,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(256),
-                rows_per_image: Some(1),
-            },
-        },
-        wgpu::Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-    );
-    queue.submit([encoder.finish()]);
-    let (sender, receiver) = mpsc::channel();
-    readback.map_async(wgpu::MapMode::Read, .., move |result| {
-        sender.send(result).unwrap();
-    });
-    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    receiver.recv().unwrap().unwrap();
-    let mapped = readback.get_mapped_range(..).unwrap();
-    let decoded: [f32; 4] = std::array::from_fn(|channel| {
-        let start = channel * 2;
-        half::f16::from_bits(u16::from_le_bytes(
-            mapped[start..start + 2].try_into().unwrap(),
-        ))
-        .to_f32()
-    });
-    for (actual, expected) in decoded.into_iter().zip([0.5, 0.0, 0.0, 0.5]) {
-        assert!((actual - expected).abs() < f32::EPSILON);
     }
 }
 
@@ -691,7 +427,7 @@ struct OffscreenRenderRequest<'a> {
     format: TextureFormat,
     peak_nits: f32,
     background: BackgroundMode,
-    source_dynamic_range: SourceDynamicRange,
+    source_peak_nits: f32,
     canonical_pixels: Option<&'a [f32]>,
     ui_pixel: Option<[f32; 4]>,
     tiled_resources: Option<&'a TileCache>,
@@ -708,9 +444,10 @@ struct OffscreenOutputCase {
 
 impl OffscreenTestGpu {
     fn new() -> Self {
+        // Production image state clears tile textures, as the real device allows.
         let (device, queue) = request_native_test_gpu(
             crate::gpu::native_backends(),
-            wgpu::Features::empty(),
+            wgpu::Features::CLEAR_TEXTURE,
             "offscreen color test requires a native GPU adapter",
         );
         Self { device, queue }
@@ -734,7 +471,7 @@ impl OffscreenTestGpu {
             request.peak_nits,
             request.background,
             exposure_stops,
-            request.source_dynamic_range,
+            request.source_peak_nits,
             request.canonical_pixels,
             request.ui_pixel,
             request.tiled_resources,
@@ -765,6 +502,8 @@ fn offscreen_shader_pixels_match_cpu_reference() {
     assert_ui_composition_matches_reference(&gpu, &luminance_fixture);
     assert_sdr_white_matches_reference(&gpu);
     assert_sdr_chromatic_fallback_matches_reference(&gpu);
+    assert_negative_pixels_match_reference(&gpu);
+    assert_measured_linear_peak_reaches_presentation(&gpu);
 }
 
 fn canonical_luminance_fixture() -> Vec<f32> {
@@ -799,7 +538,7 @@ fn tiled_color_fixture() -> Vec<f32> {
 
 fn assert_tiled_sampling_matches_canonical(gpu: &OffscreenTestGpu) {
     let fixture = tiled_color_fixture();
-    let tiled_cache = tile_cache_from_canonical_pixels(
+    let tiled_cache = TileCache::from_canonical_pixels(
         &gpu.device,
         &gpu.queue,
         &fixture,
@@ -811,7 +550,7 @@ fn assert_tiled_sampling_matches_canonical(gpu: &OffscreenTestGpu) {
         format: TextureFormat::Rgba8UnormSrgb,
         peak_nits: HDR_REFERENCE_WHITE_NITS,
         background: BackgroundMode::Checkerboard,
-        source_dynamic_range: SourceDynamicRange::Sdr,
+        source_peak_nits: HDR_REFERENCE_WHITE_NITS,
         canonical_pixels: Some(&fixture),
         ui_pixel: None,
         tiled_resources: None,
@@ -821,7 +560,7 @@ fn assert_tiled_sampling_matches_canonical(gpu: &OffscreenTestGpu) {
         format: TextureFormat::Rgba8UnormSrgb,
         peak_nits: HDR_REFERENCE_WHITE_NITS,
         background: BackgroundMode::Checkerboard,
-        source_dynamic_range: SourceDynamicRange::Sdr,
+        source_peak_nits: HDR_REFERENCE_WHITE_NITS,
         canonical_pixels: None,
         ui_pixel: None,
         tiled_resources: Some(&tiled_cache),
@@ -861,12 +600,12 @@ fn assert_output_transforms_match_reference(gpu: &OffscreenTestGpu, fixture: &[f
             format: case.format,
             peak_nits: case.peak_nits,
             background: BackgroundMode::Black,
-            source_dynamic_range: SourceDynamicRange::Hlg,
+            source_peak_nits: HLG_PATTERN_SOURCE_PEAK_NITS,
             canonical_pixels: Some(fixture),
             ui_pixel: None,
             tiled_resources: None,
         });
-        let reference = output_reference(case, SourceDynamicRange::Hlg, 1_000.0);
+        let reference = output_reference(case, 1_000.0);
         for (index, nits) in PATCH_NITS.map(f64::from).into_iter().enumerate() {
             let working = nits / f64::from(HDR_REFERENCE_WHITE_NITS);
             assert_rgba_close(
@@ -897,17 +636,15 @@ fn assert_exposure_matches_reference(gpu: &OffscreenTestGpu, fixture: &[f32]) {
         },
     ];
     for case in cases {
-        for (source_dynamic_range, source_peak_nits, exposure_stops) in [
-            (SourceDynamicRange::Hlg, 1_000.0, -1.0),
-            (SourceDynamicRange::Sdr, HDR_REFERENCE_WHITE_NITS, 1.0),
-        ] {
+        for (source_peak_nits, exposure_stops) in [(1_000.0, -1.0), (HDR_REFERENCE_WHITE_NITS, 1.0)]
+        {
             let actual = gpu.render_with_exposure(
                 OffscreenRenderRequest {
                     color_space: case.color_space,
                     format: case.format,
                     peak_nits: case.peak_nits,
                     background: BackgroundMode::Black,
-                    source_dynamic_range,
+                    source_peak_nits,
                     canonical_pixels: Some(fixture),
                     ui_pixel: None,
                     tiled_resources: None,
@@ -916,13 +653,13 @@ fn assert_exposure_matches_reference(gpu: &OffscreenTestGpu, fixture: &[f32]) {
             );
             let reference = OutputTransform {
                 exposure_stops: f64::from(exposure_stops),
-                ..output_reference(case, source_dynamic_range, source_peak_nits)
+                ..output_reference(case, source_peak_nits)
             };
             for (index, nits) in PATCH_NITS.map(f64::from).into_iter().enumerate() {
                 let working = nits / f64::from(HDR_REFERENCE_WHITE_NITS);
                 assert_rgba_close(
                     &format!(
-                        "{:?} {source_dynamic_range:?} exposure {exposure_stops:+.1}, patch {nits}",
+                        "{:?} source peak {source_peak_nits} exposure {exposure_stops:+.1}, patch {nits}",
                         case.color_space
                     ),
                     &actual[index],
@@ -977,12 +714,12 @@ fn assert_hdr_color_mapping_matches_reference(gpu: &OffscreenTestGpu) {
             format: case.format,
             peak_nits: case.peak_nits,
             background: BackgroundMode::Black,
-            source_dynamic_range: SourceDynamicRange::Hlg,
+            source_peak_nits: HLG_PATTERN_SOURCE_PEAK_NITS,
             canonical_pixels: Some(&fixture),
             ui_pixel: None,
             tiled_resources: None,
         });
-        let reference = output_reference(case, SourceDynamicRange::Hlg, 1_000.0);
+        let reference = output_reference(case, 1_000.0);
         for (index, rgb) in colors_nits.into_iter().enumerate() {
             let working = rgb.map(|channel| f64::from(channel / HDR_REFERENCE_WHITE_NITS));
             assert_rgba_close(
@@ -1009,7 +746,7 @@ fn assert_alpha_compositing_matches_reference(gpu: &OffscreenTestGpu) {
         format: TextureFormat::Rgba8UnormSrgb,
         peak_nits: HDR_REFERENCE_WHITE_NITS,
         background: BackgroundMode::Checkerboard,
-        source_dynamic_range: SourceDynamicRange::Hlg,
+        source_peak_nits: HLG_PATTERN_SOURCE_PEAK_NITS,
         canonical_pixels: Some(&fixture),
         ui_pixel: None,
         tiled_resources: None,
@@ -1022,7 +759,6 @@ fn assert_alpha_compositing_matches_reference(gpu: &OffscreenTestGpu) {
             peak_nits: HDR_REFERENCE_WHITE_NITS,
             tolerance: 2.0 / 255.0,
         },
-        SourceDynamicRange::Hlg,
         1_000.0,
     );
     for (x, alpha) in [0.0, 0.5, 1.0].into_iter().enumerate() {
@@ -1048,7 +784,7 @@ fn assert_transparent_pixels_use_background(gpu: &OffscreenTestGpu) {
         peak_nits: HDR_REFERENCE_WHITE_NITS,
         tolerance: 2.0 / 255.0,
     };
-    let reference = output_reference(case, SourceDynamicRange::Hlg, 1_000.0);
+    let reference = output_reference(case, 1_000.0);
     for (background, level) in [
         (BackgroundMode::Black, 0.0),
         (BackgroundMode::Checkerboard, 0.18),
@@ -1060,7 +796,7 @@ fn assert_transparent_pixels_use_background(gpu: &OffscreenTestGpu) {
             format: case.format,
             peak_nits: case.peak_nits,
             background,
-            source_dynamic_range: SourceDynamicRange::Hlg,
+            source_peak_nits: HLG_PATTERN_SOURCE_PEAK_NITS,
             canonical_pixels: Some(&fixture),
             ui_pixel: None,
             tiled_resources: None,
@@ -1098,13 +834,12 @@ fn assert_ui_composition_matches_reference(gpu: &OffscreenTestGpu, fixture: &[f3
             format: case.format,
             peak_nits: case.peak_nits,
             background: BackgroundMode::Black,
-            source_dynamic_range: SourceDynamicRange::Hlg,
+            source_peak_nits: HLG_PATTERN_SOURCE_PEAK_NITS,
             canonical_pixels: Some(fixture),
             ui_pixel: Some([1.0; 4]),
             tiled_resources: None,
         });
-        let expected = output_reference(case, SourceDynamicRange::Sdr, HDR_REFERENCE_WHITE_NITS)
-            .transform([1.0; 4]);
+        let expected = output_reference(case, HDR_REFERENCE_WHITE_NITS).transform([1.0; 4]);
         assert_rgba_close(
             &format!("{:?} UI pixel", case.color_space),
             &actual[0],
@@ -1139,12 +874,12 @@ fn assert_sdr_white_matches_reference(gpu: &OffscreenTestGpu) {
             format: case.format,
             peak_nits: case.peak_nits,
             background: BackgroundMode::Black,
-            source_dynamic_range: SourceDynamicRange::Sdr,
+            source_peak_nits: HDR_REFERENCE_WHITE_NITS,
             canonical_pixels: Some(&fixture),
             ui_pixel: None,
             tiled_resources: None,
         });
-        let reference = output_reference(case, SourceDynamicRange::Sdr, HDR_REFERENCE_WHITE_NITS);
+        let reference = output_reference(case, HDR_REFERENCE_WHITE_NITS);
         assert_rgba_close(
             &format!("{:?} SDR white", case.color_space),
             &actual[0],
@@ -1178,12 +913,12 @@ fn assert_sdr_chromatic_fallback_matches_reference(gpu: &OffscreenTestGpu) {
         format: case.format,
         peak_nits: case.peak_nits,
         background: BackgroundMode::Black,
-        source_dynamic_range: SourceDynamicRange::Sdr,
+        source_peak_nits: HDR_REFERENCE_WHITE_NITS,
         canonical_pixels: Some(&fixture),
         ui_pixel: None,
         tiled_resources: None,
     });
-    let reference = output_reference(case, SourceDynamicRange::Sdr, HDR_REFERENCE_WHITE_NITS);
+    let reference = output_reference(case, HDR_REFERENCE_WHITE_NITS);
     assert_rgba_close(
         "SDR chromatic fallback",
         &actual[0],
@@ -1192,11 +927,138 @@ fn assert_sdr_chromatic_fallback_matches_reference(gpu: &OffscreenTestGpu) {
     );
 }
 
-fn output_reference(
-    case: OffscreenOutputCase,
-    _source_dynamic_range: SourceDynamicRange,
-    source_peak_nits: f32,
-) -> OutputTransform {
+fn assert_negative_pixels_match_reference(gpu: &OffscreenTestGpu) {
+    let patches = [
+        [-0.25, 0.5, 0.5, 0.5],
+        [-0.25, 0.5, 0.5, 1.0],
+        [0.5, -0.25, 0.5, 1.0],
+        [0.5, 0.5, -0.25, 1.0],
+        [0.25, 0.5, 0.5, 1.0],
+        [-0.25, 0.5, 0.5, 0.0],
+        [1.0, 1.0, 1.0, 1.0],
+    ];
+    let fixture: Vec<f32> = patches.iter().flatten().copied().cycle().take(56).collect();
+    for (color_space, format, encoding, tolerance) in [
+        (
+            SurfaceColorSpace::Srgb,
+            TextureFormat::Rgba8UnormSrgb,
+            OutputEncoding::SdrSrgbHardware,
+            2.0 / 255.0,
+        ),
+        (
+            SurfaceColorSpace::Bt2100Pq,
+            TextureFormat::Rgb10a2Unorm,
+            OutputEncoding::Pq,
+            2.0 / 1023.0,
+        ),
+    ] {
+        let case = OffscreenOutputCase {
+            color_space,
+            format,
+            encoding,
+            peak_nits: HDR_REFERENCE_WHITE_NITS,
+            tolerance,
+        };
+        let actual = gpu.render(OffscreenRenderRequest {
+            color_space,
+            format,
+            peak_nits: HDR_REFERENCE_WHITE_NITS,
+            background: BackgroundMode::White,
+            source_peak_nits: HDR_REFERENCE_WHITE_NITS,
+            canonical_pixels: Some(&fixture),
+            ui_pixel: None,
+            tiled_resources: None,
+        });
+        let reference = output_reference(case, HDR_REFERENCE_WHITE_NITS);
+        for (index, patch) in patches.into_iter().enumerate() {
+            let composite = composite_linear(patch.map(f64::from), [1.0; 3]);
+            assert_rgba_close(
+                "negative image RGB",
+                &actual[index],
+                reference.transform([composite[0], composite[1], composite[2], 1.0]),
+                tolerance,
+            );
+        }
+    }
+}
+
+fn assert_measured_linear_peak_reaches_presentation(gpu: &OffscreenTestGpu) {
+    const MEASURED_PEAK_NITS: f32 = 812.0;
+    let image = decode_file(
+        &fixture_path("linear-highlights.jxl"),
+        DecodeLimits::from_memory_ceiling_mib(4),
+    )
+    .unwrap();
+    let viewport = (OFFSCREEN_WIDTH, OFFSCREEN_HEIGHT);
+    assert_eq!((image.width, image.height), viewport);
+    let workers = WorkerContext {
+        device: gpu.device.clone(),
+        queue: gpu.queue.clone(),
+        work_ready: Arc::new(|| {}),
+        submission_lock: Arc::new(Mutex::new(())),
+    };
+    let (state, _) = create_image_state(
+        &workers,
+        viewport,
+        64 * 1024 * 1024,
+        &image,
+        ViewTransform::fit(
+            PhysicalSize::new(image.width, image.height),
+            PhysicalSize::new(viewport.0, viewport.1),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        state.source_peak_nits.to_bits(),
+        MEASURED_PEAK_NITS.to_bits(),
+        "image state peak {} nits",
+        state.source_peak_nits
+    );
+
+    let case = OffscreenOutputCase {
+        color_space: SurfaceColorSpace::Srgb,
+        format: TextureFormat::Rgba8UnormSrgb,
+        encoding: OutputEncoding::SdrSrgbHardware,
+        peak_nits: HDR_REFERENCE_WHITE_NITS,
+        tolerance: 2.0 / 255.0,
+    };
+    let patches: Vec<[f64; 4]> = image
+        .store
+        .coarse_pixels()
+        .chunks_exact(4)
+        .map(|pixel| std::array::from_fn(|c| f64::from(pixel[c])))
+        .collect();
+    let reference = output_reference(case, MEASURED_PEAK_NITS);
+    // The 255-nit metadata, 1,000-nit fallback and SDR white each move some
+    // patch by more than twice the tolerance, so routing one would fail.
+    for wrong_peak in [255.0, 1_000.0, HDR_REFERENCE_WHITE_NITS] {
+        let wrong = output_reference(case, wrong_peak);
+        assert!(patches.iter().any(|&patch| {
+            let (expected, other) = (reference.transform(patch), wrong.transform(patch));
+            (0..3).any(|c| (expected[c] - other[c]).abs() > 2.0 * case.tolerance)
+        }));
+    }
+    let actual = gpu.render(OffscreenRenderRequest {
+        color_space: case.color_space,
+        format: case.format,
+        peak_nits: case.peak_nits,
+        background: BackgroundMode::Black,
+        source_peak_nits: state.source_peak_nits,
+        canonical_pixels: Some(image.store.coarse_pixels()),
+        ui_pixel: None,
+        tiled_resources: None,
+    });
+    for (pixel, patch) in actual.iter().zip(patches) {
+        assert_rgba_close(
+            "measured linear peak",
+            pixel,
+            reference.transform(patch),
+            case.tolerance,
+        );
+    }
+}
+
+fn output_reference(case: OffscreenOutputCase, source_peak_nits: f32) -> OutputTransform {
     OutputTransform {
         encoding: case.encoding,
         source_intensity_target: SourceIntensityTarget::new(f64::from(source_peak_nits)).unwrap(),
@@ -1214,7 +1076,7 @@ fn assert_rgba_close(context: &str, actual: &[f32; 4], expected: [f64; 4], toler
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // The offscreen harness keeps every shader binding and readback step visible to its callers.
+#[expect(clippy::too_many_arguments, clippy::too_many_lines)] // The offscreen harness keeps every shader binding and readback step visible to its callers.
 fn render_offscreen_scene(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1223,7 +1085,7 @@ fn render_offscreen_scene(
     peak_nits: f32,
     background: BackgroundMode,
     exposure_stops: f32,
-    source_dynamic_range: SourceDynamicRange,
+    source_peak_nits: f32,
     canonical_pixels: Option<&[f32]>,
     ui_pixel: Option<[f32; 4]>,
     tiled_resources: Option<&TileCache>,
@@ -1267,11 +1129,7 @@ fn render_offscreen_scene(
         test_surface_selection(candidate, peak_nits),
         rendering_options,
         has_image.then_some(image_dimensions),
-        if source_dynamic_range == SourceDynamicRange::Sdr {
-            HDR_REFERENCE_WHITE_NITS
-        } else {
-            HLG_PATTERN_SOURCE_PEAK_NITS
-        },
+        source_peak_nits,
         viewport_dimensions,
         view_transform,
         true,
@@ -1280,7 +1138,7 @@ fn render_offscreen_scene(
     let fallback_tile_cache;
     let selected_tile_cache = if let Some(tile_cache) = tiled_resources {
         params.tiled_image = true;
-        params.tile_columns = u32::try_from(tile_cache.mapping.len()).unwrap();
+        params.tile_columns = tile_cache.tile_columns();
         tile_cache
     } else {
         fallback_tile_cache = TileCache::fallback(device);
@@ -1290,11 +1148,13 @@ fn render_offscreen_scene(
         device,
         candidate.format,
         params,
-        &coarse_texture,
-        selected_tile_cache,
-        &coarse_texture,
-        &ui_texture,
-        &image_sampler,
+        &PresentationBindings {
+            coarse_texture: &coarse_texture,
+            tile_cache: selected_tile_cache,
+            resampled_texture: &coarse_texture,
+            ui_texture: &ui_texture,
+            image_sampler: &image_sampler,
+        },
     );
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("offscreen color reference target"),
@@ -1372,84 +1232,7 @@ fn render_offscreen_scene(
     pixels
 }
 
-#[allow(clippy::cast_possible_truncation)] // Fixture dimensions and packed half-float channels are deliberately small.
-fn tile_cache_from_canonical_pixels(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    pixels: &[f32],
-    width: u32,
-    height: u32,
-) -> TileCache {
-    assert!(height <= TILE_SIZE);
-    assert_eq!(pixels.len(), usize::try_from(width * height * 4).unwrap());
-
-    let extent = usize::try_from(tile_texture_extent()).unwrap();
-    let width = usize::try_from(width).unwrap();
-    let height = usize::try_from(height).unwrap();
-    let gutter = usize::try_from(TILE_GUTTER).unwrap();
-    let tile_size = usize::try_from(TILE_SIZE).unwrap();
-    let columns = width.div_ceil(tile_size);
-    let mut source_row = vec![0.0_f32; extent * 4];
-    let mut encoded_pixels = vec![0_u8; extent * extent * 8];
-    let mapping = (0..u32::try_from(columns).unwrap()).collect::<Vec<_>>();
-    let cache = TileCache {
-        texture: create_tile_array_texture(device, u32::try_from(columns).unwrap()),
-        mapping_buffer: create_tile_mapping_buffer(device, &mapping),
-        mapping: mapping.clone(),
-        slot_tiles: (0..u32::try_from(columns).unwrap()).map(Some).collect(),
-        last_used: vec![0; columns],
-        epoch: 0,
-        hits: 0,
-        misses: 0,
-        tile_columns: u32::try_from(columns).unwrap(),
-        tile_rows: 1,
-        coarse_downsample: 1,
-        desired_tiles: Vec::new(),
-        request_generation: 0,
-        last_view_center: None,
-        worker: None,
-    };
-    for column in 0..columns {
-        let origin_x = column * tile_size;
-        for tile_y in 0..extent {
-            let source_y = tile_y.saturating_sub(gutter).min(height - 1);
-            for tile_x in 0..extent {
-                let source_x = origin_x
-                    .saturating_add(tile_x)
-                    .saturating_sub(gutter)
-                    .min(width - 1);
-                let source_offset = (source_y * width + source_x) * 4;
-                source_row[tile_x * 4..tile_x * 4 + 4]
-                    .copy_from_slice(&pixels[source_offset..source_offset + 4]);
-            }
-            encode_premultiplied_rgba16f_row(
-                &source_row,
-                &mut encoded_pixels[tile_y * extent * 8..(tile_y + 1) * extent * 8],
-            );
-        }
-        upload_tile_layer(
-            queue,
-            &cache.texture,
-            u32::try_from(column).unwrap(),
-            &encoded_pixels,
-        )
-        .unwrap();
-    }
-    let mut mip_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("offscreen tiled fixture mip encoder"),
-    });
-    generate_linear_mips_for_layers(
-        device,
-        &mut mip_encoder,
-        &cache.texture,
-        mip_level_count(tile_texture_extent(), tile_texture_extent()),
-        &mapping,
-    );
-    queue.submit([mip_encoder.finish()]);
-    cache
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // Packed values are at most ten bits; decoded sRGB fits f32.
+#[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // Packed values are at most ten bits; decoded sRGB fits f32.
 fn decode_readback_row(bytes: &[u8], format: TextureFormat, width: u32) -> Vec<[f32; 4]> {
     let width = width as usize;
     match format {

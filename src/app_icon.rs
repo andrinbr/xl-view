@@ -16,7 +16,7 @@ pub(crate) fn window_icon() -> Icon {
     .into()
 }
 
-#[allow(clippy::cast_precision_loss)] // Production callers request practical window and UI icon sizes.
+#[expect(clippy::cast_precision_loss)] // Production callers request practical window and UI icon sizes.
 pub(crate) fn rasterize(size: u32) -> Vec<u8> {
     let tree = icon_tree();
     let mut pixmap =

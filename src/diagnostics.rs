@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};
 use std::panic;
@@ -118,7 +119,8 @@ fn source_chain(error: &(dyn Error + 'static)) -> Option<String> {
     let mut source = error.source();
     while let Some(error) = source {
         let message = error.to_string();
-        if message != previous {
+        // Most messages already include their direct source. List only new text.
+        if !previous.contains(&message) {
             causes.push(message.clone());
         }
         previous = message;
@@ -139,25 +141,27 @@ fn format_report(phase: &str, report: &str) -> String {
     format!("Diagnostics [{phase}]:\n{report}\n")
 }
 
+pub fn panic_payload_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
 pub fn install_panic_hook() {
     panic::set_hook(Box::new(|panic_info| {
         let location = panic_info
             .location()
             .map_or_else(|| "unknown location".to_owned(), ToString::to_string);
-        let message = if let Some(message) = panic_info.payload().downcast_ref::<&str>() {
-            *message
-        } else if let Some(message) = panic_info.payload().downcast_ref::<String>() {
-            message
-        } else {
-            "non-string panic payload"
-        };
+        let message = panic_payload_message(panic_info.payload());
 
         let report = format!(
             "xl-view stopped because of an internal error at {location}: {message}. \
              Set RUST_LOG=xl_view=debug and report the diagnostic log."
         );
         if tracing::enabled!(tracing::Level::ERROR) {
-            tracing::error!(category = "panic", %location, %message, "{report}");
+            tracing::error!(category = "panic", %location, panic_message = %message, "{report}");
         } else {
             eprintln!("{report}");
         }
@@ -168,6 +172,19 @@ pub fn install_panic_hook() {
 mod tests {
     use super::*;
     use crate::error::RuntimeError;
+
+    #[test]
+    fn panic_payloads_have_readable_messages() {
+        assert_eq!(
+            panic_payload_message(&"borrowed message"),
+            "borrowed message"
+        );
+        assert_eq!(
+            panic_payload_message(&"owned message".to_owned()),
+            "owned message"
+        );
+        assert_eq!(panic_payload_message(&42_u8), "non-string panic payload");
+    }
 
     #[test]
     fn default_filter_covers_the_application() {
@@ -184,15 +201,29 @@ mod tests {
     }
 
     #[test]
-    fn source_chains_skip_transparent_wrappers() {
-        let error = AppError::from(RuntimeError::GpuBackgroundWork(io::Error::other(
+    fn source_chains_list_only_causes_missing_from_the_message() {
+        #[derive(Debug)]
+        struct OpaqueContext(io::Error);
+
+        impl std::fmt::Display for OpaqueContext {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("cannot read the image")
+            }
+        }
+
+        impl Error for OpaqueContext {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let included = AppError::from(RuntimeError::GpuBackgroundWork(io::Error::other(
             "tile worker disconnected",
         )));
+        assert_eq!(source_chain(&included), None);
 
-        assert_eq!(
-            source_chain(&error).as_deref(),
-            Some("tile worker disconnected")
-        );
+        let opaque = OpaqueContext(io::Error::other("permission denied"));
+        assert_eq!(source_chain(&opaque).as_deref(), Some("permission denied"));
     }
 
     #[test]

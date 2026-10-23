@@ -58,7 +58,7 @@ define_class!(
 
     unsafe impl NSApplicationDelegate for AppDelegate {
         #[unsafe(method(application:openURLs:))]
-        #[allow(non_snake_case)]
+        #[expect(non_snake_case)]
         fn application_openURLs(&self, _application: &NSApplication, urls: &NSArray<NSURL>) {
             let paths = urls
                 .to_vec()
@@ -70,7 +70,7 @@ define_class!(
         }
 
         #[unsafe(method(applicationSupportsSecureRestorableState:))]
-        #[allow(non_snake_case)]
+        #[expect(non_snake_case)]
         fn applicationSupportsSecureRestorableState(
             &self,
             _application: &NSApplication,
@@ -81,8 +81,10 @@ define_class!(
 );
 
 impl AppDelegate {
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn new(mtm: MainThreadMarker, handler: Box<dyn Fn(Vec<PathBuf>)>) -> Retained<Self> {
+        // SAFETY: NSObject's `init` runs once on this freshly allocated, ivar-initialized
+        // instance on the main thread, and returns the declared `Retained<Self>`.
         unsafe { msg_send![super(Self::alloc(mtm).set_ivars(handler)), init] }
     }
 }

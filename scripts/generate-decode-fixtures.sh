@@ -58,6 +58,71 @@ cjxl "$work/test-pattern.ppm" "$fixtures/test_pattern-PQ.jxl" \
     --distance=0 --modular=1 --effort=3 --num_threads=1 \
     --intensity_target=10000 -x color_space=Rec2100PQ --quiet
 
+# FP16 linear sources go through OpenEXR. cjxl takes an EXR's colour space from
+# its chromaticities attribute, defaulting to BT.709/sRGB, and ignores
+# -x color_space. ImageMagick writes no chromaticities, so BT.2020 sources are
+# tagged explicitly.
+bt2020_chromaticities='0.708 0.292 0.170 0.797 0.131 0.046 0.3127 0.3290'
+
+# Unlike HLG, scRGB stores linear light and PPM cannot hold its extended-range
+# floats. Decode HLG to linear sRGB, then scale 1,000 nits to scRGB's 80-nit
+# reference before writing an FP16 source.
+djxl "$fixtures/test_pattern-HLG.jxl" "$work/test-pattern-HLG-linear-sRGB.pfm" \
+    --output_format=pfm --color_space=RGB_D65_SRG_Rel_Lin \
+    --display_nits=1000 --num_threads=1 --quiet
+magick "$work/test-pattern-HLG-linear-sRGB.pfm" -set colorspace RGB \
+    -channel RGB -evaluate Multiply 12.5 +channel \
+    -define quantum:format=floating-point -depth 16 \
+    "$work/test-pattern-scRGB.exr"
+cjxl "$work/test-pattern-scRGB.exr" "$fixtures/test_pattern-scRGB.jxl" \
+    --distance=0 --modular=1 --effort=3 --num_threads=1 \
+    --intensity_target=1000 --quiet
+# XYB: same scRGB samples. The XYB transform makes T the unit.
+cjxl "$work/test-pattern-scRGB.exr" "$fixtures/test_pattern-scRGB-xyb.jxl" \
+    --distance=1 --effort=3 --num_threads=1 \
+    --intensity_target=80 --quiet
+# Normalized linear BT.2020: 1.0 = 1,000 nits, samples within [0, 1].
+djxl "$fixtures/test_pattern-HLG.jxl" "$work/test-pattern-HLG-linear-2020.pfm" \
+    --output_format=pfm --color_space=RGB_D65_202_Rel_Lin \
+    --display_nits=1000 --num_threads=1 --quiet
+magick "$work/test-pattern-HLG-linear-2020.pfm" -set colorspace RGB \
+    -define quantum:format=floating-point -depth 16 \
+    "$work/test-pattern-linear-untagged.exr"
+# shellcheck disable=SC2086 # The chromaticities are separate arguments.
+exrstdattr -chromaticities $bt2020_chromaticities \
+    "$work/test-pattern-linear-untagged.exr" "$work/test-pattern-linear.exr"
+cjxl "$work/test-pattern-linear.exr" "$fixtures/test_pattern-linear.jxl" \
+    --distance=0 --modular=1 --effort=3 --num_threads=1 \
+    --intensity_target=1000 --quiet
+
+# Default-target linear BT.2020 patches, sized like the 7x2 offscreen render
+# target: a neutral ramp peaking at 4.0 (812 nits) above chromatic patches.
+magick \
+    \( -size 1x1 xc:'rgb(0%,0%,0%)' xc:'rgb(6.25%,6.25%,6.25%)' \
+        xc:'rgb(12.5%,12.5%,12.5%)' xc:'rgb(25%,25%,25%)' \
+        xc:'rgb(37.5%,37.5%,37.5%)' xc:'rgb(50%,50%,50%)' \
+        xc:'rgb(100%,100%,100%)' +append \) \
+    \( -size 1x1 xc:'rgb(50%,25%,12.5%)' xc:'rgb(12.5%,25%,50%)' \
+        xc:'rgb(75%,12.5%,12.5%)' xc:'rgb(12.5%,75%,12.5%)' \
+        xc:'rgb(12.5%,12.5%,75%)' xc:'rgb(25%,25%,25%)' \
+        xc:'rgb(2.5%,2.5%,2.5%)' +append \) \
+    -append -evaluate Multiply 4 -set colorspace RGB \
+    -define quantum:format=floating-point -depth 16 \
+    "$work/linear-highlights-untagged.exr"
+# shellcheck disable=SC2086 # The chromaticities are separate arguments.
+exrstdattr -chromaticities $bt2020_chromaticities \
+    "$work/linear-highlights-untagged.exr" "$work/linear-highlights.exr"
+cjxl "$work/linear-highlights.exr" "$fixtures/linear-highlights.jxl" \
+    --distance=0 --modular=1 --effort=3 --num_threads=1 --quiet
+
+# Lossy XYB linear sRGB with the default target. Alternating black and white
+# columns never exceed 1.0, but VarDCT overshoot lifts the decoded peak above it.
+magick -size 64x64 pattern:VERTICAL2 -set colorspace RGB -type TrueColor \
+    -define quantum:format=floating-point "$work/linear-stripes.pfm"
+cjxl "$work/linear-stripes.pfm" "$fixtures/linear-xyb-sdr.jxl" \
+    --distance=1 --effort=3 --num_threads=1 \
+    -x color_space=RGB_D65_SRG_Rel_Lin --quiet
+
 # A linear-in-luminance grayscale ramp. PQ code values are absolute; HLG code
 # values include the nominal display OOTF for the selected peak.
 magick -size 1024x64 xc:black -colorspace RGB -channel RGB \
@@ -158,9 +223,49 @@ magick "$sources/rgb.ppm" -profile "$adobe_rgb" "$work/rgb-adobe.png"
 cjxl "$work/rgb-adobe.png" "$fixtures/icc.jxl" \
     --distance=0 --modular=1 --effort=3 --num_threads=1 --quiet
 
+# XYB VarDCT reports a different output profile from the embedded source ICC.
+cjxl "$work/rgb.ppm" "$fixtures/icc-vardct.jxl" \
+    --distance=0.1 --modular=0 --effort=3 --num_threads=1 \
+    -x icc_pathname="$adobe_rgb" --quiet
+
+# Float inputs force HDR gamut conversion and exercise above-white headroom.
+for primaries in sRGB P3
+do
+    encoder_primaries=SRG
+    if [ "$primaries" = P3 ]; then encoder_primaries=DCI; fi
+    for transfer in PQ HLG
+    do
+        encoder_transfer=$transfer
+        if [ "$transfer" = PQ ]; then encoder_transfer=PeQ; fi
+        cjxl "$sources/hdr.pfm" "$fixtures/hdr-$primaries-$transfer.jxl" \
+            --distance=0 --modular=1 --effort=3 --num_threads=1 \
+            --intensity_target=1000 -x "color_space=RGB_D65_${encoder_primaries}_Rel_${encoder_transfer}" --quiet
+    done
+done
+cjxl "$sources/hlg-extended.pfm" "$fixtures/hlg-extended.jxl" \
+    --distance=0 --modular=1 --effort=3 --num_threads=1 \
+    --intensity_target=1000 -x color_space=Rec2100HLG --quiet
+cjxl "$sources/hdr.pfm" "$fixtures/hdr-vardct-PQ.jxl" \
+    --distance=0.1 --modular=0 --effort=3 --num_threads=1 \
+    --intensity_target=1000 -x color_space=RGB_D65_DCI_Rel_PeQ --quiet
+for transfer in PQ HLG
+do
+    encoder_transfer=$transfer
+    if [ "$transfer" = PQ ]; then encoder_transfer=PeQ; fi
+    cjxl "$sources/gray-hdr.pfm" "$fixtures/gray-hdr-vardct-$transfer.jxl" \
+        --distance=0.1 --modular=0 --effort=3 --num_threads=1 \
+        --intensity_target=1000 -x "color_space=Gra_D50_Rel_$encoder_transfer" --quiet
+done
+
 # Two-frame animation, to exercise the animated/multi-frame decode path.
 magick -size 2x2 xc:red -delay 10 -size 2x2 xc:blue -loop 0 "$work/animation.gif"
 cjxl "$work/animation.gif" "$fixtures/animation.jxl" \
+    --distance=0 --modular=1 --effort=3 --num_threads=1 --quiet
+
+# Put the delay before both frames: animation.jxl has a hidden first frame,
+# whereas this fixture has two displayable frames with 100 ms durations.
+magick -delay 10 -size 2x2 xc:red xc:blue -loop 0 "$work/animation-multi-frame.gif"
+cjxl "$work/animation-multi-frame.gif" "$fixtures/animation-multi-frame.jxl" \
     --distance=0 --modular=1 --effort=3 --num_threads=1 --quiet
 
 # Helper: apply one EXIF tag to exif-current.jpg and replace it in place, so
@@ -202,6 +307,11 @@ cjxl "$work/xmp-rating.jpg" "$fixtures/xmp-rating.jxl" \
 generated_fixtures='test_pattern-sRGB.jxl
 test_pattern-HLG.jxl
 test_pattern-PQ.jxl
+test_pattern-scRGB.jxl
+test_pattern-scRGB-xyb.jxl
+test_pattern-linear.jxl
+linear-highlights.jxl
+linear-xyb-sdr.jxl
 ramp-hlg-1000.jxl
 ramp-hlg-2000.jxl
 ramp-pq-1000.jxl
@@ -216,7 +326,17 @@ oriented.jxl
 alpha.jxl
 associated-alpha.jxl
 icc.jxl
+icc-vardct.jxl
+hdr-sRGB-PQ.jxl
+hdr-sRGB-HLG.jxl
+hdr-P3-PQ.jxl
+hdr-P3-HLG.jxl
+hlg-extended.jxl
+hdr-vardct-PQ.jxl
+gray-hdr-vardct-PQ.jxl
+gray-hdr-vardct-HLG.jxl
 animation.jxl
+animation-multi-frame.jxl
 exif-common.jxl
 xmp-rating.jxl'
 

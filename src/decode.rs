@@ -1,25 +1,28 @@
 //! Memory-limited, asynchronous JPEG XL decoding.
 //!
 //! The module boundary is one oriented canonical tile store in linear-light
-//! BT.2020. Every image is streamed to one contiguous in-memory row-major
+//! BT.2020. Every image is decoded to one contiguous in-memory row-major
 //! premultiplied RGBA16F buffer plus a bounded straight-alpha whole-image
 //! preview.
-//! `jxl-oxide` performs the source-to-working-space transform through its
-//! `moxcms` integration. [`jxl_oxide::Render::stream`] applies orientation; raw
-//! color and extra-channel accessors do not, so this module only uses the
-//! stream accessor. PQ and HLG are requested in BT.2020 without changing their
-//! transfer function, then linearized here so `jxl-oxide` cannot implicitly
-//! tone-map them through an SDR linear destination. PQ becomes absolute
-//! luminance and HLG receives the source OOTF driven by its intensity target;
-//! both are normalized so working-space `1.0` represents xl-view's fixed
+//! `jxl` applies orientation and writes directly into that RGBA16F allocation.
+//! Bounded worker-local scratch converts its actual output profile through
+//! `moxcms`, samples the straight-alpha preview, and overwrites the allocation.
+//! PQ and HLG are linearized before gamut conversion. PQ becomes absolute
+//! luminance and HLG receives the source OOTF driven by its intensity target.
+//! Linear sources resolve their nits per unit from the intensity target,
+//! using peak source luminance for non-XYB floats with a non-default target.
+//! All are normalized so working-space `1.0` represents xl-view's fixed
 //! 203-nit HDR reference white. SDR remains relative, with encoded white mapped to
 //! working-space `1.0`.
 //!
-//! Associated-alpha RGB is rendered in its declared source encoding,
-//! unpremultiplied there (transparent pixels become black), and then converted
-//! to the working space with `moxcms`. Associated grayscale and XYB remain a
-//! typed limitation because `jxl-oxide`'s public render path performs its color
-//! transform before the application can safely unpremultiply those samples.
+//! For images encoded with associated (premultiplied) alpha, only SDR
+//! or linear RGB in the original color encoding is supported. RGB is
+//! unpremultiplied before conversion with `moxcms`, with transparent pixels
+//! becoming black. Opaque and straight-alpha images also support grayscale,
+//! XYB, and HDR.
+//!
+//! Multi-frame animations stop after the first displayable frame. Complete
+//! EXIF/XMP collected by that point is retained, so later metadata may be absent.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,6 +36,7 @@ mod coordinator;
 mod jxl;
 
 use crate::metadata::{ExifMetadata, XmpMetadata};
+use crate::units::{mib_to_bytes, usize_from_u32};
 
 pub use crate::color::SourceDynamicRange;
 pub use coordinator::{DecodeCompletion, DecodeCoordinator, DecodePurpose, DecodeQueueDisposition};
@@ -44,12 +48,9 @@ pub const TILE_SIZE: u32 = 512;
 pub const TILE_GUTTER: u32 = 8;
 pub const CANONICAL_BYTES_PER_PIXEL: usize = 8;
 pub const HALF_CONVERSION_CHUNK_SAMPLES: usize = 1024;
-type CanonicalPixel = [u8; CANONICAL_BYTES_PER_PIXEL];
+// u16 gives the decoder's f16 output its required alignment without unsafe code.
+type CanonicalPixel = [u16; 4];
 type CoarsePixel = [f32; 4];
-
-fn usize_from_u32(value: u32) -> usize {
-    usize::try_from(value).expect("u32 geometry fits usize on 32-bit-or-wider targets")
-}
 
 fn automatic_memory_ceiling_bytes() -> usize {
     let mut system = System::new();
@@ -105,8 +106,10 @@ impl ImageKey {
 /// Limits applied before and during decoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodeLimits {
-    /// Ceiling applied independently to codec-managed allocations and to
-    /// application-owned decoded storage plus render scratch.
+    /// Ceiling for application-owned decoded storage plus conversion scratch.
+    /// Also determines a decoder sample limit (assuming four bytes per sample),
+    /// which bounds dimensions but does not account for decoder allocations.
+    /// Also caps the raw payload read for an EOF-sized metadata box.
     ///
     /// This is not a process-wide peak-memory limit.
     pub memory_ceiling_bytes: usize,
@@ -115,13 +118,13 @@ pub struct DecodeLimits {
 impl DecodeLimits {
     /// Constructs decode limits with a custom per-category memory ceiling.
     ///
-    /// The same ceiling is applied independently to codec-managed allocations
-    /// and to application-owned decoded storage plus render scratch. The viewer
-    /// uses [`Default`]. This constructor remains useful for tests that need a
-    /// small deterministic ceiling.
+    /// The ceiling bounds decoded storage and raw trailing metadata, and
+    /// determines the decoder sample limit. It is not an exact decoder allocation
+    /// budget. The viewer uses [`Default`]. This constructor remains useful for
+    /// tests that need a small deterministic ceiling.
     #[must_use]
     pub fn from_memory_ceiling_mib(memory_ceiling_mib: u64) -> Self {
-        let bytes_u64 = memory_ceiling_mib.saturating_mul(1024 * 1024);
+        let bytes_u64 = mib_to_bytes(memory_ceiling_mib);
         let bytes = usize::try_from(bytes_u64).unwrap_or(usize::MAX);
         Self {
             memory_ceiling_bytes: bytes,
@@ -146,13 +149,14 @@ pub struct ToneMappingMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SourceColorEncoding {
     Enumerated {
-        colour_space: String,
+        color_space: String,
         white_point: String,
-        primaries: String,
+        /// `None` for grayscale, which has no RGB primaries.
+        primaries: Option<String>,
         transfer_function: String,
     },
     Icc {
-        colour_space: String,
+        color_space: String,
         profile_bytes: usize,
     },
 }
@@ -167,7 +171,7 @@ pub struct ImageMetadata {
 
 #[derive(Debug)]
 pub struct DecodedTileStore {
-    pixels: Box<[CanonicalPixel]>,
+    pixels: Vec<CanonicalPixel>,
     width: u32,
     height: u32,
     coarse_width: u32,
@@ -215,8 +219,7 @@ impl DecodedTileStore {
         row: u32,
         destination: &mut [f32],
     ) -> Result<(), io::Error> {
-        let expected_samples = usize::try_from(self.width)
-            .map_err(|_| io::Error::other("canonical row width is not representable"))?
+        let expected_samples = usize_from_u32(self.width)
             .checked_mul(4)
             .ok_or_else(|| io::Error::other("canonical row sample count overflowed"))?;
         if destination.len() != expected_samples {
@@ -270,36 +273,26 @@ impl DecodedTileStore {
                 "canonical row range is outside the decoded image",
             ));
         }
-        let image_width = usize::try_from(self.width)
-            .map_err(|_| io::Error::other("canonical row width is not representable"))?;
-        let row_start = usize::try_from(row)
-            .map_err(|_| io::Error::other("canonical row is not representable"))?
-            .checked_mul(image_width)
+        let row_start = usize_from_u32(row)
+            .checked_mul(usize_from_u32(self.width))
             .ok_or_else(|| io::Error::other("canonical row offset overflowed"))?;
-        let range_start = usize::try_from(start_column)
-            .map_err(|_| io::Error::other("canonical row column is not representable"))?
+        let range_start = usize_from_u32(start_column)
             .checked_add(row_start)
             .ok_or_else(|| io::Error::other("canonical row range offset overflowed"))?;
-        let range_pixels = usize::try_from(range_width)
-            .map_err(|_| io::Error::other("canonical row range width is not representable"))?;
         let range_end = range_start
-            .checked_add(range_pixels)
+            .checked_add(usize_from_u32(range_width))
             .ok_or_else(|| io::Error::other("canonical row end overflowed"))?;
         let source = self
             .pixels
             .get(range_start..range_end)
             .ok_or_else(|| io::Error::other("canonical row storage is incomplete"))?;
-        let mut bits = [0_u16; HALF_CONVERSION_CHUNK_SAMPLES];
         for (encoded, samples) in source
             .as_flattened()
-            .chunks(HALF_CONVERSION_CHUNK_SAMPLES * size_of::<u16>())
+            .chunks(HALF_CONVERSION_CHUNK_SAMPLES)
             .zip(destination.chunks_mut(HALF_CONVERSION_CHUNK_SAMPLES))
         {
-            let bits = &mut bits[..samples.len()];
-            for (encoded, bits) in encoded.chunks_exact(size_of::<u16>()).zip(bits.iter_mut()) {
-                *bits = u16::from_le_bytes([encoded[0], encoded[1]]);
-            }
-            bits.reinterpret_cast::<half::f16>()
+            encoded
+                .reinterpret_cast::<half::f16>()
                 .convert_to_f32_slice(samples);
         }
         Ok(())
@@ -375,8 +368,13 @@ impl DecodedTileStore {
                     .min(self.width - 1);
                 let source_index = usize_from_u32(source_y) * width + usize_from_u32(source_x);
                 let destination_index = usize_from_u32(output_x) * CANONICAL_BYTES_PER_PIXEL;
-                destination_row[destination_index..destination_index + CANONICAL_BYTES_PER_PIXEL]
-                    .copy_from_slice(&self.pixels[source_index]);
+                for (destination, bits) in destination_row
+                    [destination_index..destination_index + CANONICAL_BYTES_PER_PIXEL]
+                    .chunks_exact_mut(2)
+                    .zip(self.pixels[source_index])
+                {
+                    destination.copy_from_slice(&bits.to_le_bytes());
+                }
             }
         }
         Ok(output)
@@ -389,7 +387,7 @@ impl DecodedTileStore {
         coarse_height: u32,
         coarse_downsample: u32,
         coarse_pixels: Vec<CoarsePixel>,
-        pixels: Box<[CanonicalPixel]>,
+        pixels: Vec<CanonicalPixel>,
     ) -> Self {
         Self {
             pixels,
@@ -403,12 +401,34 @@ impl DecodedTileStore {
     }
 }
 
+/// Absolute luminance of linear source value 1.0, before CMS.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinearUnit {
+    pub nits: f32,
+    /// The default intensity target leaves samples uncalibrated, so `nits` is
+    /// HDR reference white by assumption.
+    pub assumed: bool,
+}
+
 #[derive(Debug)]
 pub struct DecodedImage {
     pub store: Arc<DecodedTileStore>,
     pub width: u32,
     pub height: u32,
     pub source_dynamic_range: SourceDynamicRange,
+    /// Peak used for presentation: measured from visible pixels for PQ, HLG and
+    /// linear sources, and HDR reference white for SDR.
+    pub source_peak: crate::color::SourceIntensityTarget,
+    /// Header intensity target after the invalid-value fallback. PQ and HLG
+    /// decode relative to it, but it only bounds their content.
+    pub intensity_target: crate::color::SourceIntensityTarget,
+    /// Calibration of linear source samples.
+    pub linear_unit: Option<LinearUnit>,
+    /// Whether the source supports an HDR claim. PQ and HLG need a target above
+    /// HDR reference white. Linear sources need a measured peak above it, and
+    /// not XYB with the default target, where codec overshoot alone can produce
+    /// such a peak.
+    pub hdr_source: bool,
     pub metadata: ImageMetadata,
     pub memory_cost_bytes: usize,
 }
@@ -431,8 +451,10 @@ pub enum DecodeError {
     SourceChanged { path: PathBuf },
     #[error("invalid or unsupported JPEG XL data: {0}")]
     Decoder(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
-    #[error("JPEG XL decoder allocations exceed the {limit} byte working-memory limit")]
+    #[error("JPEG XL decoder sample or allocation limit exceeded ({limit} byte budget)")]
     DecoderMemoryLimit { limit: usize },
+    #[error("JPEG XL metadata needs {required} bytes; limit is {limit} bytes")]
+    MetadataMemoryLimit { required: usize, limit: usize },
     #[error("invalid image dimensions {width}x{height}")]
     InvalidDimensions { width: u32, height: u32 },
     #[error(
@@ -459,16 +481,12 @@ pub enum DecodeError {
     SizeOverflow,
     #[error("unsupported JPEG XL extra channel: {0}")]
     UnsupportedExtraChannel(String),
-    #[error("associated alpha with XYB or grayscale input is not safely transformable yet")]
+    #[error("associated alpha with XYB, grayscale, or PQ/HLG input is unsupported")]
     UnsupportedAssociatedAlphaEncoding,
+    #[error("color conversion produced a non-finite RGBA16F sample")]
+    NonFiniteOutput,
     #[error("unsupported color profile: {0}")]
     UnsupportedColorProfile(String),
-    #[error("decoder produced no displayable keyframe")]
-    NoDisplayableKeyframe,
-    #[error("decoder produced an unsupported {0}-channel pixel format")]
-    UnsupportedPixelFormat(usize),
-    #[error("decoder produced only {actual} of {expected} expected samples")]
-    IncompleteOutput { actual: usize, expected: usize },
     #[error("decode coordinator stopped before completing the request")]
     Cancelled,
 }
@@ -501,22 +519,12 @@ mod tests {
     fn canonical_row_ranges_decode_only_selected_columns() {
         let pixels = (0..6_u16)
             .map(|pixel| {
-                let channels = [f32::from(pixel), 0.25, 0.5, 1.0]
+                [f32::from(pixel), 0.25, 0.5, 1.0]
                     .map(half::f16::from_f32)
-                    .map(half::f16::to_le_bytes);
-                [
-                    channels[0][0],
-                    channels[0][1],
-                    channels[1][0],
-                    channels[1][1],
-                    channels[2][0],
-                    channels[2][1],
-                    channels[3][0],
-                    channels[3][1],
-                ]
+                    .map(half::f16::to_bits)
             })
             .collect::<Vec<_>>();
-        let store = DecodedTileStore::new(3, 2, 1, 1, 1, vec![[0.0; 4]], pixels.into_boxed_slice());
+        let store = DecodedTileStore::new(3, 2, 1, 1, 1, vec![[0.0; 4]], pixels);
         let mut selected = [0.0; 8];
         store
             .read_canonical_row_range_rgba_f32(1, 1, &mut selected)
@@ -539,18 +547,9 @@ mod tests {
             .collect::<Vec<_>>();
         let pixels = half_bits
             .chunks_exact(4)
-            .map(|channels| {
-                let red = channels[0].to_le_bytes();
-                let green = channels[1].to_le_bytes();
-                let blue = channels[2].to_le_bytes();
-                let alpha = channels[3].to_le_bytes();
-                [
-                    red[0], red[1], green[0], green[1], blue[0], blue[1], alpha[0], alpha[1],
-                ]
-            })
+            .map(|channels| channels.try_into().unwrap())
             .collect::<Vec<_>>();
-        let store =
-            DecodedTileStore::new(width, 1, 1, 1, 1, vec![[0.0; 4]], pixels.into_boxed_slice());
+        let store = DecodedTileStore::new(width, 1, 1, 1, 1, vec![[0.0; 4]], pixels);
         let mut actual = vec![0.0; sample_count];
 
         store.read_canonical_row_rgba_f32(0, &mut actual).unwrap();

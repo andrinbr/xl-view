@@ -12,7 +12,6 @@ mod error;
 mod gpu;
 #[cfg(test)]
 mod test_utils;
-mod units;
 
 use std::process::ExitCode;
 
@@ -41,7 +40,7 @@ fn main() -> ExitCode {
         }
     };
 
-    // Report startup failures
+    // Report fatal startup and runtime failures
     if let Err(error) = app::run(&cli) {
         diagnostics::report_fatal(&error);
         diagnostics::show_startup_error_dialog(&error);

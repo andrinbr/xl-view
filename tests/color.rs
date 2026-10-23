@@ -30,7 +30,7 @@ fn assert_near(actual: impl Into<f64>, expected: impl Into<f64>, tolerance: f64)
 }
 
 #[test]
-#[allow(clippy::cast_possible_truncation)] // The production color pipeline intentionally uses f32.
+#[expect(clippy::cast_possible_truncation)] // The production color pipeline intentionally uses f32.
 fn transfer_functions_match_numeric_references() {
     for (linear, encoded) in SRGB_REFERENCES {
         assert_near(srgb_oetf(linear), encoded, 1.0e-9);

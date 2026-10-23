@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use rfd::FileDialog;
@@ -19,7 +20,24 @@ pub(super) fn dropped_file_paths(value: &dyn TypedData) -> std::io::Result<Vec<P
 pub(super) enum FilePickerResult {
     Selected(PathBuf),
     Cancelled,
-    Failed(String),
+    Unsupported(PathBuf),
+}
+
+/// The folder holding the current image could not be listed.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot read {}: {source}", .folder.display())]
+pub(super) struct FolderReadError {
+    folder: PathBuf,
+    source: io::Error,
+}
+
+impl FolderReadError {
+    pub(super) fn new(folder: &Path, source: io::Error) -> Self {
+        Self {
+            folder: folder.to_path_buf(),
+            source,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,9 +117,7 @@ pub(super) fn select_image_file(
 
     match chooser.pick_file() {
         Some(path) if is_supported_image_path(&path) => FilePickerResult::Selected(path),
-        Some(_) => {
-            FilePickerResult::Failed("the selected file is not a supported image".to_owned())
-        }
+        Some(path) => FilePickerResult::Unsupported(path),
         None => FilePickerResult::Cancelled,
     }
 }
@@ -109,7 +125,7 @@ pub(super) fn select_image_file(
 pub(super) fn adjacent_image_path(
     current_path: &Path,
     direction: FolderDirection,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, FolderReadError> {
     let neighbors = neighboring_image_paths(current_path)?;
     Ok(match direction {
         FolderDirection::Previous => neighbors.previous,
@@ -117,11 +133,13 @@ pub(super) fn adjacent_image_path(
     })
 }
 
-pub(super) fn neighboring_image_paths(current_path: &Path) -> Result<NeighborPaths, String> {
+pub(super) fn neighboring_image_paths(
+    current_path: &Path,
+) -> Result<NeighborPaths, FolderReadError> {
     let parent = current_path.parent().unwrap_or_else(|| Path::new("."));
     let current_name = current_path.file_name();
-    let entries = std::fs::read_dir(parent)
-        .map_err(|error| format!("cannot read {}: {error}", parent.display()))?;
+    let entries =
+        std::fs::read_dir(parent).map_err(|source| FolderReadError::new(parent, source))?;
     // Once the directory is open, scan it best-effort: one entry may disappear
     // or become unreadable without hiding the other navigable images.
     let mut paths = entries
@@ -133,19 +151,14 @@ pub(super) fn neighboring_image_paths(current_path: &Path) -> Result<NeighborPat
                 && (path.file_name() == current_name || !is_hidden_path(path))
         })
         .collect::<Vec<_>>();
-    paths.sort_by_cached_key(|path| {
-        path.file_name()
-            .unwrap_or(path.as_os_str())
-            .to_string_lossy()
-            .to_lowercase()
-    });
+    paths.sort_by_cached_key(|path| file_name(path).to_lowercase());
     Ok(NeighborPaths {
         previous: choose_adjacent_path(&paths, current_path, FolderDirection::Previous),
         next: choose_adjacent_path(&paths, current_path, FolderDirection::Next),
     })
 }
 
-pub(super) fn choose_adjacent_path(
+fn choose_adjacent_path(
     sorted_paths: &[PathBuf],
     current_path: &Path,
     direction: FolderDirection,
@@ -209,5 +222,45 @@ mod tests {
             .open(&path)
             .unwrap();
         assert!(is_hidden_path(&path));
+    }
+
+    #[test]
+    fn displayed_file_name_does_not_expose_parent_directories() {
+        assert_eq!(
+            file_name(Path::new("/home/user/private/photo.jxl")),
+            "photo.jxl"
+        );
+    }
+
+    #[test]
+    fn dropped_paths_choose_the_first_image() {
+        let paths = [
+            PathBuf::from("notes.txt"),
+            PathBuf::from("first.JXL"),
+            PathBuf::from("second.jxl"),
+        ];
+        assert_eq!(first_image_path(&paths), Some(PathBuf::from("first.JXL")));
+        assert_eq!(first_image_path(&[PathBuf::from("notes.txt")]), None);
+    }
+
+    #[test]
+    fn folder_navigation_chooses_neighbors_without_wrapping() {
+        let paths = ["a.jxl", "b.jxl", "c.jxl"].map(PathBuf::from);
+        assert_eq!(
+            choose_adjacent_path(&paths, Path::new("b.jxl"), FolderDirection::Previous),
+            Some(PathBuf::from("a.jxl"))
+        );
+        assert_eq!(
+            choose_adjacent_path(&paths, Path::new("b.jxl"), FolderDirection::Next),
+            Some(PathBuf::from("c.jxl"))
+        );
+        assert_eq!(
+            choose_adjacent_path(&paths, Path::new("a.jxl"), FolderDirection::Previous),
+            None
+        );
+        assert_eq!(
+            choose_adjacent_path(&paths, Path::new("c.jxl"), FolderDirection::Next),
+            None
+        );
     }
 }

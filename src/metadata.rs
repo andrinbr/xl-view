@@ -11,7 +11,7 @@ const MAX_XMP_NODES: u32 = 4_096;
 const XMP_BASIC_NAMESPACE: &str = "http://ns.adobe.com/xap/1.0/";
 
 /// Common fields parsed from an EXIF payload capped at 16 MiB.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExifMetadata {
     pub aperture_f_number: Option<f64>,
     pub artist: Option<String>,
@@ -39,27 +39,6 @@ pub struct XmpMetadata {
     pub rating: Option<f64>,
 }
 
-impl ExifMetadata {
-    fn empty() -> Self {
-        Self {
-            aperture_f_number: None,
-            artist: None,
-            camera_make: None,
-            camera_model: None,
-            captured_at: None,
-            copyright: None,
-            exposure_bias_ev: None,
-            exposure_time_seconds: None,
-            focal_length_mm: None,
-            iso_speed: None,
-            lens_make: None,
-            lens_model: None,
-            parse_error: None,
-            software: None,
-        }
-    }
-}
-
 /// Parses common TIFF/EXIF fields without retaining the source payload.
 ///
 /// Invalid EXIF is returned with `parse_error` set instead of failing image
@@ -67,7 +46,7 @@ impl ExifMetadata {
 /// a description of the ignored errors.
 #[must_use]
 pub fn parse_exif(raw_payload: &[u8], tiff_header_offset: u32) -> ExifMetadata {
-    let mut metadata = ExifMetadata::empty();
+    let mut metadata = ExifMetadata::default();
     if raw_payload.len() > MAX_EXIF_BYTES {
         metadata.parse_error = Some(format!(
             "EXIF payload is {} bytes; limit is {MAX_EXIF_BYTES} bytes",

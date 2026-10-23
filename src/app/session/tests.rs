@@ -6,6 +6,13 @@ use super::*;
 use crate::test_utils::fixture_path;
 use xl_view::decode::{DecodeLimits, decode_file};
 
+fn permission_denied() -> FolderReadError {
+    FolderReadError::new(
+        Path::new("/photos"),
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+    )
+}
+
 #[derive(Debug)]
 struct FakeDecodeState {
     demand_disposition: DecodeQueueDisposition,
@@ -349,7 +356,7 @@ fn neighbor_lookup_failure_is_silent_and_clears_the_current_plan() {
     session.handle_neighbor_paths(
         request.generation,
         &request.anchor_key,
-        Err("permission denied".to_owned()),
+        Err(permission_denied()),
     );
 
     assert!(session.prefetch_plan.is_none());
@@ -603,13 +610,13 @@ fn navigation_results_ignore_stale_work_and_report_end_or_failure() {
             request.generation,
             request.direction,
             &request.source_path,
-            Err("permission denied".to_owned()),
+            Err(permission_denied()),
         ),
         NavigationEffect::StatusChanged
     ));
     assert_eq!(
         session.status_message(),
-        Some("Cannot inspect the image folder: permission denied")
+        Some("Cannot inspect the image folder: cannot read /photos: permission denied")
     );
 }
 

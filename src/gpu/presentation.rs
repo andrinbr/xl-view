@@ -3,19 +3,27 @@ use wgpu::util::DeviceExt;
 
 use super::tiles::TileCache;
 
-pub(super) const PARAM_BUFFER_USAGE: wgpu::BufferUsages =
+const PARAM_BUFFER_USAGE: wgpu::BufferUsages =
     wgpu::BufferUsages::UNIFORM.union(wgpu::BufferUsages::COPY_DST);
 const PRESENTATION_PARAM_WORD_COUNT: usize = 22;
+
+/// What the presentation shader draws, matching the WGSL `CONTENT_*` constants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ContentMode {
+    EmptyState = 0,
+    DiagnosticsPattern = 1,
+    DecodedImage = 2,
+}
 
 /// Named CPU representation of the WGSL `Params` uniform.
 ///
 /// [`Self::to_words`] is the single source of truth for the cross-language
 /// field order and representation.
-#[allow(clippy::struct_excessive_bools)] // These are independent WGSL flags serialized as u32 words, not overlapping state.
+#[expect(clippy::struct_excessive_bools)] // These are independent WGSL flags serialized as u32 words, not overlapping state.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct PresentationParams {
     pub(super) pq_output: bool,
-    pub(super) content_mode: u32,
+    pub(super) content_mode: ContentMode,
     pub(super) background_mode: u32,
     pub(super) hdr_reference_white_nits: f32,
     pub(super) source_peak_nits: f32,
@@ -42,7 +50,7 @@ impl PresentationParams {
     fn to_words(self) -> [u32; PRESENTATION_PARAM_WORD_COUNT] {
         [
             u32::from(self.pq_output),
-            self.content_mode,
+            self.content_mode as u32,
             self.background_mode,
             self.hdr_reference_white_nits.to_bits(),
             self.source_peak_nits.to_bits(),
@@ -77,17 +85,21 @@ pub(super) struct PresentationResources {
     pub(super) params_buffer: wgpu::Buffer,
 }
 
+/// The textures and sampler the presentation shader reads, one per binding.
+pub(super) struct PresentationBindings<'a> {
+    pub(super) coarse_texture: &'a wgpu::Texture,
+    pub(super) tile_cache: &'a TileCache,
+    pub(super) resampled_texture: &'a wgpu::Texture,
+    pub(super) ui_texture: &'a wgpu::Texture,
+    pub(super) image_sampler: &'a wgpu::Sampler,
+}
+
 impl PresentationResources {
-    #[allow(clippy::too_many_arguments)] // The binding inputs remain explicit at this small call surface.
     pub(super) fn new(
         device: &wgpu::Device,
         target_format: TextureFormat,
         params: PresentationParams,
-        coarse_texture: &wgpu::Texture,
-        tile_cache: &TileCache,
-        resampled_texture: &wgpu::Texture,
-        ui_texture: &wgpu::Texture,
-        image_sampler: &wgpu::Sampler,
+        bindings: &PresentationBindings<'_>,
     ) -> Self {
         let pipeline = create_presentation_pipeline(device, target_format);
         let params = params.to_ne_bytes();
@@ -96,16 +108,8 @@ impl PresentationResources {
             contents: params.as_flattened(),
             usage: PARAM_BUFFER_USAGE,
         });
-        let bind_group = create_presentation_bind_group(
-            device,
-            &pipeline,
-            &params_buffer,
-            coarse_texture,
-            tile_cache,
-            resampled_texture,
-            ui_texture,
-            image_sampler,
-        );
+        let bind_group =
+            create_presentation_bind_group(device, &pipeline, &params_buffer, bindings);
         Self {
             pipeline,
             bind_group,
@@ -116,48 +120,24 @@ impl PresentationResources {
     pub(super) fn rebuild_bind_group(
         &mut self,
         device: &wgpu::Device,
-        coarse_texture: &wgpu::Texture,
-        tile_cache: &TileCache,
-        resampled_texture: &wgpu::Texture,
-        ui_texture: &wgpu::Texture,
-        image_sampler: &wgpu::Sampler,
+        bindings: &PresentationBindings<'_>,
     ) {
-        self.bind_group = create_presentation_bind_group(
-            device,
-            &self.pipeline,
-            &self.params_buffer,
-            coarse_texture,
-            tile_cache,
-            resampled_texture,
-            ui_texture,
-            image_sampler,
-        );
+        self.bind_group =
+            create_presentation_bind_group(device, &self.pipeline, &self.params_buffer, bindings);
     }
 
-    #[allow(clippy::too_many_arguments)] // Mirrors construction when the surface format changes.
     pub(super) fn rebuild_pipeline(
         &mut self,
         device: &wgpu::Device,
         target_format: TextureFormat,
-        coarse_texture: &wgpu::Texture,
-        tile_cache: &TileCache,
-        resampled_texture: &wgpu::Texture,
-        ui_texture: &wgpu::Texture,
-        image_sampler: &wgpu::Sampler,
+        bindings: &PresentationBindings<'_>,
     ) {
         self.pipeline = create_presentation_pipeline(device, target_format);
-        self.rebuild_bind_group(
-            device,
-            coarse_texture,
-            tile_cache,
-            resampled_texture,
-            ui_texture,
-            image_sampler,
-        );
+        self.rebuild_bind_group(device, bindings);
     }
 }
 
-pub(super) fn presentation_shader_source() -> String {
+fn presentation_shader_source() -> String {
     [
         include_str!("shaders/color_transform.wgsl"),
         include_str!("shaders/test_pattern.wgsl"),
@@ -183,23 +163,25 @@ fn create_presentation_pipeline(
     )
 }
 
-#[allow(clippy::too_many_arguments)] // Each entry maps directly to one shader resource binding.
 fn create_presentation_bind_group(
     device: &wgpu::Device,
     pipeline: &wgpu::RenderPipeline,
     params_buffer: &wgpu::Buffer,
-    coarse_texture: &wgpu::Texture,
-    tile_cache: &TileCache,
-    resampled_texture: &wgpu::Texture,
-    ui_texture: &wgpu::Texture,
-    image_sampler: &wgpu::Sampler,
+    bindings: &PresentationBindings<'_>,
 ) -> wgpu::BindGroup {
+    let PresentationBindings {
+        coarse_texture,
+        tile_cache,
+        resampled_texture,
+        ui_texture,
+        image_sampler,
+    } = *bindings;
     let bind_group_layout = pipeline.get_bind_group_layout(0);
     let coarse_view = coarse_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let ui_view = ui_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let resampled_view = resampled_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let tile_view = tile_cache
-        .texture
+        .texture()
         .create_view(&wgpu::TextureViewDescriptor {
             label: Some("canonical high-resolution tile-cache view"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -231,7 +213,7 @@ fn create_presentation_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 5,
-                resource: tile_cache.mapping_buffer.as_entire_binding(),
+                resource: tile_cache.mapping_buffer().as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 6,

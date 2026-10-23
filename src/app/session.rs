@@ -13,9 +13,9 @@ use xl_view::decode::{
 };
 
 use super::decoded_cache::{CachedDecodedImage, DecodedImageCache};
-use super::files::{FolderDirection, NeighborPaths, file_name};
-use super::milliseconds;
+use super::files::{FolderDirection, FolderReadError, NeighborPaths, file_name};
 use super::overlay::{DecodeTiming, LoadedImageSummary};
+use xl_view::units::milliseconds;
 
 const PREFETCH_DELAY: Duration = Duration::from_millis(250);
 
@@ -219,14 +219,12 @@ impl PendingImageInstall {
     }
 }
 
-#[allow(clippy::large_enum_variant)] // The payload moves once; boxing would allocate on every image open.
 pub(super) enum SelectionEffect {
     Install(PendingImageInstall),
     Pending,
     StatusChanged,
 }
 
-#[allow(clippy::large_enum_variant)] // The payload moves once; boxing would allocate on every completed demand.
 pub(super) enum DecodeEffect {
     Install(PendingImageInstall),
     StatusChanged,
@@ -329,7 +327,7 @@ impl ImageSession {
             self.pending_open = Some(context);
             SelectionEffect::Install(
                 self.prepare_current_install(image, true)
-                    .expect("the cached selection was just installed"),
+                    .expect("pending_open was set immediately above"),
             )
         } else {
             let disposition = self.decode_queue.request_demand(path, key, generation);
@@ -383,8 +381,7 @@ impl ImageSession {
         } else {
             DecodeTiming::Measured(decode_time)
         };
-        let summary =
-            LoadedImageSummary::from_decoded(Some(path.as_path()), &cached.image, decode_timing);
+        let summary = LoadedImageSummary::from_decoded(&path, &cached.image, decode_timing);
         let decoded_image = retain_decoded_image.then(|| Arc::clone(&cached.image));
         tracing::info!(
             path = %path.display(),
@@ -492,7 +489,7 @@ impl ImageSession {
         &mut self,
         generation: u64,
         anchor_key: &ImageKey,
-        result: Result<NeighborPaths, String>,
+        result: Result<NeighborPaths, FolderReadError>,
     ) {
         let Some(plan) = self.prefetch_plan.as_mut() else {
             return;
@@ -633,7 +630,7 @@ impl ImageSession {
         generation: u64,
         direction: FolderDirection,
         source_path: &Path,
-        result: Result<Option<PathBuf>, String>,
+        result: Result<Option<PathBuf>, FolderReadError>,
     ) -> NavigationEffect {
         if generation != self.navigation_generation {
             return NavigationEffect::None;
@@ -687,21 +684,15 @@ impl ImageSession {
         completion: DecodeCompletion,
         selection_generation: u64,
     ) -> DecodeEffect {
-        let is_current = self.pending_open.as_ref().is_some_and(|context| {
+        let current = self.pending_open.as_ref().filter(|context| {
             context.generation == selection_generation && context.key == completion.key
         });
-        let direction = self
-            .pending_open
-            .as_ref()
-            .filter(|_| is_current)
-            .and_then(|context| context.direction);
+        let is_current = current.is_some();
+        let direction = current.and_then(|context| context.direction);
         match completion.result {
             Ok(image) => {
-                let request_to_decode_complete = self
-                    .pending_open
-                    .as_ref()
-                    .filter(|_| is_current)
-                    .map_or(Duration::ZERO, |context| context.started.elapsed());
+                let request_to_decode_complete =
+                    current.map_or(Duration::ZERO, |context| context.started.elapsed());
                 if is_current {
                     tracing::info!(
                         path = %completion.path.display(),
@@ -786,10 +777,7 @@ impl ImageSession {
         }
         match completion.result {
             Ok(image) => {
-                let protected = self
-                    .prefetch_plan
-                    .as_ref()
-                    .map_or_else(Vec::new, |plan| plan.protected.clone());
+                let protected = plan.protected.clone();
                 let key = completion.key;
                 let cached = CachedDecodedImage::new(image, completion.decode_time);
                 let admitted = self

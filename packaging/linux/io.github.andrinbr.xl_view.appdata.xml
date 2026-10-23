@@ -10,7 +10,7 @@
   </developer>
   <description>
     <p>
-      View SDR, HLG, and PQ images using native Wayland and Vulkan presentation.
+      View SDR, HLG, PQ, and linear images (including scRGB) using native Wayland and Vulkan presentation.
       The current version supports JPEG XL files, and the compositor remains
       responsible for final display mapping and calibration.
     </p>
@@ -22,6 +22,7 @@
   </provides>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.4.0" date="2026-10-23" />
     <release version="0.3.1" date="2026-08-28" />
     <release version="0.3.0" date="2026-08-22" />
     <release version="0.2.0" date="2026-08-15" />

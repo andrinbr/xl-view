@@ -1,7 +1,7 @@
 use std::io;
 use std::ops::Range;
 
-use crate::units::usize_from_u32;
+use xl_view::units::usize_from_u32;
 
 pub(super) const MAX_STAGING_BYTES: usize = 16 * 1024 * 1024;
 const RGBA16F_BYTES_PER_PIXEL: u32 = 8;
@@ -44,8 +44,7 @@ impl TextureUploadLayout {
             .checked_mul(bytes_per_pixel)
             .ok_or_else(|| io::Error::other(format!("{context} row size overflowed")))?;
         let padded_row_bytes = row_bytes
-            .checked_add(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT - 1)
-            .map(|value| value & !(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT - 1))
+            .checked_next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             .ok_or_else(|| io::Error::other(format!("{context} row alignment overflowed")))?;
         let row_bytes_usize = usize_from_u32(row_bytes);
         let padded_row_bytes_usize = usize_from_u32(padded_row_bytes);
@@ -128,15 +127,38 @@ impl TextureUploadLayout {
         }
     }
 
-    pub(super) fn stripe_data(self, staging: &[u8], stripe: UploadStripe) -> &[u8] {
+    /// Writes one staged stripe into `layer` of the texture's base mip level.
+    pub(super) fn write_stripe(
+        self,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        layer: u32,
+        staging: &[u8],
+        stripe: UploadStripe,
+    ) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: stripe.first_row,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            self.stripe_data(staging, stripe),
+            self.copy_buffer_layout(stripe),
+            self.copy_extent(stripe),
+        );
+    }
+
+    fn stripe_data(self, staging: &[u8], stripe: UploadStripe) -> &[u8] {
         let bytes = usize_from_u32(stripe.row_count) * usize_from_u32(self.padded_row_bytes);
         &staging[..bytes]
     }
 
-    pub(super) const fn copy_buffer_layout(
-        self,
-        stripe: UploadStripe,
-    ) -> wgpu::TexelCopyBufferLayout {
+    const fn copy_buffer_layout(self, stripe: UploadStripe) -> wgpu::TexelCopyBufferLayout {
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(self.padded_row_bytes),
@@ -144,7 +166,7 @@ impl TextureUploadLayout {
         }
     }
 
-    pub(super) const fn copy_extent(self, stripe: UploadStripe) -> wgpu::Extent3d {
+    const fn copy_extent(self, stripe: UploadStripe) -> wgpu::Extent3d {
         wgpu::Extent3d {
             width: self.width,
             height: stripe.row_count,

@@ -68,7 +68,7 @@ impl DisplayTargetProvider {
         Self
     }
 
-    #[allow(clippy::unused_self)] // Keeps target queries uniform across platform providers.
+    #[expect(clippy::unused_self)] // Keeps target queries uniform across platform providers.
     pub(super) fn target(&self, info: &wgpu::DisplayHdrInfo) -> HdrTarget {
         let luminance = info.luminance.unwrap_or_default();
         windows_target(
@@ -136,11 +136,8 @@ pub(super) fn macos_target(
 }
 
 #[cfg(any(test, target_os = "linux"))]
-#[allow(clippy::cast_precision_loss)] // Protocol luminances are far below f32's exact-integer limit.
-pub(super) fn wayland_target(reference_lum: Option<u32>, max_lum: Option<u32>) -> HdrTarget {
-    let (Some(reference_lum), Some(max_lum)) = (reference_lum, max_lum) else {
-        return Err(HdrUnavailableReason::MissingDisplayInformation);
-    };
+#[expect(clippy::cast_precision_loss)] // Protocol luminances are far below f32's exact-integer limit.
+pub(super) fn wayland_target(reference_lum: u32, max_lum: u32) -> HdrTarget {
     if reference_lum == 0 || max_lum == 0 {
         return Err(HdrUnavailableReason::InvalidLuminance);
     }
@@ -197,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // These normalization cases are exactly representable.
+    #[expect(clippy::float_cmp)] // These normalization cases are exactly representable.
     fn windows_reference_white_is_validation_only() {
         let first = windows_target(Some(true), Some(100.0), Some(600.0)).unwrap();
         let second = windows_target(Some(true), Some(300.0), Some(600.0)).unwrap();
@@ -206,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // The headroom fixtures have exact binary products.
+    #[expect(clippy::float_cmp)] // The headroom fixtures have exact binary products.
     fn macos_bootstraps_with_potential_and_maps_pq_from_100_nits() {
         assert_eq!(
             reason(macos_target(Some(1.0), Some(2.0))),
@@ -241,30 +238,22 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)] // Integer protocol luminances convert exactly here.
+    #[expect(clippy::float_cmp)] // Integer protocol luminances convert exactly here.
     fn wayland_uses_integer_luminance_and_fixed_white() {
         assert_eq!(
-            reason(wayland_target(None, Some(600))),
-            HdrUnavailableReason::MissingDisplayInformation
-        );
-        assert_eq!(
-            reason(wayland_target(Some(200), None)),
-            HdrUnavailableReason::MissingDisplayInformation
-        );
-        assert_eq!(
-            reason(wayland_target(Some(0), Some(600))),
+            reason(wayland_target(0, 600)),
             HdrUnavailableReason::InvalidLuminance
         );
         assert_eq!(
-            reason(wayland_target(Some(600), Some(600))),
+            reason(wayland_target(600, 600)),
             HdrUnavailableReason::DisplayReportsSdr
         );
         assert_eq!(
-            reason(wayland_target(Some(100), Some(203))),
+            reason(wayland_target(100, 203)),
             HdrUnavailableReason::DisplayReportsSdr
         );
-        let first = wayland_target(Some(100), Some(600)).unwrap();
-        let second = wayland_target(Some(300), Some(600)).unwrap();
+        let first = wayland_target(100, 600).unwrap();
+        let second = wayland_target(300, 600).unwrap();
         assert_eq!(first, second);
         assert_eq!(first, 600.0);
     }

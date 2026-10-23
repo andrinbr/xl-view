@@ -3,12 +3,10 @@ use std::io;
 use wgpu::TextureFormat;
 
 use super::upload::TextureUploadLayout;
-use crate::units::usize_from_u32;
+use xl_view::units::{BYTES_PER_MIB, usize_from_u32};
 
-const MIB_BYTES: u64 = 1024 * 1024;
 const GPU_TEXTURE_OVERHEAD_DIVISOR: u64 = 10;
 
-#[allow(clippy::too_many_arguments)] // Texture dimensions, mip policy, and diagnostic label are explicit upload inputs.
 pub(super) fn create_rgba16f_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -19,13 +17,8 @@ pub(super) fn create_rgba16f_texture(
     label: &'static str,
 ) -> Result<wgpu::Texture, io::Error> {
     let upload_layout = TextureUploadLayout::rgba16f(width, height, label)?;
-    let expected_samples = usize::try_from(width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
+    let expected_samples = usize_from_u32(width)
+        .checked_mul(usize_from_u32(height))
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| io::Error::other(format!("{label} sample count overflowed")))?;
     if pixels.len() != expected_samples {
@@ -62,27 +55,13 @@ pub(super) fn create_rgba16f_texture(
             let destination = upload_layout.staging_row_mut(&mut staging, stripe_row);
             encode_premultiplied_rgba16f_row(source, destination);
         }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: 0,
-                    y: stripe.first_row(),
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            upload_layout.stripe_data(&staging, stripe),
-            upload_layout.copy_buffer_layout(stripe),
-            upload_layout.copy_extent(stripe),
-        );
+        upload_layout.write_stripe(queue, &texture, 0, &staging, stripe);
     }
     if mip_level_count > 1 {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("linear RGBA16F mip encoder"),
         });
-        generate_linear_mips(device, &mut encoder, &texture, mip_level_count);
+        generate_linear_mips_for_layers(device, &mut encoder, &texture, mip_level_count, &[0]);
         queue.submit([encoder.finish()]);
     }
     Ok(texture)
@@ -129,10 +108,8 @@ pub(super) fn rgba16f_texture_budget_bytes(
     for _ in 0..mip_levels {
         let row_bytes = u64::from(width).saturating_mul(8);
         let padded_row_bytes = row_bytes
-            .saturating_add(alignment - 1)
-            .checked_div(alignment)
-            .unwrap_or(u64::MAX)
-            .saturating_mul(alignment);
+            .checked_next_multiple_of(alignment)
+            .unwrap_or(u64::MAX);
         total = total.saturating_add(
             padded_row_bytes
                 .saturating_mul(u64::from(height))
@@ -143,17 +120,8 @@ pub(super) fn rgba16f_texture_budget_bytes(
     }
     let with_overhead = total.saturating_add(total.div_ceil(GPU_TEXTURE_OVERHEAD_DIVISOR));
     with_overhead
-        .checked_add(MIB_BYTES - 1)
-        .map_or(u64::MAX, |bytes| bytes / MIB_BYTES * MIB_BYTES)
-}
-
-fn generate_linear_mips(
-    device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
-    texture: &wgpu::Texture,
-    mip_level_count: u32,
-) {
-    generate_linear_mips_for_layers(device, encoder, texture, mip_level_count, &[0]);
+        .checked_next_multiple_of(BYTES_PER_MIB)
+        .unwrap_or(u64::MAX)
 }
 
 pub(super) fn generate_linear_mips_for_layers(
@@ -192,7 +160,6 @@ impl LinearMipGenerator {
         Self { sampler, pipeline }
     }
 
-    #[allow(clippy::too_many_lines)] // One loop owns the per-level views, bindings, render passes, and layer transitions.
     pub(super) fn generate(
         &self,
         device: &wgpu::Device,
@@ -263,6 +230,7 @@ impl LinearMipGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::test_utils::request_native_test_gpu;
 
     #[test]
     fn mip_level_count_covers_the_longest_dimension() {
@@ -276,8 +244,8 @@ mod tests {
         let budget = rgba16f_texture_budget_bytes(3840, 2160, 1, 1);
 
         assert!(budget > logical);
-        assert_eq!(budget % MIB_BYTES, 0);
-        assert_eq!(budget, 70 * MIB_BYTES);
+        assert_eq!(budget % BYTES_PER_MIB, 0);
+        assert_eq!(budget, 70 * BYTES_PER_MIB);
     }
 
     #[test]
@@ -287,5 +255,94 @@ mod tests {
 
         assert!(four_layers > one_layer);
         assert!(four_layers <= one_layer.saturating_mul(4));
+    }
+
+    #[test]
+    fn upload_repack_premultiplies_linear_rgb() {
+        let mut encoded = [0_u8; 8];
+        encode_premultiplied_rgba16f_row(&[1.0, 0.5, 0.25, 0.5], &mut encoded);
+        let decoded: [f32; 4] = std::array::from_fn(|channel| {
+            let start = channel * 2;
+            half::f16::from_bits(u16::from_le_bytes(
+                encoded[start..start + 2].try_into().unwrap(),
+            ))
+            .to_f32()
+        });
+        for (actual, expected) in decoded.into_iter().zip([0.5, 0.25, 0.125, 0.5]) {
+            assert!((actual - expected).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a native GPU adapter for mip readback"]
+    fn linear_mip_generation_preserves_light_and_premultiplied_alpha() {
+        let (device, queue) = request_native_test_gpu(
+            crate::gpu::native_backends(),
+            wgpu::Features::empty(),
+            "mip readback test requires a native GPU adapter",
+        );
+
+        // Transparent white must contribute no RGB after premultiplication. The
+        // 50% linear red result also distinguishes linear averaging from an
+        // encoded-sRGB average decoded back to roughly 21.4% linear light.
+        let pixels = [
+            1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0,
+        ];
+        let texture = create_rgba16f_texture(
+            &device,
+            &queue,
+            &pixels,
+            2,
+            2,
+            mip_level_count(2, 2),
+            "linear mip test",
+        )
+        .unwrap();
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("linear mip readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 1,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback.map_async(wgpu::MapMode::Read, .., move |result| {
+            sender.send(result).unwrap();
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
+        let mapped = readback.get_mapped_range(..).unwrap();
+        let decoded: [f32; 4] = std::array::from_fn(|channel| {
+            let start = channel * 2;
+            half::f16::from_bits(u16::from_le_bytes(
+                mapped[start..start + 2].try_into().unwrap(),
+            ))
+            .to_f32()
+        });
+        for (actual, expected) in decoded.into_iter().zip([0.5, 0.0, 0.0, 0.5]) {
+            assert!((actual - expected).abs() < f32::EPSILON);
+        }
     }
 }

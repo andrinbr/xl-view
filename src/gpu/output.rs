@@ -1,8 +1,5 @@
 //! Pure surface-selection and presentation policy shared by the GPU renderer.
 
-use std::error::Error;
-use std::fmt;
-
 #[cfg(test)]
 use wgpu::SurfaceColorSpaces;
 use wgpu::{SurfaceColorSpace, SurfaceFormatCapabilities, TextureFormat};
@@ -11,9 +8,6 @@ use winit::dpi::PhysicalSize;
 use super::display_target::{DISPLAY_INFORMATION_SOURCE, HdrTarget, HdrUnavailableReason};
 use crate::cli::{BackgroundMode, OutputMode};
 use xl_view::color::HDR_REFERENCE_WHITE_NITS;
-
-/// Source mastering peak used when HDR source metadata is missing or invalid.
-pub(super) const FALLBACK_HDR_SOURCE_PEAK_NITS: f32 = 1_000.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderingOptions {
@@ -81,32 +75,23 @@ impl SurfaceSelection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(clippy::enum_variant_names)] // Each planned name identifies the unavailable resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[expect(clippy::enum_variant_names)] // Each planned name identifies the unavailable resource.
 pub(crate) enum SurfaceOutputError {
+    #[error(
+        "requested PQ output is unavailable because the GPU surface does not advertise BT.2100 PQ with Rgb10a2Unorm; use '--output auto' or '--output sdr'"
+    )]
     PqSurfaceUnavailable,
+    #[error(
+        "requested PQ output is unavailable from {provider}: {0}; use '--output auto' or '--output sdr'",
+        provider = DISPLAY_INFORMATION_SOURCE
+    )]
     HdrTargetUnavailable(HdrUnavailableReason),
+    #[error(
+        "sRGB output is unavailable because the GPU surface does not advertise an sRGB 8-bit format/color-space pair; check the display connection and GPU driver"
+    )]
     SrgbSurfaceUnavailable,
 }
-
-impl fmt::Display for SurfaceOutputError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::PqSurfaceUnavailable => formatter.write_str(
-                "requested PQ output is unavailable because the GPU surface does not advertise BT.2100 PQ with Rgb10a2Unorm; use '--output auto' or '--output sdr'",
-            ),
-            Self::HdrTargetUnavailable(reason) => write!(
-                formatter,
-                "requested PQ output is unavailable from {DISPLAY_INFORMATION_SOURCE}: {reason}; use '--output auto' or '--output sdr'",
-            ),
-            Self::SrgbSurfaceUnavailable => formatter.write_str(
-                "sRGB output is unavailable because the GPU surface does not advertise an sRGB 8-bit format/color-space pair; check the display connection and GPU driver",
-            ),
-        }
-    }
-}
-
-impl Error for SurfaceOutputError {}
 
 pub(super) fn is_hdr_color_space(color_space: SurfaceColorSpace) -> bool {
     color_space == SurfaceColorSpace::Bt2100Pq

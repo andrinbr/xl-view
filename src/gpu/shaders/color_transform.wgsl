@@ -1,17 +1,25 @@
-fn sanitize(value: f32) -> f32 {
-    // WGSL has no portable isnan/isinf built-ins. NaN is unequal to itself;
-    // positive infinity exceeds the largest finite f32, and negative infinity
-    // is covered by the negative-input policy.
-    if value != value || value > 3.402823e38 || value < 0.0 { return 0.0; }
+fn finite_or_zero(value: f32) -> f32 {
+    // WGSL has no portable isnan/isinf built-ins.
+    if value != value || abs(value) > 3.402823e38 { return 0.0; }
     return value;
 }
 
+fn sanitize(value: f32) -> f32 {
+    return max(finite_or_zero(value), 0.0);
+}
+
+const PQ_PEAK_NITS: f32 = 10000.0;
 const PQ_M1: f32 = 0.1593017578125;
 const PQ_M2: f32 = 78.84375;
 const PQ_C1: f32 = 0.8359375;
 const PQ_C2: f32 = 18.8515625;
 const PQ_C3: f32 = 18.6875;
 const ICTCP_GAMUT_SEARCH_ITERATIONS: u32 = 12u;
+// Clip colors at most 0.1% outside BT.709 (relative to the largest channel)
+// instead of gamut mapping them. This covers f16 and conversion rounding for
+// every hue. Clipping such small excursions stays within about one
+// just-noticeable difference of the source.
+const GAMUT_BOUNDARY_TOLERANCE: f32 = 1e-3;
 
 // SMPTE ST 2084 inverse EOTF, with luminance normalized to 10,000 nits.
 fn pq_oetf_scalar(normalized_luminance: f32) -> f32 {
@@ -46,6 +54,9 @@ fn pq_eotf(encoded: vec3f) -> vec3f {
     );
 }
 
+// Only the BT.2111 diagnostics pattern uses this. Clamping shows its -7%
+// sub-black step as black. Decoded HLG images use the CPU
+// color::hlg_inverse_oetf, which mirrors BT.2100's extended range below zero.
 fn hlg_inverse_oetf(encoded: vec3f) -> vec3f {
     let value = max(encoded, vec3f(0.0));
     let a = 0.17883277;
@@ -130,7 +141,7 @@ fn tone_map_pq_hermite(
     if source_peak_nits <= display_peak_nits { return value; }
     if value >= source_peak_nits { return display_peak_nits; }
 
-    let input = pq_oetf_scalar(value / 10000.0) / source_peak_pq;
+    let input = pq_oetf_scalar(value / PQ_PEAK_NITS) / source_peak_pq;
     let output_peak = output_peak_pq / source_peak_pq;
     let knee = max(1.5 * output_peak - 0.5, 0.0);
     if input <= knee { return value; }
@@ -149,7 +160,7 @@ fn tone_map_pq_hermite(
         + (-2.0 * position3 + 3.0 * position2) * output_peak;
 
     return clamp(
-        pq_eotf_scalar(mapped * source_peak_pq) * 10000.0,
+        pq_eotf_scalar(mapped * source_peak_pq) * PQ_PEAK_NITS,
         0.0,
         display_peak_nits,
     );
@@ -178,12 +189,12 @@ fn tone_map_bt2020_max_rgb(
 }
 
 fn bt2020_nits_to_ictcp(rgb: vec3f) -> vec3f {
-    let lms_prime = pq_oetf(max(BT2020_TO_LMS * rgb, vec3f(0.0)) / 10000.0);
+    let lms_prime = pq_oetf(max(BT2020_TO_LMS * rgb, vec3f(0.0)) / PQ_PEAK_NITS);
     return LMS_PRIME_TO_ICTCP * lms_prime;
 }
 
 fn ictcp_to_bt2020_nits(ictcp: vec3f) -> vec3f {
-    let lms = pq_eotf(ICTCP_TO_LMS_PRIME * ictcp) * 10000.0;
+    let lms = pq_eotf(ICTCP_TO_LMS_PRIME * ictcp) * PQ_PEAK_NITS;
     return LMS_TO_BT2020 * lms;
 }
 
@@ -214,14 +225,23 @@ fn bound_rgb_preserving_luminance(rgb: vec3f, luminance: f32, upper: f32) -> vec
 // shared constant-I/hue ray to the same surface point, so saturated gradients
 // can flatten.
 fn gamut_map_bt2020_to_bt709_ictcp_hard(rgb_nits: vec3f, upper: f32) -> vec3f {
-    let sanitized_rgb_nits = vec3f(
-        sanitize(rgb_nits.r), sanitize(rgb_nits.g), sanitize(rgb_nits.b),
+    var finite_rgb_nits = vec3f(
+        finite_or_zero(rgb_nits.r), finite_or_zero(rgb_nits.g), finite_or_zero(rgb_nits.b),
     );
-    let direct = BT2020_TO_BT709 * sanitized_rgb_nits;
-    if rgb_is_within_cube(direct, upper) { return direct; }
+    let direct = BT2020_TO_BT709 * finite_rgb_nits;
+    let tolerance = max(max(abs(direct.r), abs(direct.g)), abs(direct.b))
+        * GAMUT_BOUNDARY_TOLERANCE;
+    if all(direct >= vec3f(-tolerance)) && all(direct <= vec3f(upper + tolerance)) {
+        return clamp(direct, vec3f(0.0), vec3f(upper));
+    }
 
-    let ictcp = bt2020_nits_to_ictcp(sanitized_rgb_nits);
-    let neutral_bt709 = vec3f(pq_eotf_scalar(ictcp.x) * 10000.0);
+    if any(finite_rgb_nits < vec3f(0.0)) {
+        finite_rgb_nits = bound_rgb_preserving_luminance(
+            finite_rgb_nits, luma_bt2020(finite_rgb_nits), upper,
+        );
+    }
+    let ictcp = bt2020_nits_to_ictcp(finite_rgb_nits);
+    let neutral_bt709 = vec3f(pq_eotf_scalar(ictcp.x) * PQ_PEAK_NITS);
     if !rgb_is_within_cube(neutral_bt709, upper) {
         return bound_rgb_preserving_luminance(direct, luma_bt709(direct), upper);
     }

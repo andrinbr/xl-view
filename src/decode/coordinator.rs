@@ -42,7 +42,8 @@ pub enum DecodeQueueDisposition {
     Queued,
     /// Work for the same image was already queued or active.
     Coalesced,
-    /// Existing prefetch work was upgraded to demand priority and identity.
+    /// Queued prefetch work, or any active work, adopted the demand's
+    /// priority and identity.
     Promoted,
 }
 
@@ -140,9 +141,10 @@ impl DecodeCoordinator {
 
     /// Queues user-requested work ahead of all prefetch work.
     ///
-    /// Repeated demand is coalesced. Queued or active prefetch work for the
-    /// same key is promoted and adopts this selection generation; if an active
-    /// limited prefetch then fails only its admission limit, it is retried as
+    /// Repeated demand for queued work is coalesced. Queued prefetch work for
+    /// the same key is promoted, and active work of either purpose adopts this
+    /// selection generation and reports `Promoted`. If an active limited
+    /// prefetch then fails only its admission limit, it is retried as
     /// unrestricted demand.
     pub fn request_demand(
         &self,
@@ -206,7 +208,6 @@ impl DecodeCoordinator {
     /// `maximum_retained_bytes` bounds the decoded storage admitted for this
     /// prefetch. Any existing job for `key`, including demand or active work,
     /// is left unchanged and reported as [`DecodeQueueDisposition::Coalesced`].
-    #[allow(clippy::too_many_arguments)] // Prefetch identity, priority, and admission limit form one explicit request.
     pub fn request_prefetch(
         &self,
         path: PathBuf,
@@ -276,13 +277,15 @@ impl DecodeCoordinator {
         state.jobs.contains_key(key)
     }
 
-    /// Stops accepting work, clears queued jobs, and suppresses active delivery.
+    /// Stops the worker, clears queued jobs, and suppresses active delivery.
     ///
-    /// The codec cannot interrupt an in-flight decode, and application shutdown
-    /// must not wait for one to finish. An already-finished worker is joined;
-    /// otherwise its handle is detached. The worker owns the state and callbacks
-    /// it still needs, observes `shutdown` before delivery, and releases those
-    /// resources when the codec call eventually returns.
+    /// Requests made after shutdown are recorded but never run. The codec
+    /// cannot interrupt an in-flight decode, and application shutdown must not
+    /// wait for one to finish. An already-finished worker is joined; otherwise
+    /// its handle is detached. The worker owns the state and callbacks it still
+    /// needs, checks `shutdown` before delivery, and releases those resources
+    /// when the codec call eventually returns. A completion that passed that
+    /// check just before shutdown may still be delivered.
     pub fn shutdown(&mut self) {
         let (state, wake) = self.state.as_ref();
         {
@@ -360,10 +363,21 @@ fn run_decode_attempt(
     }
 }
 
+/// What the worker does with a decode attempt after synchronizing it with the
+/// queue state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptOutcome {
+    Deliver,
+    /// A promoted demand failed only the former prefetch admission limit.
+    RetryAsDemand,
+    /// Shutdown started while the codec was running.
+    Suppress,
+}
+
 fn synchronize_initial_attempt(
     shared: &(Mutex<CoordinatorState>, Condvar),
     attempt: &mut DecodeAttempt,
-) -> Option<bool> {
+) -> AttemptOutcome {
     // Copy any active-prefetch promotion into the completed attempt. A demand
     // that failed only because of the former prefetch admission limit is
     // retried without that limit; all other attempts leave the queue index
@@ -376,21 +390,22 @@ fn synchronize_initial_attempt(
         attempt.job = active.clone();
     }
     if state.shutdown {
-        return None;
+        return AttemptOutcome::Suppress;
     }
-    let retry = matches!(attempt.job.purpose, DecodePurpose::Demand { .. })
-        && matches!(attempt.result, Err(DecodeError::PrefetchTooLarge { .. }));
-    if !retry {
-        state.active = None;
-        state.jobs.remove(&attempt.job.key);
+    if matches!(attempt.job.purpose, DecodePurpose::Demand { .. })
+        && matches!(attempt.result, Err(DecodeError::PrefetchTooLarge { .. }))
+    {
+        return AttemptOutcome::RetryAsDemand;
     }
-    Some(retry)
+    state.active = None;
+    state.jobs.remove(&attempt.job.key);
+    AttemptOutcome::Deliver
 }
 
 fn finish_retry(
     shared: &(Mutex<CoordinatorState>, Condvar),
     attempt: &mut DecodeAttempt,
-) -> Option<()> {
+) -> AttemptOutcome {
     let (state, _) = shared;
     let mut state = state
         .lock()
@@ -399,7 +414,11 @@ fn finish_retry(
         attempt.job = active;
     }
     state.jobs.remove(&attempt.job.key);
-    (!state.shutdown).then_some(())
+    if state.shutdown {
+        AttemptOutcome::Suppress
+    } else {
+        AttemptOutcome::Deliver
+    }
 }
 
 fn execute_decode_job(
@@ -409,14 +428,15 @@ fn execute_decode_job(
 ) -> Option<DecodeCompletion> {
     let maximum_retained_bytes = decode_retained_byte_limit(job.purpose);
     let mut attempt = run_decode_attempt(job, maximum_retained_bytes, decode);
-    if synchronize_initial_attempt(shared, &mut attempt)? {
+    let mut outcome = synchronize_initial_attempt(shared, &mut attempt);
+    if outcome == AttemptOutcome::RetryAsDemand {
         let retry = run_decode_attempt(attempt.job, None, decode);
         attempt.job = retry.job;
         attempt.result = retry.result;
         attempt.decode_time = attempt.decode_time.saturating_add(retry.decode_time);
-        finish_retry(shared, &mut attempt)?;
+        outcome = finish_retry(shared, &mut attempt);
     }
-    Some(attempt.into_completion())
+    (outcome == AttemptOutcome::Deliver).then(|| attempt.into_completion())
 }
 
 fn run_coordinator(

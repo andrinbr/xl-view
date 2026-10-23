@@ -127,7 +127,7 @@ impl<'window> HdrSurface<'window> {
         self.set_vulkan_metadata(metadata)
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn set_vulkan_metadata(&self, metadata: HdrMetadata) -> SignalStatus {
         // SAFETY: The guards remain alive for the complete raw Vulkan call.
         let Some(hal_surface) = (unsafe { self.surface.as_hal::<wgpu::hal::api::Vulkan>() }) else {
@@ -194,7 +194,7 @@ pub async fn request_device<'window>(
     Ok((device, queue, hdr_surface))
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn try_request_vulkan_device(
     adapter: &wgpu::Adapter,
     descriptor: &wgpu::DeviceDescriptor<'_>,
@@ -230,7 +230,7 @@ fn try_request_vulkan_device(
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
+#[expect(clippy::float_cmp)]
 mod tests {
     use super::*;
 

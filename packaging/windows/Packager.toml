@@ -2,7 +2,7 @@
 # fields such as the version in sync with Cargo.toml.
 name = "xl-view"
 product-name = "XL-View"
-version = "0.3.1"
+version = "0.4.0"
 identifier = "io.github.andrinbr.xl_view"
 description = "A minimalist HDR image viewer optimized for large images"
 authors = ["Andrin Brunner"]

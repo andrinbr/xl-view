@@ -40,11 +40,11 @@
 
     <h2>License summary</h2>
     <ul>
-      <li><a href="#MIT">MIT License</a> (uses: 218)</li>
+      <li><a href="#MIT">MIT License</a> (uses: 212)</li>
       <li><a href="#Unicode-3.0">Unicode License v3</a> (uses: 19)</li>
       <li><a href="#Apache-2.0">Apache License 2.0</a> (uses: 14)</li>
-      <li><a href="#BSD-3-Clause">BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License</a> (uses: 4)</li>
-      <li><a href="#BSD-2-Clause">BSD 2-Clause &quot;Simplified&quot; License</a> (uses: 3)</li>
+      <li><a href="#BSD-3-Clause">BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License</a> (uses: 8)</li>
+      <li><a href="#BSD-2-Clause">BSD 2-Clause &quot;Simplified&quot; License</a> (uses: 6)</li>
       <li><a href="#GPL-3.0-only">GNU General Public License v3.0 only</a> (uses: 3)</li>
       <li><a href="#ISC">ISC License</a> (uses: 1)</li>
       <li><a href="#Zlib">zlib License</a> (uses: 1)</li>
@@ -56,7 +56,7 @@
       <ul>
         <li>
           <a href="https://github.com/awxkee/moxcms.git">
-            moxcms 0.8.1
+            moxcms 0.9.1
           </a>
         </li>
         <li>
@@ -485,37 +485,37 @@
       <ul>
         <li>
           <a href="https://github.com/rust-windowing/winit">
-            winit 0.31.0-beta.2
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/rust-windowing/winit">
             dpi 0.1.2
           </a>
         </li>
         <li>
           <a href="https://github.com/rust-windowing/winit">
-            winit-appkit 0.31.0-beta.2
+            winit-appkit 0.31.0-beta.3
           </a>
         </li>
         <li>
           <a href="https://github.com/rust-windowing/winit">
-            winit-common 0.31.0-beta.2
+            winit-common 0.31.0-beta.3
           </a>
         </li>
         <li>
           <a href="https://github.com/rust-windowing/winit">
-            winit-core 0.31.0-beta.2
+            winit-core 0.31.0-beta.3
           </a>
         </li>
         <li>
           <a href="https://github.com/rust-windowing/winit">
-            winit-wayland 0.31.0-beta.2
+            winit-wayland 0.31.0-beta.3
           </a>
         </li>
         <li>
           <a href="https://github.com/rust-windowing/winit">
-            winit-win32 0.31.0-beta.2
+            winit-win32 0.31.0-beta.3
+          </a>
+        </li>
+        <li>
+          <a href="https://github.com/rust-windowing/winit">
+            winit 0.31.0-beta.3
           </a>
         </li>
       </ul>
@@ -825,6 +825,203 @@ limitations under the License.
       <h3>Used by</h3>
       <ul>
         <li>
+          <a href="https://github.com/kamadak/exif-rs">
+            kamadak-exif 0.6.1
+          </a>
+        </li>
+      </ul>
+      <pre>//
+// Copyright (c) 2016 KAMADA Ken&#x27;ichi.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+// 1. Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+// 2. Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS &#x60;&#x60;AS IS&#x27;&#x27; AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+// FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+// DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+// OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+// HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+// LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+// OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+// SUCH DAMAGE.
+//
+
+// Macros for testing.
+
+macro_rules! assert_ok {
+    ($expr:expr, $value:expr) &#x3D;&gt; (
+        match $expr {
+            Ok(v) &#x3D;&gt; assert_eq!(v, $value),
+            r &#x3D;&gt; panic!(&quot;assertion failed: unexpected {:?}&quot;, r),
+        }
+    )
+}
+
+macro_rules! assert_pat {
+    ($expr:expr, $pat:pat) &#x3D;&gt; (
+        match $expr {
+            $pat &#x3D;&gt; {},
+            ref r &#x3D;&gt; panic!(&quot;assertion failed: unexpected {:?}&quot;, r),
+        }
+    )
+}
+
+macro_rules! assert_err_pat {
+    ($expr:expr, $variant:pat) &#x3D;&gt; (
+        match $expr {
+            Err($variant) &#x3D;&gt; {},
+            r &#x3D;&gt; panic!(&quot;assertion failed: unexpected {:?}&quot;, r),
+        }
+    )
+}
+
+// This macro is intended to be used with std::io::Error, but other
+// types with kind() will also work.
+macro_rules! assert_err_kind {
+    ($expr:expr, $kind:expr) &#x3D;&gt; (
+        match $expr {
+            Err(e) &#x3D;&gt; assert_eq!(e.kind(), $kind),
+            r &#x3D;&gt; panic!(&quot;assertion failed: unexpected {:?}&quot;, r),
+        }
+    )
+}
+</pre>
+    </section>
+    <section>
+      <h3>Used by</h3>
+      <ul>
+        <li>
+          <a href="https://github.com/kamadak/exif-rs">
+            kamadak-exif 0.6.1
+          </a>
+        </li>
+      </ul>
+      <pre>//
+// Copyright (c) 2016 KAMADA Ken&#x27;ichi.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+// 1. Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+// 2. Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS &#x60;&#x60;AS IS&#x27;&#x27; AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+// FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+// DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+// OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+// HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+// LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+// OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+// SUCH DAMAGE.
+//
+
+extern crate exif;
+
+use std::env;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+
+fn main() {
+    for path in env::args_os().skip(1).map(PathBuf::from) {
+        if let Err(e) &#x3D; dump_file(&amp;path) {
+            println!(&quot;{}: {}&quot;, path.display(), e);
+        }
+    }
+}
+
+fn dump_file(path: &amp;Path) -&gt; Result&lt;(), exif::Error&gt; {
+    let file &#x3D; File::open(path)?;
+
+    // To parse strictly:
+    // let exif &#x3D; exif::Reader::new()
+    //     .read_from_container(&amp;mut BufReader::new(&amp;file))?;
+
+    // To parse with continue-on-error mode:
+    let exif &#x3D; exif::Reader::new()
+        .continue_on_error(true)
+        .read_from_container(&amp;mut BufReader::new(&amp;file))
+        .or_else(|e| e.distill_partial_result(|errors| {
+            eprintln!(&quot;{}: {} warning(s)&quot;, path.display(), errors.len());
+            errors.iter().for_each(|e| eprintln!(&quot;  {}&quot;, e));
+        }))?;
+
+    println!(&quot;{}&quot;, path.display());
+    for f in exif.fields() {
+        println!(&quot;  {}/{}: {}&quot;,
+                 f.ifd_num.index(), f.tag,
+                 f.display_value().with_unit(&amp;exif));
+        println!(&quot;      {:?}&quot;, f.value);
+    }
+    Ok(())
+}
+</pre>
+    </section>
+    <section>
+      <h3>Used by</h3>
+      <ul>
+        <li>
+          <a href="https://github.com/kamadak/exif-rs">
+            kamadak-exif 0.6.1
+          </a>
+        </li>
+      </ul>
+      <pre>//
+// Copyright (c) 2016 KAMADA Ken&#x27;ichi.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+// 1. Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+// 2. Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS &#x60;&#x60;AS IS&#x27;&#x27; AND
+// ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+// FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+// DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+// OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+// HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+// LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+// OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+// SUCH DAMAGE.
+//
+
+use std::mem;
+
+// This library assumes that usize is not smaller than u32.
+#[test]
+fn size_of_usize() {
+    assert!(mem::size_of::&lt;usize&gt;() &gt;&#x3D; mem::size_of::&lt;u32&gt;());
+}
+</pre>
+    </section>
+    <section>
+      <h3>Used by</h3>
+      <ul>
+        <li>
           <a href="https://github.com/droundy/arrayref">
             arrayref 0.3.9
           </a>
@@ -978,7 +1175,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
       <ul>
         <li>
           <a href="https://github.com/dropbox/rust-alloc-no-stdlib">
-            alloc-no-stdlib 2.0.4
+            alloc-no-stdlib 3.0.0
           </a>
         </li>
       </ul>
@@ -1001,7 +1198,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS &quot;AS IS&
       <ul>
         <li>
           <a href="https://github.com/dropbox/rust-alloc-no-stdlib">
-            alloc-stdlib 0.2.4
+            alloc-stdlib 0.3.0
           </a>
         </li>
       </ul>
@@ -1019,12 +1216,65 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS &quot;AS IS&
 </pre>
     </section>
     <section>
+      <h3>Used by</h3>
+      <ul>
+        <li>
+          <a href="https://github.com/libjxl/jxl-rs">
+            jxl 0.8.0
+          </a>
+        </li>
+        <li>
+          <a href="https://github.com/libjxl/jxl-rs">
+            jxl_macros 0.8.0
+          </a>
+        </li>
+        <li>
+          <a href="https://github.com/libjxl/jxl-rs">
+            jxl_simd 0.8.0
+          </a>
+        </li>
+        <li>
+          <a href="https://github.com/libjxl/jxl-rs">
+            jxl_transforms 0.8.0
+          </a>
+        </li>
+      </ul>
+      <pre>Copyright (c) the JPEG XL Project Authors.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS &quot;AS IS&quot;
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+</pre>
+    </section>
+    <section>
       <h2 id="GPL-3.0-only">GNU General Public License v3.0 only</h2>
       <h3>Used by</h3>
       <ul>
         <li>
           <a href="https://github.com/andrinbr/xl-view">
-            xl-view 0.3.1
+            xl-view 0.4.0
           </a>
         </li>
         <li>
@@ -1301,10 +1551,42 @@ THIS SOFTWARE.
       <h3>Used by</h3>
       <ul>
         <li>
-          <a href="https://github.com/rust-lang-nursery/lazy-static.rs">
-            lazy_static 1.5.0
+          <a href="https://github.com/katharostech/cfg_aliases">
+            cfg_aliases 0.2.2
           </a>
         </li>
+      </ul>
+      <pre># 3rd Party Notices
+
+The &#x60;cfg_aliases!&#x60; macro uses a lot of the code from [&#x60;tectonic_cfg_support::target_cfg!&#x60;] macro which is under the following license:
+
+[&#x60;tectonic_cfg_support::target_cfg!&#x60;]: https://github.com/tectonic-typesetting/tectonic/blob/f2439b936470ad27bdf92882064bc4702ee01899/cfg_support/src/lib.rs#L166
+
+    tectonic_cfg_support is licensed under the MIT License.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the “Software”), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+---
+</pre>
+    </section>
+    <section>
+      <h3>Used by</h3>
+      <ul>
         <li>
           <a href="https://github.com/rayon-rs/rayon">
             rayon-core 1.13.0
@@ -1435,22 +1717,22 @@ DEALINGS IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/rust-lang/cc-rs">
-            cc 1.4.0
+            cc 1.8.0
           </a>
         </li>
         <li>
           <a href="https://github.com/rust-lang/cfg-if">
-            cfg-if 1.0.4
+            cfg-if 1.0.5
           </a>
         </li>
         <li>
           <a href="https://github.com/rust-lang/cc-rs">
-            find-msvc-tools 0.1.9
+            find-msvc-tools 0.1.14
           </a>
         </li>
         <li>
           <a href="https://github.com/rust-lang/pkg-config-rs">
-            pkg-config 0.3.33
+            pkg-config 0.3.34
           </a>
         </li>
         <li>
@@ -1527,12 +1809,17 @@ DEALINGS IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/bitflags/bitflags">
-            bitflags 2.13.1
+            bitflags 2.13.2
           </a>
         </li>
         <li>
           <a href="https://github.com/rust-lang/log">
-            log 0.4.33
+            log 0.4.34
+          </a>
+        </li>
+        <li>
+          <a href="https://github.com/rust-num/num-derive">
+            num-derive 0.4.2
           </a>
         </li>
         <li>
@@ -1542,7 +1829,7 @@ DEALINGS IN THE SOFTWARE.
         </li>
         <li>
           <a href="https://github.com/rust-lang/regex">
-            regex-automata 0.4.16
+            regex-automata 0.4.18
           </a>
         </li>
         <li>
@@ -1613,7 +1900,7 @@ IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/rust-lang/flate2-rs">
-            flate2 1.1.9
+            flate2 1.1.10
           </a>
         </li>
       </ul>
@@ -1649,7 +1936,7 @@ DEALINGS IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/rayon-rs/either">
-            either 1.17.0
+            either 1.19.0
           </a>
         </li>
       </ul>
@@ -1685,7 +1972,7 @@ DEALINGS IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/smithay/wayland-rs">
-            wayland-backend 0.3.16
+            wayland-backend 0.3.17
           </a>
         </li>
         <li>
@@ -1760,7 +2047,7 @@ THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/reem/rust-ordered-float">
-            ordered-float 5.3.0
+            ordered-float 5.5.0
           </a>
         </li>
       </ul>
@@ -2101,7 +2388,7 @@ DEALINGS IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/indexmap-rs/indexmap">
-            indexmap 2.14.0
+            indexmap 2.14.2
           </a>
         </li>
       </ul>
@@ -2137,7 +2424,7 @@ DEALINGS IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/indexmap-rs/equivalent">
-            equivalent 1.0.2
+            equivalent 1.0.3
           </a>
         </li>
       </ul>
@@ -2272,6 +2559,42 @@ DEALINGS IN THE SOFTWARE.</pre>
       <h3>Used by</h3>
       <ul>
         <li>
+          <a href="https://github.com/Manishearth/array-init/">
+            array-init 2.1.0
+          </a>
+        </li>
+      </ul>
+      <pre>Copyright (c) 2017-2020 The array-init developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+</pre>
+    </section>
+    <section>
+      <h3>Used by</h3>
+      <ul>
+        <li>
           <a href="https://github.com/cuviper/autocfg">
             autocfg 1.5.1
           </a>
@@ -2350,7 +2673,7 @@ DEALINGS IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/servo/rust-smallvec">
-            smallvec 1.15.2
+            smallvec 1.16.3
           </a>
         </li>
       </ul>
@@ -2415,7 +2738,7 @@ THE SOFTWARE.</pre>
       <ul>
         <li>
           <a href="https://github.com/Smithay/calloop">
-            calloop 0.14.4
+            calloop 0.14.5
           </a>
         </li>
       </ul>
@@ -2474,42 +2797,6 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
-</pre>
-    </section>
-    <section>
-      <h3>Used by</h3>
-      <ul>
-        <li>
-          <a href="https://github.com/tokio-rs/slab">
-            slab 0.4.12
-          </a>
-        </li>
-      </ul>
-      <pre>Copyright (c) 2019 Carl Lerche
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the &quot;Software&quot;), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
 </pre>
     </section>
     <section>
@@ -2700,7 +2987,7 @@ THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/rodrigocfd/winsafe">
-            winsafe 0.0.28
+            winsafe 0.0.29
           </a>
         </li>
       </ul>
@@ -2795,7 +3082,7 @@ SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/LukasKalbertodt/litrs">
-            litrs 1.0.0
+            litrs 1.0.1
           </a>
         </li>
       </ul>
@@ -3178,22 +3465,22 @@ DEALINGS IN THE SOFTWARE.
         </li>
         <li>
           <a href="https://github.com/clap-rs/clap">
-            clap 4.6.5
+            clap 4.6.7
           </a>
         </li>
         <li>
           <a href="https://github.com/clap-rs/clap">
-            clap_builder 4.6.5
+            clap_builder 4.6.7
           </a>
         </li>
         <li>
           <a href="https://github.com/clap-rs/clap">
-            clap_derive 4.6.4
+            clap_derive 4.6.7
           </a>
         </li>
         <li>
           <a href="https://github.com/clap-rs/clap">
-            clap_lex 1.1.0
+            clap_lex 1.1.1
           </a>
         </li>
         <li>
@@ -3213,22 +3500,22 @@ DEALINGS IN THE SOFTWARE.
         </li>
         <li>
           <a href="https://github.com/toml-rs/toml">
-            serde_spanned 1.1.1
+            serde_spanned 1.1.2
           </a>
         </li>
         <li>
           <a href="https://github.com/toml-rs/toml">
-            toml 1.1.4+spec-1.1.0
+            toml 1.1.8+spec-1.1.0
           </a>
         </li>
         <li>
           <a href="https://github.com/toml-rs/toml">
-            toml_datetime 1.1.1+spec-1.1.0
+            toml_datetime 1.1.2+spec-1.1.0
           </a>
         </li>
         <li>
           <a href="https://github.com/toml-rs/toml">
-            toml_parser 1.1.3+spec-1.1.0
+            toml_parser 1.1.5+spec-1.1.0
           </a>
         </li>
       </ul>
@@ -3258,7 +3545,7 @@ SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/rust-lang/libc">
-            libc 0.2.189
+            libc 0.2.190
           </a>
         </li>
       </ul>
@@ -3366,7 +3653,7 @@ DEALINGS IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/BenjaminRi/winresource">
-            winresource 0.1.31
+            winresource 0.1.34
           </a>
         </li>
       </ul>
@@ -3402,7 +3689,7 @@ DEALINGS IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/mystor/synstructure">
-            synstructure 0.13.2
+            synstructure 0.14.0
           </a>
         </li>
       </ul>
@@ -3420,12 +3707,12 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
       <ul>
         <li>
           <a href="https://github.com/linebender/resvg">
-            resvg 0.47.0
+            resvg 0.48.1
           </a>
         </li>
         <li>
           <a href="https://github.com/linebender/resvg">
-            usvg 0.47.0
+            usvg 0.48.1
           </a>
         </li>
       </ul>
@@ -3461,12 +3748,12 @@ DEALINGS IN THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/google/zerocopy">
-            zerocopy-derive 0.8.55
+            zerocopy-derive 0.8.63
           </a>
         </li>
         <li>
           <a href="https://github.com/google/zerocopy">
-            zerocopy 0.8.55
+            zerocopy 0.8.63
           </a>
         </li>
       </ul>
@@ -3538,6 +3825,82 @@ DEALINGS IN THE SOFTWARE.
       <h3>Used by</h3>
       <ul>
         <li>
+          <a href="https://github.com/smithay/wayland-rs">
+            wayland-protocols 0.32.13
+          </a>
+        </li>
+      </ul>
+      <pre>Copyright © 2008-2013 Kristian Høgsberg
+Copyright © 2010-2013 Intel Corporation
+Copyright © 2013      Rafael Antognolli
+Copyright © 2013      Jasper St. Pierre
+Copyright © 2014      Jonas Ådahl
+Copyright © 2014      Jason Ekstrand
+Copyright © 2014-2015 Collabora, Ltd.
+Copyright © 2015      Red Hat Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the &quot;Software&quot;),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+---
+
+The above is the version of the MIT &quot;Expat&quot; License used by X.org:
+
+    http://cgit.freedesktop.org/xorg/xserver/tree/COPYING
+</pre>
+    </section>
+    <section>
+      <h3>Used by</h3>
+      <ul>
+        <li>
+          <a href="https://github.com/Roughsketch/imagesize">
+            imagesize 0.15.0
+          </a>
+        </li>
+      </ul>
+      <pre>MIT License
+
+Copyright (c) 2017 Maiddog
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the &quot;Software&quot;), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+</pre>
+    </section>
+    <section>
+      <h3>Used by</h3>
+      <ul>
+        <li>
           <a href="https://github.com/nvzqz/static-assertions-rs">
             static_assertions 1.1.0
           </a>
@@ -3571,7 +3934,7 @@ SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/srijs/rust-crc32fast">
-            crc32fast 1.5.0
+            crc32fast 1.5.2
           </a>
         </li>
       </ul>
@@ -3608,7 +3971,7 @@ SOFTWARE.
         </li>
         <li>
           <a href="https://github.com/Lokathor/bytemuck">
-            bytemuck_derive 1.11.0
+            bytemuck_derive 1.12.1
           </a>
         </li>
       </ul>
@@ -3908,27 +4271,27 @@ SOFTWARE.</pre>
       <ul>
         <li>
           <a href="https://github.com/gfx-rs/wgpu">
-            naga-types 30.0.0
+            naga-types 30.0.1
           </a>
         </li>
         <li>
           <a href="https://github.com/gfx-rs/wgpu">
-            naga 30.0.0
+            naga 30.0.1
           </a>
         </li>
         <li>
           <a href="https://github.com/gfx-rs/wgpu">
-            wgpu-core-deps-apple 30.0.0
+            wgpu-core-deps-apple 30.0.1
           </a>
         </li>
         <li>
           <a href="https://github.com/gfx-rs/wgpu">
-            wgpu-core-deps-windows-linux-android 30.0.0
+            wgpu-core-deps-windows-linux-android 30.0.1
           </a>
         </li>
         <li>
           <a href="https://github.com/gfx-rs/wgpu">
-            wgpu-core 30.0.0
+            wgpu-core 30.0.1
           </a>
         </li>
         <li>
@@ -3938,17 +4301,17 @@ SOFTWARE.</pre>
         </li>
         <li>
           <a href="https://github.com/gfx-rs/wgpu">
-            wgpu-naga-bridge 30.0.0
+            wgpu-naga-bridge 30.0.1
           </a>
         </li>
         <li>
           <a href="https://github.com/gfx-rs/wgpu">
-            wgpu-types 30.0.0
+            wgpu-types 30.0.1
           </a>
         </li>
         <li>
           <a href="https://github.com/gfx-rs/wgpu">
-            wgpu 30.0.0
+            wgpu 30.0.1
           </a>
         </li>
       </ul>
@@ -3979,23 +4342,23 @@ SOFTWARE.
       <h3>Used by</h3>
       <ul>
         <li>
-          <a href="https://github.com/rust-windowing/winit">
-            dpi 0.1.2
-          </a>
-        </li>
-        <li>
           <a href="https://github.com/madsmtm/objc2">
             block2 0.6.2
           </a>
         </li>
         <li>
           <a href="https://github.com/dropbox/rust-brotli-decompressor">
-            brotli-decompressor 5.0.3
+            brotli-decompressor 6.1.0
           </a>
         </li>
         <li>
           <a href="https://github.com/madsmtm/objc2">
             dispatch2 0.3.1
+          </a>
+        </li>
+        <li>
+          <a href="https://github.com/rust-windowing/winit">
+            dpi 0.1.2
           </a>
         </li>
         <li>
@@ -4050,17 +4413,12 @@ SOFTWARE.
         </li>
         <li>
           <a href="https://github.com/madsmtm/objc2">
-            objc2 0.6.4
+            objc2 0.6.5
           </a>
         </li>
         <li>
           <a href="https://github.com/aclysma/profiling">
             profiling 1.0.18
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/jedisct1/rust-siphash">
-            siphasher 1.0.3
           </a>
         </li>
         <li>
@@ -4184,6 +4542,11 @@ SOFTWARE.
             miniz_oxide 0.8.9
           </a>
         </li>
+        <li>
+          <a href="https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide">
+            miniz_oxide 0.9.1
+          </a>
+        </li>
       </ul>
       <pre>MIT License
 
@@ -4192,6 +4555,46 @@ Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
 Copyright (c) 2017 Frommi
 Copyright (c) 2017-2024 oyvindln
 
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the &quot;Software&quot;), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+</pre>
+    </section>
+    <section>
+      <h3>Used by</h3>
+      <ul>
+        <li>
+          <a href="https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide">
+            miniz_oxide 0.8.9
+          </a>
+        </li>
+        <li>
+          <a href="https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide">
+            miniz_oxide 0.9.1
+          </a>
+        </li>
+      </ul>
+      <pre>MIT License
+
+Copyright 2013-2014 RAD Game Tools and Valve Software
+Copyright 2010-2014 Rich Geldreich and Tenacious Software LLC
+Copyright (c) 2017 Frommi
+Copyright (c) 2017-2024 oyvindln
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the &quot;Software&quot;), to deal
@@ -4282,32 +4685,30 @@ SOFTWARE.
       <h3>Used by</h3>
       <ul>
         <li>
-          <a href="https://github.com/Roughsketch/imagesize">
-            imagesize 0.14.0
+          <a href="https://github.com/smithay/wayland-rs">
+            wayland-protocols-plasma 0.3.12
           </a>
         </li>
       </ul>
-      <pre>MIT License
-
-Copyright (c) 2017 Maiddog
+      <pre>MIT License Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the &quot;Software&quot;), to deal
 in the Software without restriction, including without limitation the rights
 to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+copies of the Software, and to permit persons to whom the Software is furnished
+to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
 
 THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
+OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
+OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 </pre>
     </section>
     <section>
@@ -4329,68 +4730,8 @@ SOFTWARE.
           </a>
         </li>
         <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-bitstream 1.1.0
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-coding 1.0.1
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-color 0.11.0
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-frame 0.13.3
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-grid 0.6.2
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-image 0.13.0
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-jbr 0.2.1
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-modular 0.11.3
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-oxide-common 1.0.0
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-oxide 0.12.6
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-render 0.12.4
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-threadpool 1.0.0
-          </a>
-        </li>
-        <li>
-          <a href="https://github.com/tirr-c/jxl-oxide.git">
-            jxl-vardct 0.11.1
+          <a href="https://github.com/rust-lang-nursery/lazy-static.rs">
+            lazy_static 1.5.1
           </a>
         </li>
         <li>
@@ -4430,7 +4771,7 @@ SOFTWARE.
         </li>
         <li>
           <a href="https://github.com/bytecodealliance/rustix">
-            rustix 1.1.4
+            rustix 1.1.5
           </a>
         </li>
         <li>
@@ -4439,8 +4780,8 @@ SOFTWARE.
           </a>
         </li>
         <li>
-          <a href="https://github.com/rust-analyzer/smol_str">
-            smol_str 0.3.2
+          <a href="https://github.com/rust-lang/rust-analyzer/tree/master/lib/smol_str">
+            smol_str 0.3.6
           </a>
         </li>
         <li>
@@ -4450,22 +4791,22 @@ SOFTWARE.
         </li>
         <li>
           <a href="https://github.com/dtolnay/syn">
-            syn 3.0.3
+            syn 3.0.9
           </a>
         </li>
         <li>
           <a href="https://github.com/dtolnay/thiserror">
-            thiserror-impl 2.0.19
+            thiserror-impl 2.0.21
           </a>
         </li>
         <li>
           <a href="https://github.com/dtolnay/thiserror">
-            thiserror 2.0.19
+            thiserror 2.0.21
           </a>
         </li>
         <li>
           <a href="https://github.com/dtolnay/unicode-ident">
-            unicode-ident 1.0.24
+            unicode-ident 1.0.27
           </a>
         </li>
       </ul>
@@ -4565,6 +4906,11 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
             raw-window-metal 1.1.0
           </a>
         </li>
+        <li>
+          <a href="https://github.com/jedisct1/rust-siphash">
+            siphasher 1.0.4
+          </a>
+        </li>
       </ul>
       <pre>Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the &quot;Software&quot;), to deal
@@ -4617,14 +4963,14 @@ SOFTWARE.
       <h3>Used by</h3>
       <ul>
         <li>
-          <a href="https://github.com/marshallpierce/rust-base64">
-            base64 0.22.1
+          <a href="https://github.com/tokio-rs/tracing">
+            tracing-core 0.1.36
           </a>
         </li>
       </ul>
       <pre>The MIT License (MIT)
 
-Copyright (c) 2015 Alice Maz
+Copyright (c) 2014 Mathijs van de Nes
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the &quot;Software&quot;), to deal
@@ -4633,21 +4979,26 @@ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 copies of the Software, and to permit persons to whom the Software is
 furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 </pre>
     </section>
     <section>
       <h3>Used by</h3>
       <ul>
+        <li>
+          <a href="https://github.com/BurntSushi/byteorder">
+            byteorder 1.5.0
+          </a>
+        </li>
         <li>
           <a href="https://github.com/BurntSushi/memchr">
             memchr 2.8.3
@@ -4716,7 +5067,7 @@ SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/GuillaumeGomez/sysinfo">
-            sysinfo 0.38.4
+            sysinfo 0.39.6
           </a>
         </li>
       </ul>
@@ -4844,50 +5195,18 @@ SOFTWARE.
       <h3>Used by</h3>
       <ul>
         <li>
-          <a href="https://github.com/RazrFalcon/xmlwriter">
-            xmlwriter 0.1.0
-          </a>
-        </li>
-      </ul>
-      <pre>The MIT License (MIT)
-
-Copyright (c) 2019 Reizner Evgeniy
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the &quot;Software&quot;), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-</pre>
-    </section>
-    <section>
-      <h3>Used by</h3>
-      <ul>
-        <li>
           <a href="https://github.com/crossbeam-rs/crossbeam">
-            crossbeam-deque 0.8.7
+            crossbeam-deque 0.8.8
           </a>
         </li>
         <li>
           <a href="https://github.com/crossbeam-rs/crossbeam">
-            crossbeam-epoch 0.9.20
+            crossbeam-epoch 0.9.21
           </a>
         </li>
         <li>
           <a href="https://github.com/crossbeam-rs/crossbeam">
-            crossbeam-utils 0.8.22
+            crossbeam-utils 0.8.23
           </a>
         </li>
       </ul>
@@ -5055,7 +5374,7 @@ THE SOFTWARE.
       <ul>
         <li>
           <a href="https://github.com/dtolnay/unicode-ident">
-            unicode-ident 1.0.24
+            unicode-ident 1.0.27
           </a>
         </li>
       </ul>
@@ -5105,62 +5424,62 @@ authorization of the copyright holder.
       <ul>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            icu_collections 2.2.0
+            icu_collections 2.3.0
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            icu_locale_core 2.2.0
+            icu_locale_core 2.3.0
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            icu_normalizer 2.2.0
+            icu_normalizer 2.3.0
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            icu_normalizer_data 2.2.0
+            icu_normalizer_data 2.3.0
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            icu_properties 2.2.0
+            icu_properties 2.3.0
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            icu_properties_data 2.2.0
+            icu_properties_data 2.3.0
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            icu_provider 2.2.0
+            icu_provider 2.3.1
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            litemap 0.8.2
+            litemap 0.8.3
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            potential_utf 0.1.5
+            potential_utf 0.1.6
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            tinystr 0.8.3
+            tinystr 0.8.4
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            writeable 0.6.3
+            writeable 0.6.4
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            yoke-derive 0.8.2
+            yoke-derive 0.8.4
           </a>
         </li>
         <li>
@@ -5170,7 +5489,7 @@ authorization of the copyright holder.
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            zerofrom-derive 0.1.7
+            zerofrom-derive 0.1.8
           </a>
         </li>
         <li>
@@ -5180,17 +5499,17 @@ authorization of the copyright holder.
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            zerotrie 0.2.4
+            zerotrie 0.2.5
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            zerovec-derive 0.11.3
+            zerovec-derive 0.11.6
           </a>
         </li>
         <li>
           <a href="https://github.com/unicode-org/icu4x">
-            zerovec 0.11.6
+            zerovec 0.11.8
           </a>
         </li>
       </ul>

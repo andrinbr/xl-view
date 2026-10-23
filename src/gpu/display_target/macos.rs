@@ -20,7 +20,8 @@ impl DisplayTargetProvider {
     pub(in crate::gpu) fn new(notify_changed: DisplayChangeNotifier) -> Self {
         let center = NSNotificationCenter::defaultCenter();
         // AppKit posts this for display configuration and EDR headroom changes.
-        // objc2 exposes the typed AppKit constant as an unsafe extern static.
+        // objc2 exposes the typed AppKit constant only as an unsafe extern
+        // static, and this crate forbids unsafe code, so name it by string.
         let observer = create_observer(
             &center,
             ns_string!("NSApplicationDidChangeScreenParametersNotification"),
@@ -31,7 +32,7 @@ impl DisplayTargetProvider {
         }
     }
 
-    #[allow(clippy::unused_self)] // The provider also owns the notification observer.
+    #[expect(clippy::unused_self)] // The provider also owns the notification observer.
     pub(in crate::gpu) fn target(&self, info: &wgpu::DisplayHdrInfo) -> HdrTarget {
         // wgpu resolves the window's screen, only normalize its EDR values here.
         let headroom = info.headroom.unwrap_or_default();

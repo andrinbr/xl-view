@@ -6,6 +6,8 @@ use std::time::Duration;
 use sysinfo::System;
 use xl_view::decode::{DecodedImage, ImageKey};
 
+use xl_view::units::u64_from_usize;
+
 const GIB: u64 = 1024 * 1024 * 1024;
 const MINIMUM_AUTOMATIC_CACHE_BYTES: u64 = 2 * GIB;
 
@@ -169,7 +171,7 @@ impl CachedDecodedImage {
     }
 
     fn memory_cost_bytes(&self) -> u64 {
-        u64::try_from(self.image.memory_cost_bytes).unwrap_or(u64::MAX)
+        u64_from_usize(self.image.memory_cost_bytes)
     }
 }
 

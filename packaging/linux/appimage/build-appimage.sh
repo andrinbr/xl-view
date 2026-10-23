@@ -52,6 +52,10 @@ desktop="$appdir/usr/share/applications/$APPLICATION_ID.desktop"
 appdata="$appdir/usr/share/metainfo/$APPLICATION_ID.appdata.xml"
 license_dir="$appdir/usr/share/licenses/xl-view"
 
+# AppRun must also be executable by non-owners, such as in Firejail mounts.
+test "$(stat -c '%a' "$appdir/AppRun")" = 755 \
+    || { echo "AppRun must have mode 0755 so non-owners can execute it" >&2; exit 1; }
+
 # Check AppImage integration files and license payloads.
 test -e "$appdir/$APPLICATION_ID.desktop"
 test -f "$appdir/.DirIcon"

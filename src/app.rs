@@ -11,8 +11,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-#[cfg(test)]
-use winit::cursor::CursorIcon;
 use winit::data_transfer::{DataTransferId, TypeHint, TypedData};
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{
@@ -23,8 +21,6 @@ use winit::event_loop::{
     ActiveEventLoop, AsyncRequestSerial, ControlFlow, DndAction, EventLoop, EventLoopProxy,
 };
 use winit::keyboard::ModifiersState;
-#[cfg(test)]
-use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::monitor::Fullscreen;
 #[cfg(target_os = "linux")]
 use winit::platform::{
@@ -37,14 +33,15 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::APPLICATION_ID;
 use crate::APPLICATION_NAME;
 use crate::app_icon;
-use crate::cli::{BackgroundMode, Cli, OutputMode};
+use crate::cli::Cli;
+#[cfg(target_os = "linux")]
+use crate::cli::OutputMode;
 use crate::diagnostics;
 use crate::error::{AppError, RuntimeError};
 use crate::gpu;
 use xl_view::color::HDR_REFERENCE_WHITE_NITS;
 use xl_view::decode::{DecodeCompletion, DecodeCoordinator, DecodeLimits, ImageKey};
-#[cfg(test)]
-use xl_view::metadata::{ExifMetadata, XmpMetadata};
+use xl_view::units::{BYTES_PER_MIB, mib_to_bytes, milliseconds};
 
 mod decoded_cache;
 mod files;
@@ -54,19 +51,11 @@ mod session;
 
 use self::decoded_cache::automatic_decoded_cache_bytes;
 use self::files::{
-    FilePickerResult, FolderDirection, NeighborPaths, adjacent_image_path, dropped_file_paths,
-    first_image_path, neighboring_image_paths, select_image_file,
+    FilePickerResult, FolderDirection, FolderReadError, NeighborPaths, adjacent_image_path,
+    dropped_file_paths, first_image_path, neighboring_image_paths, select_image_file,
 };
-#[cfg(test)]
-use self::files::{choose_adjacent_path, file_name};
 use self::input::{
     FullscreenState, KeyboardAction, PrimaryClickTracker, image_cursor, keyboard_action,
-};
-#[cfg(test)]
-use self::overlay::{DecodeTiming, format_exif_datetime, source_encoding_details, xmp_rating_row};
-use self::overlay::{
-    attribution_metadata_rows, capture_metadata_rows, decode_summary, dimensions_summary,
-    source_range_summary,
 };
 use self::session::{
     DecodeEffect, ImageSession, NavigationEffect, PendingImageInstall, SelectionEffect,
@@ -76,6 +65,13 @@ const FULLSCREEN_CURSOR_HIDE_DELAY: Duration = Duration::from_secs(2);
 const DISPLAY_METADATA_REFRESH_DELAY: Duration = Duration::from_millis(150);
 #[cfg(target_os = "linux")]
 const WAYLAND_MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const INITIAL_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1024.0, 682.0);
+const KEYBOARD_ZOOM_IN_FACTOR: f64 = 1.25;
+const KEYBOARD_ZOOM_OUT_FACTOR: f64 = 0.8;
+const KEYBOARD_PAN_STEP_PIXELS: f64 = 64.0;
+const EXPOSURE_STEP_STOPS: f32 = 0.25;
+// Each wheel line multiplies the zoom by exp(0.18), about 1.2.
+const WHEEL_LOG_ZOOM_PER_LINE: f64 = 0.18;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PinchDirection {
@@ -90,11 +86,9 @@ enum StartupDiagnosticsState {
 }
 
 struct Application {
-    background: BackgroundMode,
     cursor_hide_deadline: Option<Instant>,
     cursor_position: Option<PhysicalPosition<f64>>,
     cursor_visibility: CursorVisibility,
-    diagnostics: bool,
     display_change_pending: Arc<AtomicBool>,
     startup_diagnostics: StartupDiagnosticsState,
     fatal_error: Option<RuntimeError>,
@@ -103,18 +97,17 @@ struct Application {
     file_picker_state: FilePickerState,
     fullscreen: FullscreenState,
     gpu: Option<gpu::GpuState>,
+    gpu_options: gpu::GpuOptions,
     is_dragging: bool,
     last_drag_position: Option<PhysicalPosition<f64>>,
     metadata_refresh_deadline: Option<Instant>,
     metadata_visible: bool,
     modifiers: ModifiersState,
-    output_mode: OutputMode,
     pending_drop: Option<PendingDrop>,
     pinch_fit_block: Option<PinchDirection>,
     primary_click: PrimaryClickTracker,
     session: ImageSession,
     title_hdr_surface: Option<bool>,
-    gpu_memory_limit_bytes: u64,
     window: Option<Arc<dyn Window>>,
 }
 
@@ -175,6 +168,12 @@ impl PendingDrop {
 }
 
 impl Application {
+    /// Records a fatal runtime error and asks the event loop to exit.
+    fn fail(&mut self, event_loop: &dyn ActiveEventLoop, error: RuntimeError) {
+        self.fatal_error = Some(error);
+        event_loop.exit();
+    }
+
     fn select_path(&mut self, path: PathBuf, direction: Option<FolderDirection>) {
         match self.session.select_path(path, direction) {
             SelectionEffect::Install(install) => self.install_image(install),
@@ -302,11 +301,11 @@ impl Application {
         match result {
             FilePickerResult::Selected(path) => self.select_path(path, None),
             FilePickerResult::Cancelled => {}
-            FilePickerResult::Failed(error) => {
-                tracing::warn!(%error, "file picker failed");
-                self.session.set_status_message(format!(
-                    "Cannot open the selected file: {error}; choose an image"
-                ));
+            FilePickerResult::Unsupported(path) => {
+                tracing::warn!(path = %path.display(), "selected file is not a supported image");
+                self.session.set_status_message(
+                    "Cannot open the selected file: the selected file is not a supported image; choose an image",
+                );
                 self.update_window_title();
             }
         }
@@ -413,66 +412,16 @@ impl Application {
         let Some(image) = self.session.loaded_image() else {
             return Vec::new();
         };
-        let mut sections = vec![
-            gpu::OverlaySection {
-                title: "IMAGE",
-                rows: vec![
-                    ("File".to_owned(), image.file_name.clone()),
-                    (
-                        "Dimensions".to_owned(),
-                        dimensions_summary(image.dimensions.0, image.dimensions.1),
-                    ),
-                    (
-                        "Decode".to_owned(),
-                        decode_summary(image.decode_timing, image.memory_bytes),
-                    ),
-                ],
-            },
-            gpu::OverlaySection {
-                title: "SOURCE",
-                rows: vec![
-                    (
-                        "Range".to_owned(),
-                        source_range_summary(image.hdr_source, &image.source_transfer),
-                    ),
-                    ("Color space".to_owned(), image.source_color_space.clone()),
-                    (
-                        "Source peak".to_owned(),
-                        format!("{:.0} nits", image.source_intensity_nits),
-                    ),
-                ],
-            },
-        ];
-        let display_rows = if let Some(gpu) = self.gpu.as_ref() {
-            gpu.ui_summary_rows()
-        } else {
-            vec![("Output surface".to_owned(), "pending".to_owned())]
-        };
-        sections.push(gpu::OverlaySection {
-            title: "DISPLAY & VIEWER",
-            rows: display_rows,
-        });
-
-        let capture_rows = capture_metadata_rows(image.exif.as_ref());
-        if !capture_rows.is_empty() {
-            sections.push(gpu::OverlaySection {
-                title: "CAPTURE",
-                rows: capture_rows,
-            });
-        }
-        let attribution_rows = attribution_metadata_rows(image.exif.as_ref(), image.xmp.as_ref());
-        if !attribution_rows.is_empty() {
-            sections.push(gpu::OverlaySection {
-                title: "ATTRIBUTION",
-                rows: attribution_rows,
-            });
-        }
-        sections
+        let display_rows = self.gpu.as_ref().map_or_else(
+            || vec![("Output surface".to_owned(), "pending".to_owned())],
+            gpu::GpuState::ui_summary_rows,
+        );
+        image.overlay_sections(display_rows)
     }
 
     fn refresh_metadata_overlay(&mut self) {
         self.metadata_refresh_deadline = None;
-        if !self.session.has_loaded_image() && !self.diagnostics {
+        if !self.session.has_loaded_image() && !self.gpu_options.diagnostics {
             if let Some(gpu) = self.gpu.as_mut()
                 && let Err(error) = gpu.set_empty_state()
             {
@@ -610,8 +559,7 @@ impl Application {
                 .session
                 .handle_neighbor_paths(generation, &anchor_key, result),
             UserEvent::GpuFailure(failure) => {
-                self.fatal_error = Some(failure.into());
-                event_loop.exit();
+                self.fail(event_loop, failure.into());
             }
             UserEvent::DisplayChanged => {
                 self.display_change_pending.store(false, Ordering::Relaxed);
@@ -631,8 +579,7 @@ impl Application {
                 if let Some(gpu) = self.gpu.as_mut()
                     && let Err(error) = gpu.process_background_work()
                 {
-                    self.fatal_error = Some(RuntimeError::GpuBackgroundWork(error));
-                    event_loop.exit();
+                    self.fail(event_loop, RuntimeError::GpuBackgroundWork(error));
                     return;
                 }
                 if let Some(window) = self.window.as_ref() {
@@ -651,7 +598,7 @@ impl Application {
         })
     }
 
-    #[allow(clippy::too_many_lines)] // One exhaustive match intentionally owns every keyboard action.
+    #[expect(clippy::too_many_lines)] // One exhaustive match intentionally owns every keyboard action.
     fn handle_keyboard_action(&mut self, event_loop: &dyn ActiveEventLoop, action: KeyboardAction) {
         let overlay_effect = match action {
             KeyboardAction::Quit => {
@@ -698,26 +645,26 @@ impl Application {
             KeyboardAction::ZoomIn => {
                 let zoom_anchor = self.zoom_anchor();
                 if let (Some(gpu), Some(position)) = (self.gpu.as_mut(), zoom_anchor) {
-                    gpu.zoom_at(position, 1.25);
+                    gpu.zoom_at(position, KEYBOARD_ZOOM_IN_FACTOR);
                 }
                 OverlayEffect::None
             }
             KeyboardAction::ZoomOut => {
                 let zoom_anchor = self.zoom_anchor();
                 if let (Some(gpu), Some(position)) = (self.gpu.as_mut(), zoom_anchor) {
-                    gpu.zoom_at(position, 0.8);
+                    gpu.zoom_at(position, KEYBOARD_ZOOM_OUT_FACTOR);
                 }
                 OverlayEffect::None
             }
             KeyboardAction::ExposureDown => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.adjust_exposure(-0.25);
+                    gpu.adjust_exposure(-EXPOSURE_STEP_STOPS);
                 }
                 OverlayEffect::Refresh
             }
             KeyboardAction::ExposureUp => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.adjust_exposure(0.25);
+                    gpu.adjust_exposure(EXPOSURE_STEP_STOPS);
                 }
                 OverlayEffect::Refresh
             }
@@ -735,25 +682,25 @@ impl Application {
             }
             KeyboardAction::PanLeft => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.pan_by(64.0, 0.0);
+                    gpu.pan_by(KEYBOARD_PAN_STEP_PIXELS, 0.0);
                 }
                 OverlayEffect::None
             }
             KeyboardAction::PanRight => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.pan_by(-64.0, 0.0);
+                    gpu.pan_by(-KEYBOARD_PAN_STEP_PIXELS, 0.0);
                 }
                 OverlayEffect::None
             }
             KeyboardAction::PanUp => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.pan_by(0.0, 64.0);
+                    gpu.pan_by(0.0, KEYBOARD_PAN_STEP_PIXELS);
                 }
                 OverlayEffect::None
             }
             KeyboardAction::PanDown => {
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.pan_by(0.0, -64.0);
+                    gpu.pan_by(0.0, -KEYBOARD_PAN_STEP_PIXELS);
                 }
                 OverlayEffect::None
             }
@@ -772,8 +719,7 @@ impl Application {
         if let Some(gpu) = self.gpu.as_mut()
             && let Err(error) = gpu.resize(size)
         {
-            self.fatal_error = Some(RuntimeError::SurfaceResize(error));
-            event_loop.exit();
+            self.fail(event_loop, RuntimeError::SurfaceResize(error));
             return;
         }
         if let Some(window) = self.window.as_ref() {
@@ -784,8 +730,7 @@ impl Application {
     fn handle_scale_factor_changed(&mut self, event_loop: &dyn ActiveEventLoop, scale_factor: f64) {
         if let (Some(gpu), Some(window)) = (self.gpu.as_mut(), self.window.as_ref()) {
             if let Err(error) = gpu.scale_factor_changed(window.surface_size(), scale_factor) {
-                self.fatal_error = Some(RuntimeError::SurfaceScaleFactor(error));
-                event_loop.exit();
+                self.fail(event_loop, RuntimeError::SurfaceScaleFactor(error));
             } else {
                 window.request_redraw();
                 self.refresh_metadata_overlay();
@@ -793,6 +738,7 @@ impl Application {
         }
     }
 
+    /// Returns `None` after a refresh failure has been recorded as fatal.
     fn try_refresh_display_state(
         &mut self,
         event_loop: &dyn ActiveEventLoop,
@@ -803,11 +749,10 @@ impl Application {
         let Some(gpu) = self.gpu.as_mut() else {
             return Some(gpu::DisplayRefresh::default());
         };
-        let refresh = match gpu.refresh_display(reason, capabilities) {
+        let refresh = match gpu.refresh_surface_selection(reason, capabilities) {
             Ok(refresh) => refresh,
             Err(error) => {
-                self.fatal_error = Some(error_context(error));
-                event_loop.exit();
+                self.fail(event_loop, error_context(error));
                 return None;
             }
         };
@@ -887,9 +832,13 @@ impl Application {
             pending.data = match dropped_file_paths(value) {
                 Ok(paths) => first_image_path(&paths)
                     .map_or(PendingDropData::Unsupported, PendingDropData::Path),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Deadlock
+                    ) =>
+                {
                     // winit re-delivers DataTransferReceived. A new drag replaces pending state.
-                    // ErrorKind::Deadlock is also retryable but unstable on pinned Rust 1.97.
                     return;
                 }
                 Err(error) => {
@@ -940,7 +889,7 @@ impl Application {
             // pan as well because Winit does not expose the input source here.
             // see https://github.com/rust-windowing/winit/issues/4315.
             MouseScrollDelta::LineDelta(_, vertical) => {
-                let amount = f64::from(vertical) * 0.18;
+                let amount = f64::from(vertical) * WHEEL_LOG_ZOOM_PER_LINE;
                 if let (Some(position), Some(gpu)) = (self.cursor_position, self.gpu.as_mut()) {
                     gpu.zoom_at(position, amount.exp());
                 }
@@ -1054,9 +1003,8 @@ impl Application {
         }
         let display_refresh = match render_result {
             Err(error) => {
-                self.fatal_error = Some(RuntimeError::Render(error));
                 self.session.cancel_pending_presentation();
-                event_loop.exit();
+                self.fail(event_loop, RuntimeError::Render(error));
                 None
             }
             Ok(outcome) => {
@@ -1077,7 +1025,7 @@ impl Application {
                         first_present_ms = milliseconds(opening_time),
                         "image opening completed"
                     );
-                    if self.diagnostics {
+                    if self.gpu_options.diagnostics {
                         let report = format!(
                             "  path: {}\n  request: {}\n  selection generation: {}\n  cache hit: {}\n  dimensions: {}x{}\n  decode: {:.2} ms\n  first presentation submission: {:.2} ms\n{}",
                             path.display(),
@@ -1110,7 +1058,7 @@ impl Application {
     }
 
     fn current_image_finished_report(&self, reason: &str) -> Option<String> {
-        if !self.diagnostics || !self.session.current_image_was_presented() {
+        if !self.gpu_options.diagnostics || !self.session.current_image_was_presented() {
             return None;
         }
         let path = self.session.current_path()?;
@@ -1121,10 +1069,6 @@ impl Application {
             gpu.image_finished_diagnostics_report(),
         ))
     }
-}
-
-fn milliseconds(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1_000.0
 }
 
 fn fullscreen_cursor_hide_deadline(
@@ -1161,12 +1105,12 @@ enum UserEvent {
         generation: u64,
         direction: FolderDirection,
         source_path: PathBuf,
-        result: Result<Option<PathBuf>, String>,
+        result: Result<Option<PathBuf>, FolderReadError>,
     },
     NeighborPathsComplete {
         generation: u64,
         anchor_key: ImageKey,
-        result: Result<NeighborPaths, String>,
+        result: Result<NeighborPaths, FolderReadError>,
     },
     DisplayChanged,
     GpuFailure(gpu::GpuFailure),
@@ -1182,7 +1126,7 @@ impl ApplicationHandler for Application {
         let attributes = WindowAttributes::default()
             .with_title(APPLICATION_NAME)
             .with_window_icon(Some(app_icon::window_icon()))
-            .with_surface_size(LogicalSize::new(1024.0, 682.0));
+            .with_surface_size(INITIAL_WINDOW_SIZE);
         #[cfg(target_os = "linux")]
         let attributes = {
             let mut wayland_attributes =
@@ -1196,28 +1140,29 @@ impl ApplicationHandler for Application {
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::<dyn Window>::from(window),
             Err(error) => {
-                self.fatal_error = Some(RuntimeError::WindowCreation(error));
-                event_loop.exit();
+                self.fail(event_loop, RuntimeError::WindowCreation(error));
                 return;
             }
         };
 
         let event_sender = self.event_sender.clone();
-        let report_failure: gpu::FailureReporter = Arc::new(move |failure| {
-            event_sender.send(UserEvent::GpuFailure(failure));
-        });
         let work_event_sender = self.event_sender.clone();
-        let notify_work_ready: gpu::WorkReadyNotifier = Arc::new(move || {
-            work_event_sender.send(UserEvent::GpuWorkReady);
-        });
         let display_event_sender = self.event_sender.clone();
         let display_change_pending = Arc::clone(&self.display_change_pending);
-        let notify_display_changed: gpu::DisplayChangeNotifier = Arc::new(move || {
-            // Preserve the latest provider state without building an event backlog.
-            if !display_change_pending.swap(true, Ordering::Relaxed) {
-                display_event_sender.send(UserEvent::DisplayChanged);
-            }
-        });
+        let callbacks = gpu::GpuCallbacks {
+            report_failure: Arc::new(move |failure| {
+                event_sender.send(UserEvent::GpuFailure(failure));
+            }),
+            work_ready: Arc::new(move || {
+                work_event_sender.send(UserEvent::GpuWorkReady);
+            }),
+            display_changed: Arc::new(move || {
+                // Preserve the latest provider state without building an event backlog.
+                if !display_change_pending.swap(true, Ordering::Relaxed) {
+                    display_event_sender.send(UserEvent::DisplayChanged);
+                }
+            }),
+        };
         match gpu::initialize(
             || {
                 wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
@@ -1225,24 +1170,15 @@ impl ApplicationHandler for Application {
                 ))
             },
             &window,
-            self.output_mode,
-            gpu::RenderingOptions {
-                exposure_stops: 0.0,
-                background: self.background,
-            },
-            self.diagnostics,
-            &report_failure,
-            &notify_work_ready,
-            &notify_display_changed,
-            self.gpu_memory_limit_bytes,
+            self.gpu_options,
+            &callbacks,
         ) {
             Ok(mut gpu) => {
                 if let Some(image) = self.session.take_decoded_image()
                     && let Err(error) = gpu.set_image(&image)
                 {
-                    self.fatal_error = Some(RuntimeError::ImageInstall(error));
                     self.session.cancel_pending_presentation();
-                    event_loop.exit();
+                    self.fail(event_loop, RuntimeError::ImageInstall(error));
                     return;
                 }
                 window.request_redraw();
@@ -1256,8 +1192,7 @@ impl ApplicationHandler for Application {
                 }
             }
             Err(error) => {
-                self.fatal_error = Some(RuntimeError::GpuInitialization(error));
-                event_loop.exit();
+                self.fail(event_loop, RuntimeError::GpuInitialization(error));
             }
         }
     }
@@ -1308,7 +1243,7 @@ impl ApplicationHandler for Application {
         #[cfg(target_os = "linux")]
         let monitor_poll_needed = self.window.as_ref().is_some_and(|window| {
             self.startup_diagnostics == StartupDiagnosticsState::Pending
-                || (self.output_mode != OutputMode::Sdr && window.has_focus())
+                || (self.gpu_options.output_mode != OutputMode::Sdr && window.has_focus())
         });
         #[cfg(target_os = "linux")]
         let next_deadline = if monitor_poll_needed {
@@ -1383,9 +1318,9 @@ impl ApplicationHandler for Application {
 pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
     #[cfg(target_os = "linux")]
     require_native_wayland()?;
-    let decoded_cache_bytes = cli.cache.map_or_else(automatic_decoded_cache_bytes, |mib| {
-        mib.saturating_mul(1024 * 1024)
-    });
+    let decoded_cache_bytes = cli
+        .cache
+        .map_or_else(automatic_decoded_cache_bytes, mib_to_bytes);
     log_startup_options(cli, decoded_cache_bytes);
 
     let mut event_loop_builder = EventLoop::builder();
@@ -1416,11 +1351,9 @@ pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
     })
     .map_err(RuntimeError::DecodeCoordinator)?;
     let mut application = Application {
-        background: cli.background,
         cursor_hide_deadline: None,
         cursor_position: None,
         cursor_visibility: CursorVisibility::Visible,
-        diagnostics: cli.diagnostics,
         display_change_pending: Arc::new(AtomicBool::new(false)),
         startup_diagnostics: if cli.diagnostics {
             StartupDiagnosticsState::Pending
@@ -1433,18 +1366,22 @@ pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
         file_picker_state: FilePickerState::Closed,
         fullscreen: FullscreenState::Windowed,
         gpu: None,
+        gpu_options: gpu::GpuOptions {
+            output_mode: cli.output,
+            background: cli.background,
+            diagnostics: cli.diagnostics,
+            memory_limit_bytes: mib_to_bytes(cli.gpu_memory),
+        },
         is_dragging: false,
         last_drag_position: None,
         metadata_refresh_deadline: None,
         metadata_visible: false,
         modifiers: ModifiersState::empty(),
-        output_mode: cli.output,
         pending_drop: None,
         pinch_fit_block: None,
         primary_click: PrimaryClickTracker::default(),
         session: ImageSession::new(decoded_cache_bytes, decode_coordinator),
         title_hdr_surface: None,
-        gpu_memory_limit_bytes: cli.gpu_memory.saturating_mul(1024 * 1024),
         window: None,
     };
 
@@ -1471,7 +1408,7 @@ fn log_startup_options(cli: &Cli, decoded_cache_bytes: u64) {
         output = cli.output.as_str(),
         background = cli.background.as_str(),
         hdr_reference_white_nits = HDR_REFERENCE_WHITE_NITS,
-        decoded_cache_mib = decoded_cache_bytes / (1024 * 1024),
+        decoded_cache_mib = decoded_cache_bytes / BYTES_PER_MIB,
         decoded_cache_automatic = cli.cache.is_none(),
         gpu_memory_mib = cli.gpu_memory,
         diagnostics = cli.diagnostics,

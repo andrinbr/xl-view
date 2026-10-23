@@ -6,10 +6,18 @@
 
 /// BT.2100/BT.2408 HDR reference white used to normalize the working space.
 pub const HDR_REFERENCE_WHITE_NITS: f32 = 203.0;
+/// Absolute luminance of the maximum PQ signal value (SMPTE ST 2084).
+pub const PQ_PEAK_NITS: f32 = 10_000.0;
+const PQ_PEAK_NITS_F64: f64 = PQ_PEAK_NITS as f64;
 
 const BT2020_LUMA: [f64; 3] = [0.2627, 0.6780, 0.0593];
 const BT709_LUMA: [f64; 3] = [0.2126, 0.7152, 0.0722];
 const ICTCP_GAMUT_SEARCH_ITERATIONS: u32 = 12;
+// Clip colors at most 0.1% outside BT.709 (relative to the largest channel)
+// instead of gamut mapping them. This covers f16 and conversion rounding for
+// every hue. Clipping such small excursions stays within about one
+// just-noticeable difference of the source.
+const GAMUT_BOUNDARY_TOLERANCE: f64 = 1.0e-3;
 
 // Recommendation ITU-R BT.2100 PQ-based ICtCp matrices. LMS_PRIME is
 // PQ-encoded LMS with absolute luminance normalized to 10,000 cd/m².
@@ -46,80 +54,8 @@ const ICTCP_TO_LMS_PRIME: [[f64; 3]; 3] = [
     [1.0, 0.560_031_335_710_679_1, -0.320_627_174_987_318_85],
 ];
 
-/// Linear BT.709/sRGB to CIE XYZ (D65), with matrix rows stored in order.
-pub const BT709_TO_XYZ_D65: [[f64; 3]; 3] = [
-    [
-        0.412_390_799_265_959_5,
-        0.357_584_339_383_877_96,
-        0.180_480_788_401_834_3,
-    ],
-    [
-        0.212_639_005_871_510_36,
-        0.715_168_678_767_755_9,
-        0.072_192_315_360_733_71,
-    ],
-    [
-        0.019_330_818_715_591_85,
-        0.119_194_779_794_625_99,
-        0.950_532_152_249_660_7,
-    ],
-];
-
-/// CIE XYZ (D65) to linear BT.709/sRGB.
-pub const XYZ_D65_TO_BT709: [[f64; 3]; 3] = [
-    [
-        3.240_969_941_904_522_6,
-        -1.537_383_177_570_094,
-        -0.498_610_760_293_003_4,
-    ],
-    [
-        -0.969_243_636_280_879_6,
-        1.875_967_501_507_720_2,
-        0.041_555_057_407_175_59,
-    ],
-    [
-        0.055_630_079_696_993_66,
-        -0.203_976_958_888_976_52,
-        1.056_971_514_242_878_6,
-    ],
-];
-
-/// Linear BT.2020 to CIE XYZ (D65).
-pub const BT2020_TO_XYZ_D65: [[f64; 3]; 3] = [
-    [
-        0.636_958_048_301_291_4,
-        0.144_616_903_586_208_32_f64,
-        0.168_880_975_164_172_1,
-    ],
-    [
-        0.262_700_212_011_267_1,
-        0.677_998_071_518_870_8,
-        0.059_301_716_469_861_96,
-    ],
-    [0.0, 0.028_072_693_049_087_428, 1.060_985_057_710_791],
-];
-
-/// CIE XYZ (D65) to linear BT.2020.
-pub const XYZ_D65_TO_BT2020: [[f64; 3]; 3] = [
-    [
-        1.716_651_187_971_268,
-        -0.355_670_783_776_392_4,
-        -0.253_366_281_373_659_74,
-    ],
-    [
-        -0.666_684_351_832_489,
-        1.616_481_236_634_939_5,
-        0.015_768_545_813_911_13,
-    ],
-    [
-        0.017_639_857_445_310_783,
-        -0.042_770_613_257_808_524,
-        0.942_103_121_235_473_8,
-    ],
-];
-
 /// Linear BT.2020 to linear BT.709/sRGB, both D65.
-pub const BT2020_TO_BT709: [[f64; 3]; 3] = [
+const BT2020_TO_BT709: [[f64; 3]; 3] = [
     [
         1.660_491_002_108_434_7,
         -0.587_641_138_788_549_5,
@@ -134,25 +70,6 @@ pub const BT2020_TO_BT709: [[f64; 3]; 3] = [
         -0.018_150_763_354_905_256,
         -0.100_578_898_008_007_39,
         1.118_729_661_362_913_7,
-    ],
-];
-
-/// Linear BT.709/sRGB to linear BT.2020, both D65.
-pub const BT709_TO_BT2020: [[f64; 3]; 3] = [
-    [
-        0.627_403_895_934_699,
-        0.329_283_038_377_883_7,
-        0.043_313_065_687_417_23,
-    ],
-    [
-        0.069_097_289_358_232_1,
-        0.919_540_395_075_458_8,
-        0.011_362_315_566_309_1,
-    ],
-    [
-        0.016_391_438_875_150_28,
-        0.088_013_307_877_225_7,
-        0.895_595_253_247_624_1,
     ],
 ];
 
@@ -187,24 +104,22 @@ positive_nits_type!(OutputPeak, "Display tone-mapping target peak in cd/m².");
 /// Transfer-function class of the decoded source image.
 ///
 /// Decoded pixels are always linear BT.2020, but SDR remains relative while
-/// PQ and HLG pixels carry absolute luminance normalized by HDR reference white.
+/// PQ, HLG and linear pixels carry absolute luminance
+/// normalized by HDR reference white.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceDynamicRange {
     Sdr,
+    Linear,
     Pq,
     Hlg,
-}
-
-impl SourceDynamicRange {
-    #[must_use]
-    pub const fn is_hdr(self) -> bool {
-        matches!(self, Self::Pq | Self::Hlg)
-    }
 }
 
 impl SourceIntensityTarget {
     /// Conservative fallback when source metadata is unavailable or invalid.
     pub const FALLBACK: Self = Self(1_000.0);
+
+    /// HDR reference white, the presentation peak of SDR sources.
+    pub const REFERENCE_WHITE: Self = Self(HDR_REFERENCE_WHITE_NITS as f64);
 
     /// Uses valid JPEG XL metadata or the documented 1,000-nit fallback.
     #[must_use]
@@ -237,7 +152,7 @@ impl OutputTransform {
     pub fn transform(self, rgba: [f64; 4]) -> [f64; 4] {
         let exposure = exposure_scale(self.exposure_stops);
         let working = [rgba[0], rgba[1], rgba[2]]
-            .map(sanitize)
+            .map(finite_or_zero)
             .map(|channel| channel * exposure);
         let alpha = sanitize(rgba[3]).clamp(0.0, 1.0);
         let output = match self.encoding {
@@ -262,7 +177,7 @@ impl OutputTransform {
         // PQ output retains the BT.2020 destination gamut. This is only its
         // final numerical safety projection.
         bound_rgb_preserving_luminance(mapped, BT2020_LUMA, self.output_peak.nits())
-            .map(|nits| pq_oetf_f64(nits / 10_000.0))
+            .map(|nits| pq_oetf_f64(nits / PQ_PEAK_NITS_F64))
     }
 
     fn to_sdr(self, working: [f64; 3]) -> [f64; 3] {
@@ -336,12 +251,14 @@ pub fn hlg_oetf(scene_linear: f32) -> f32 {
 #[must_use]
 #[inline]
 pub fn hlg_inverse_oetf(encoded: f32) -> f32 {
-    let encoded = encoded.max(0.0);
-    if encoded <= 0.5 {
-        encoded * encoded / 3.0
+    // BT.2100's extended range is symmetric below zero.
+    let magnitude = encoded.abs();
+    let scene = if magnitude <= 0.5 {
+        magnitude * magnitude / 3.0
     } else {
-        (((encoded - HLG_C) / HLG_A).exp() + HLG_B) / 12.0
-    }
+        (((magnitude - HLG_C) / HLG_A).exp() + HLG_B) / 12.0
+    };
+    scene.copysign(encoded)
 }
 
 /// BT.2100 HLG system gamma used while decoding an HLG source.
@@ -358,7 +275,7 @@ pub fn hlg_system_gamma(display_peak_nits: f32) -> f32 {
 
 /// Applies a 3x3 row-major matrix to an RGB/XYZ vector.
 #[must_use]
-pub fn multiply(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
+fn multiply(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
     matrix.map(|row| dot(row, vector))
 }
 
@@ -367,7 +284,8 @@ pub fn multiply(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
 pub fn composite_linear(foreground: [f64; 4], background: [f64; 3]) -> [f64; 3] {
     let alpha = sanitize(foreground[3]).clamp(0.0, 1.0);
     std::array::from_fn(|index| {
-        sanitize(foreground[index]).mul_add(alpha, sanitize(background[index]) * (1.0 - alpha))
+        finite_or_zero(foreground[index])
+            .mul_add(alpha, sanitize(background[index]) * (1.0 - alpha))
     })
 }
 
@@ -396,9 +314,9 @@ fn tone_map_pq_hermite(value: f64, source_peak: f64, output_peak: f64) -> f64 {
         return output_peak;
     }
 
-    let source_peak_pq = pq_oetf_f64(source_peak / 10_000.0);
-    let output_peak_pq = pq_oetf_f64(output_peak / 10_000.0);
-    let input = pq_oetf_f64(value / 10_000.0) / source_peak_pq;
+    let source_peak_pq = pq_oetf_f64(source_peak / PQ_PEAK_NITS_F64);
+    let output_peak_pq = pq_oetf_f64(output_peak / PQ_PEAK_NITS_F64);
+    let input = pq_oetf_f64(value / PQ_PEAK_NITS_F64) / source_peak_pq;
     let normalized_output_peak = output_peak_pq / source_peak_pq;
     let knee = pq_hermite_knee(normalized_output_peak);
     // Preserve the exact linear-light identity. A PQ round-trip adds rounding.
@@ -407,7 +325,7 @@ fn tone_map_pq_hermite(value: f64, source_peak: f64, output_peak: f64) -> f64 {
     }
     let mapped = tone_map_normalized_pq_hermite(input, normalized_output_peak, knee);
 
-    (pq_eotf_f64(mapped * source_peak_pq) * 10_000.0).clamp(0.0, output_peak)
+    (pq_eotf_f64(mapped * source_peak_pq) * PQ_PEAK_NITS_F64).clamp(0.0, output_peak)
 }
 
 fn tone_map_normalized_pq_hermite(input: f64, output_peak: f64, knee: f64) -> f64 {
@@ -469,13 +387,14 @@ fn pq_eotf_f64(encoded: f64) -> f64 {
 }
 
 fn bt2020_nits_to_ictcp(rgb: [f64; 3]) -> [f64; 3] {
-    let lms_prime =
-        multiply(BT2020_TO_LMS, rgb).map(|channel| pq_oetf_f64(channel.max(0.0) / 10_000.0));
+    let lms_prime = multiply(BT2020_TO_LMS, rgb)
+        .map(|channel| pq_oetf_f64(channel.max(0.0) / PQ_PEAK_NITS_F64));
     multiply(LMS_PRIME_TO_ICTCP, lms_prime)
 }
 
 fn ictcp_to_bt2020_nits(ictcp: [f64; 3]) -> [f64; 3] {
-    let lms = multiply(ICTCP_TO_LMS_PRIME, ictcp).map(|channel| pq_eotf_f64(channel) * 10_000.0);
+    let lms =
+        multiply(ICTCP_TO_LMS_PRIME, ictcp).map(|channel| pq_eotf_f64(channel) * PQ_PEAK_NITS_F64);
     multiply(LMS_TO_BT2020, lms)
 }
 
@@ -490,14 +409,26 @@ fn rgb_is_within_cube(rgb: [f64; 3], upper: f64) -> bool {
 // shared constant-I/hue ray to the same surface point, so saturated gradients
 // can flatten.
 fn gamut_map_bt2020_to_bt709_ictcp_hard(rgb_nits: [f64; 3], upper: f64) -> [f64; 3] {
-    let sanitized_rgb_nits = rgb_nits.map(sanitize);
-    let direct = multiply(BT2020_TO_BT709, sanitized_rgb_nits);
-    if rgb_is_within_cube(direct, upper) {
-        return direct;
+    let rgb_nits = rgb_nits.map(finite_or_zero);
+    let direct = multiply(BT2020_TO_BT709, rgb_nits);
+    let tolerance = direct
+        .into_iter()
+        .fold(0.0, |maximum: f64, channel| maximum.max(channel.abs()))
+        * GAMUT_BOUNDARY_TOLERANCE;
+    if direct
+        .into_iter()
+        .all(|channel| (-tolerance..=upper + tolerance).contains(&channel))
+    {
+        return direct.map(|channel| channel.clamp(0.0, upper));
     }
 
-    let ictcp = bt2020_nits_to_ictcp(sanitized_rgb_nits);
-    let neutral_bt709 = [pq_eotf_f64(ictcp[0]) * 10_000.0; 3];
+    let rgb_nits = if rgb_nits.into_iter().any(|channel| channel < 0.0) {
+        bound_rgb_preserving_luminance(rgb_nits, BT2020_LUMA, upper)
+    } else {
+        rgb_nits
+    };
+    let ictcp = bt2020_nits_to_ictcp(rgb_nits);
+    let neutral_bt709 = [pq_eotf_f64(ictcp[0]) * PQ_PEAK_NITS_F64; 3];
     if !rgb_is_within_cube(neutral_bt709, upper) {
         // Invalid or mis-signalled values can put even the equal-intensity
         // neutral outside the target cube, so retain the bounded fallback.
@@ -532,18 +463,17 @@ fn bound_rgb_preserving_luminance(rgb: [f64; 3], luma: [f64; 3], upper: f64) -> 
     // Preserve finite negative matrix results here: they carry the chroma
     // direction needed for line-to-neutral gamut compression.
     let rgb = rgb.map(finite_or_zero);
-    let maximum = upper;
-    let neutral = dot(rgb, luma).clamp(0.0, maximum);
+    let neutral = dot(rgb, luma).clamp(0.0, upper);
     let mut scale = 1.0_f64;
     for channel in rgb {
         let chroma = channel - neutral;
         if chroma < 0.0 {
             scale = scale.min(neutral / -chroma);
         } else if chroma > 0.0 {
-            scale = scale.min((maximum - neutral) / chroma);
+            scale = scale.min((upper - neutral) / chroma);
         }
     }
-    rgb.map(|channel| (neutral + (channel - neutral) * scale.clamp(0.0, 1.0)).clamp(0.0, maximum))
+    rgb.map(|channel| (neutral + (channel - neutral) * scale.clamp(0.0, 1.0)).clamp(0.0, upper))
 }
 
 fn dot(left: [f64; 3], right: [f64; 3]) -> f64 {
@@ -585,6 +515,97 @@ mod tests {
     use super::*;
 
     const EPSILON: f64 = 1.0e-12;
+
+    /// Linear BT.709/sRGB to CIE XYZ (D65), with matrix rows stored in order.
+    const BT709_TO_XYZ_D65: [[f64; 3]; 3] = [
+        [
+            0.412_390_799_265_959_5,
+            0.357_584_339_383_877_96,
+            0.180_480_788_401_834_3,
+        ],
+        [
+            0.212_639_005_871_510_36,
+            0.715_168_678_767_755_9,
+            0.072_192_315_360_733_71,
+        ],
+        [
+            0.019_330_818_715_591_85,
+            0.119_194_779_794_625_99,
+            0.950_532_152_249_660_7,
+        ],
+    ];
+
+    /// CIE XYZ (D65) to linear BT.709/sRGB.
+    const XYZ_D65_TO_BT709: [[f64; 3]; 3] = [
+        [
+            3.240_969_941_904_522_6,
+            -1.537_383_177_570_094,
+            -0.498_610_760_293_003_4,
+        ],
+        [
+            -0.969_243_636_280_879_6,
+            1.875_967_501_507_720_2,
+            0.041_555_057_407_175_59,
+        ],
+        [
+            0.055_630_079_696_993_66,
+            -0.203_976_958_888_976_52,
+            1.056_971_514_242_878_6,
+        ],
+    ];
+
+    /// Linear BT.2020 to CIE XYZ (D65).
+    const BT2020_TO_XYZ_D65: [[f64; 3]; 3] = [
+        [
+            0.636_958_048_301_291_4,
+            0.144_616_903_586_208_32_f64,
+            0.168_880_975_164_172_1,
+        ],
+        [
+            0.262_700_212_011_267_1,
+            0.677_998_071_518_870_8,
+            0.059_301_716_469_861_96,
+        ],
+        [0.0, 0.028_072_693_049_087_428, 1.060_985_057_710_791],
+    ];
+
+    /// CIE XYZ (D65) to linear BT.2020.
+    const XYZ_D65_TO_BT2020: [[f64; 3]; 3] = [
+        [
+            1.716_651_187_971_268,
+            -0.355_670_783_776_392_4,
+            -0.253_366_281_373_659_74,
+        ],
+        [
+            -0.666_684_351_832_489,
+            1.616_481_236_634_939_5,
+            0.015_768_545_813_911_13,
+        ],
+        [
+            0.017_639_857_445_310_783,
+            -0.042_770_613_257_808_524,
+            0.942_103_121_235_473_8,
+        ],
+    ];
+
+    /// Linear BT.709/sRGB to linear BT.2020, both D65.
+    const BT709_TO_BT2020: [[f64; 3]; 3] = [
+        [
+            0.627_403_895_934_699,
+            0.329_283_038_377_883_7,
+            0.043_313_065_687_417_23,
+        ],
+        [
+            0.069_097_289_358_232_1,
+            0.919_540_395_075_458_8,
+            0.011_362_315_566_309_1,
+        ],
+        [
+            0.016_391_438_875_150_28,
+            0.088_013_307_877_225_7,
+            0.895_595_253_247_624_1,
+        ],
+    ];
 
     fn assert_near(actual: impl Into<f64>, expected: impl Into<f64>, tolerance: f64) {
         let actual = actual.into();
@@ -986,6 +1007,53 @@ mod tests {
     }
 
     #[test]
+    fn cpu_and_shader_pq_peaks_match() {
+        let shader = include_str!("gpu/shaders/color_transform.wgsl");
+        let expected = format!("const PQ_PEAK_NITS: f32 = {PQ_PEAK_NITS:?};");
+        assert!(
+            shader.contains(&expected),
+            "shader must contain `{expected}` to match the CPU PQ peak",
+        );
+    }
+
+    #[test]
+    fn cpu_and_shader_gamut_boundary_tolerances_match() {
+        let shader = include_str!("gpu/shaders/color_transform.wgsl");
+        let expected =
+            format!("const GAMUT_BOUNDARY_TOLERANCE: f32 = {GAMUT_BOUNDARY_TOLERANCE:e};");
+        assert!(
+            shader.contains(&expected),
+            "shader must contain `{expected}` to match the CPU tolerance",
+        );
+    }
+
+    #[test]
+    fn hard_ictcp_gamut_mapping_clips_only_rounding_sized_excursions() {
+        // Without the tolerance this pure blue would drop to approx 29 nits blue
+        // with approx 1 nit green. The green carries real f16 storage rounding.
+        let blue = multiply(BT709_TO_BT2020, [-0.001, 0.0, 35.0]);
+        let green = multiply(BT709_TO_BT2020, [0.0, 0.548_828_125, 0.0])
+            .map(|channel| half::f16::from_f64(channel).to_f64() * 203.0);
+        for rounding in [blue, green] {
+            let direct = multiply(BT2020_TO_BT709, rounding);
+            assert!(!rgb_is_within_cube(direct, 203.0));
+            assert_eq!(
+                gamut_map_bt2020_to_bt709_ictcp_hard(rounding, 203.0).map(f64::to_bits),
+                direct
+                    .map(|channel| channel.clamp(0.0, 203.0))
+                    .map(f64::to_bits),
+            );
+        }
+
+        // Beyond the tolerance, the ICtCp search still preserves hue.
+        let outside = multiply(BT709_TO_BT2020, [-0.1, 0.0, 35.0]);
+        let mapped = gamut_map_bt2020_to_bt709_ictcp_hard(outside, 203.0);
+        let before = bt2020_nits_to_ictcp(outside);
+        let after = bt2020_nits_to_ictcp(multiply(BT709_TO_BT2020, mapped));
+        assert_near(after[2] / after[1], before[2] / before[1], 1.0e-6);
+    }
+
+    #[test]
     fn hard_ictcp_gamut_mapping_reaches_bt709_surface_at_fixed_intensity_and_hue() {
         for source in [
             [203.0, 0.0, 0.0],
@@ -1044,6 +1112,40 @@ mod tests {
             composite_linear([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0]).map(f64::to_bits),
             [1.0, 0.0, 0.0].map(f64::to_bits),
         );
+    }
+
+    #[test]
+    fn negative_image_color_preserves_composites_and_luminance() {
+        let composite = composite_linear([-0.25, 0.5, 0.5, 0.5], [1.0; 3]);
+        assert_eq!(
+            composite.map(f64::to_bits),
+            [0.375_f64, 0.75, 0.75].map(f64::to_bits)
+        );
+        let rgb = [-0.25, 0.5, 0.5];
+        // Independent line-to-neutral projection into BT.2020. Both gamut
+        // paths must retain the chroma direction represented by negative red.
+        let y = -0.25 * 0.2627 + 0.5 * 0.6780 + 0.5 * 0.0593;
+        let scale = y / (y + 0.25);
+        let projected = [0.0, y + (0.5 - y) * scale, y + (0.5 - y) * scale];
+        for encoding in [OutputEncoding::Pq, OutputEncoding::SdrSrgbHardware] {
+            let transform = transform(encoding, 203.0, 203.0);
+            let actual = transform.transform([rgb[0], rgb[1], rgb[2], 1.0]);
+            let expected = transform.transform([projected[0], projected[1], projected[2], 1.0]);
+            for channel in 0..3 {
+                assert_near(actual[channel], expected[channel], 1e-10);
+            }
+            let clipped = transform.transform([0.0, 0.5, 0.5, 1.0]);
+            assert!(actual[1] < clipped[1]);
+            assert!(actual[2] < clipped[2]);
+        }
+    }
+
+    #[test]
+    fn default_target_linear_highlights_tone_map_white_from_the_observed_peak() {
+        let transform = transform(OutputEncoding::SdrSrgbHardware, 812.0, 203.0);
+        let white = transform.transform([1.0; 4]);
+        assert_near(white[0], 0.81, 0.01);
+        assert_near(transform.transform([4.0, 4.0, 4.0, 1.0])[0], 1.0, 1e-10);
     }
 
     #[test]

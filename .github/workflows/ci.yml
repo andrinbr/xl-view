@@ -12,15 +12,14 @@ permissions:
   contents: read
 
 jobs:
-  quality:
-    name: Quality checks
+  quality-linux:
+    name: Quality checks (Linux)
     runs-on: ubuntu-latest
     env:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
       SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
       SONAR_QUALITY_GATE_ENABLED: ${{ vars.SONAR_QUALITY_GATE_ENABLED }}
-
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin v7.0.1
@@ -58,10 +57,6 @@ jobs:
       - name: Lint shell scripts
         run: shellcheck scripts/*.sh packaging/linux/appimage/*.sh packaging/macos/*.sh
 
-      - name: Lint PowerShell scripts
-        shell: pwsh
-        run: Invoke-ScriptAnalyzer -Path packaging/windows -Recurse -EnableExit
-
       - name: Install Vulkan SDK and Lavapipe
         uses: jakoch/install-vulkan-sdk-action@37effcfa045411f8bfbbda26df2fd1b3bf3436fa # pin v1.6.0
         with:
@@ -90,14 +85,57 @@ jobs:
         with:
           pollingTimeoutSec: 600
 
+  quality-windows:
+    name: Quality checks (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin v7.0.1
+
+      - name: Lint PowerShell scripts
+        shell: pwsh
+        run: Invoke-ScriptAnalyzer -Path packaging/windows -Recurse -EnableExit
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # pin v2.9.1
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      # GPU tests are ignored by default: They run on Linux.
+      - name: Run tests
+        run: cargo test --workspace --all-targets --all-features --locked
+
+  quality-macos:
+    name: Quality checks (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin v7.0.1
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # pin v2.9.1
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      # GPU tests are ignored by default: They run on Linux.
+      - name: Run tests
+        run: cargo test --workspace --all-targets --all-features --locked
+
   appimage:
     name: Build and publish AppImage
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: quality
+    needs: quality-linux
     runs-on: ubuntu-latest
     permissions:
       contents: write # needed to create/upload the GitHub release
-
     steps:
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin v7.0.1
@@ -139,11 +177,10 @@ jobs:
   windows:
     name: Build and publish Windows packages
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: appimage
+    needs: [appimage, quality-windows]
     runs-on: windows-latest
     permissions:
       contents: write # needed to upload files to the GitHub release
-
     steps:
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin v7.0.1
@@ -177,11 +214,10 @@ jobs:
   macos:
     name: Build and publish macOS package
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: appimage
+    needs: [appimage, quality-macos]
     runs-on: macos-latest
     permissions:
       contents: write # needed to upload files to the GitHub release
-
     steps:
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin v7.0.1

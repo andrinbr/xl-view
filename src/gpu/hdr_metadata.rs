@@ -68,7 +68,7 @@ mod passthrough {
             Self::metadata_status(metadata)
         }
 
-        #[allow(clippy::unused_self)]
+        #[expect(clippy::unused_self)] // Mirrors the Linux bridge, which sends metadata through its surface.
         pub fn set_metadata(&mut self, metadata: Option<HdrMetadata>) -> SignalStatus {
             Self::metadata_status(metadata)
         }

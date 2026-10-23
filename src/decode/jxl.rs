@@ -1,47 +1,54 @@
 use std::fs::{self, File, Metadata};
-use std::io::{Cursor, Read};
+use std::io::{BufReader, IoSliceMut};
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
 
-use jxl_oxide::image::ExtraChannelType;
-use jxl_oxide::image::color::{
-    ColourEncoding, ColourSpace, EnumColourEncoding, Primaries, TransferFunction, WhitePoint,
-};
-use jxl_oxide::{
-    AllocTracker, AuxBoxData, HdrType, JxlImage, PixelFormat, Render, RenderingIntent,
+use jxl::api::{
+    Event, ExtraChannel, JxlAuxBox, JxlAuxBoxType, JxlBasicInfo, JxlBitDepth, JxlBitstreamInput,
+    JxlColorEncoding, JxlColorProfile, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer,
+    JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat, JxlPrimaries, JxlTransferFunction,
+    JxlWhitePoint, RenderingIntent,
 };
 use moxcms::{ColorProfile, DataColorSpace, Layout, TransformF32Executor, TransformOptions};
 use rayon::prelude::*;
 
 use crate::color::{
-    HDR_REFERENCE_WHITE_NITS, SourceDynamicRange, SourceIntensityTarget, hlg_inverse_oetf,
-    hlg_system_gamma, pq_eotf,
+    HDR_REFERENCE_WHITE_NITS, PQ_PEAK_NITS, SourceDynamicRange, SourceIntensityTarget,
+    hlg_inverse_oetf, hlg_system_gamma, pq_eotf,
 };
 use crate::metadata::{parse_exif, parse_xmp};
+use crate::units::{u64_from_usize, usize_from_u32};
 
 use super::{
     CANONICAL_BYTES_PER_PIXEL, CanonicalPixel, CoarsePixel, DecodeError, DecodeLimits,
-    DecodeResult, DecodedImage, DecodedTileStore, ImageKey, ImageMetadata, SourceColorEncoding,
-    ToneMappingMetadata, usize_from_u32,
+    DecodeResult, DecodedImage, DecodedTileStore, ImageKey, ImageMetadata, LinearUnit,
+    SourceColorEncoding, ToneMappingMetadata,
 };
 
-const MAX_RENDER_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+const BT2020_LUMA: [f32; 3] = [0.2627, 0.6780, 0.0593];
+const CHUNK_PIXELS: usize = 65_536;
+const MAX_SCRATCH_BYTES: usize = 32 * 1024 * 1024;
 const MAX_COARSE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_COARSE_DIMENSION: u32 = 4_096;
+const MAX_TRAILING_METADATA_BYTES: usize = 32 * 1024 * 1024;
+const XML: JxlAuxBoxType = JxlAuxBoxType(*b"xml ");
+// jxl clamps converted HLG output to this range before f16 storage.
+const HLG_SIGNAL_MIN: f32 = half::f16::from_f32_const(-0.074).to_f32_const();
+const HLG_SIGNAL_MAX: f32 = half::f16::from_f32_const(1.1).to_f32_const();
+// Two RGB buffers plus a row of f64 preview accumulators per worker.
+const WORKER_SCRATCH_BYTES: usize =
+    CHUNK_PIXELS * 6 * size_of::<f32>() + MAX_COARSE_DIMENSION as usize * size_of::<[f64; 4]>();
+const MAX_WORKERS: usize = MAX_SCRATCH_BYTES / WORKER_SCRATCH_BYTES;
 
 /// Decodes a filesystem source within the supplied limits.
 ///
 /// # Errors
-///
 /// Returns a typed error for I/O, malformed input, unsupported content, or a
 /// configured resource limit.
 pub fn decode_file(path: &Path, limits: DecodeLimits) -> DecodeResult {
-    let file = File::open(path).map_err(|source| DecodeError::Read {
-        path: path.to_owned(),
-        source,
-    })?;
-    let image = read_image(file, limits)?;
-    decode_initialized_image(image, limits, None)
+    let file = open_file(path)?;
+    decode_input(&mut FileInput(BufReader::new(file)), limits, None)
 }
 
 pub(super) fn decode_file_for_key(
@@ -49,34 +56,26 @@ pub(super) fn decode_file_for_key(
     limits: DecodeLimits,
     maximum_retained_bytes: Option<u64>,
 ) -> DecodeResult {
-    let path = &key.normalized_path;
-    let mut file = File::open(path).map_err(|source| DecodeError::Read {
-        path: path.clone(),
+    let file = open_file(&key.normalized_path)?;
+    let metadata_error = |source| DecodeError::SourceMetadata {
+        path: key.normalized_path.clone(),
         source,
-    })?;
-    let before = file
-        .metadata()
-        .map_err(|source| DecodeError::SourceMetadata {
-            path: path.clone(),
-            source,
-        })?;
-    verify_source_identity(key, &before)?;
-
-    let image = read_image(&mut file, limits);
-
-    let after = file
-        .metadata()
-        .map_err(|source| DecodeError::SourceMetadata {
-            path: path.clone(),
-            source,
-        })?;
-    let path_after = fs::metadata(path).map_err(|source| DecodeError::SourceMetadata {
-        path: path.clone(),
-        source,
-    })?;
+    };
+    verify_source_identity(key, &file.metadata().map_err(metadata_error)?)?;
+    let mut input = FileInput(BufReader::new(file));
+    let decoded = decode_input(&mut input, limits, maximum_retained_bytes);
+    let after = input.0.get_ref().metadata().map_err(metadata_error)?;
+    let path_after = fs::metadata(&key.normalized_path).map_err(metadata_error)?;
     verify_source_identity(key, &after)?;
     verify_source_identity(key, &path_after)?;
-    decode_initialized_image(image?, limits, maximum_retained_bytes)
+    decoded
+}
+
+fn open_file(path: &Path) -> Result<File, DecodeError> {
+    File::open(path).map_err(|source| DecodeError::Read {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 fn verify_source_identity(key: &ImageKey, metadata: &Metadata) -> Result<(), DecodeError> {
@@ -95,571 +94,936 @@ fn verify_source_identity(key: &ImageKey, metadata: &Metadata) -> Result<(), Dec
     }
 }
 
+// Use the default read-based skip: seeking past EOF would hide truncated boxes.
+struct FileInput(BufReader<File>);
+impl JxlBitstreamInput for FileInput {
+    fn available_bytes(&mut self) -> std::io::Result<usize> {
+        self.0.available_bytes()
+    }
+    fn read(&mut self, buffers: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+        JxlBitstreamInput::read(&mut self.0, buffers)
+    }
+}
+
 /// Decodes an in-memory JPEG XL source within the supplied limits.
 ///
 /// # Errors
-///
 /// Returns a typed error for malformed input, unsupported content, or a
 /// configured resource limit.
-pub fn decode_memory(bytes: &[u8], limits: DecodeLimits) -> DecodeResult {
-    let image = read_image(Cursor::new(bytes), limits)?;
-    decode_initialized_image(image, limits, None)
+pub fn decode_memory(mut bytes: &[u8], limits: DecodeLimits) -> DecodeResult {
+    decode_input(&mut bytes, limits, None)
 }
 
-fn read_image(reader: impl Read, limits: DecodeLimits) -> Result<JxlImage, DecodeError> {
-    JxlImage::builder()
-        .alloc_tracker(AllocTracker::with_limit(limits.memory_ceiling_bytes))
-        .read(reader)
-        .map_err(|error| classify_decoder_error(error, limits.memory_ceiling_bytes))
+struct RayonRunner;
+impl JxlParallelRunner for RayonRunner {
+    fn run(&mut self, count: usize, fun: &JxlParallelRunnerFun<'_>) -> jxl::error::Result<()> {
+        (0..count).into_par_iter().try_for_each(fun)
+    }
+    fn num_threads(&self) -> usize {
+        rayon::current_num_threads()
+    }
 }
 
-fn decode_initialized_image(
-    mut image: JxlImage,
+// Inputs are complete files, so a request for more input means truncation.
+fn advance(
+    decoder: &mut JxlDecoder,
+    input: &mut impl JxlBitstreamInput,
+    buffers: Option<&mut [JxlOutputBuffer<'_>]>,
+    limits: DecodeLimits,
+) -> Result<Event, DecodeError> {
+    match decoder
+        .process(input, buffers, Some(&mut RayonRunner))
+        .map_err(|error| decoder_error(error, limits))?
+    {
+        Event::NeedMoreInput { .. } => Err(DecodeError::Decoder(Box::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "incomplete JPEG XL input",
+        )))),
+        event => Ok(event),
+    }
+}
+
+fn expect_event(event: Event, expected: Event) -> Result<(), DecodeError> {
+    if event == expected {
+        Ok(())
+    } else {
+        Err(unexpected_event(event))
+    }
+}
+
+fn unexpected_event(event: Event) -> DecodeError {
+    DecodeError::Decoder(Box::new(std::io::Error::other(format!(
+        "unexpected JPEG XL decoder event {event:?}"
+    ))))
+}
+
+fn decoder_error(error: jxl::error::Error, limits: DecodeLimits) -> DecodeError {
+    match error {
+        jxl::error::Error::ImageSizeTooLarge(..)
+        | jxl::error::Error::OutOfMemory(..)
+        | jxl::error::Error::ImageOutOfMemory(..) => DecodeError::DecoderMemoryLimit {
+            limit: limits.memory_ceiling_bytes,
+        },
+        _ => DecodeError::Decoder(Box::new(error)),
+    }
+}
+
+fn decode_input(
+    input: &mut impl JxlBitstreamInput,
     limits: DecodeLimits,
     maximum_retained_bytes: Option<u64>,
 ) -> DecodeResult {
-    // Header metadata exists before rendering and before our output allocation.
-    let width = image.width();
-    let height = image.height();
-    let (associated_alpha, grayscale, xyb_encoded) = {
-        let source = &image.image_header().metadata;
-        (
-            source
-                .ec_info
-                .iter()
-                .find_map(jxl_oxide::image::ExtraChannelInfo::alpha_associated)
-                .unwrap_or(false),
-            source.grayscale(),
-            source.xyb_encoded,
-        )
-    };
-    let metadata = extract_metadata(&image);
-    let hdr_type = image.hdr_type();
-    let source_dynamic_range = match hdr_type {
-        Some(HdrType::Pq) => SourceDynamicRange::Pq,
-        Some(HdrType::Hlg) => SourceDynamicRange::Hlg,
-        None => SourceDynamicRange::Sdr,
-    };
+    let mut options = JxlDecoderOptions::default();
+    options.sample_limit = Some(limits.memory_ceiling_bytes / size_of::<f32>());
+    options.request_aux_boxes = vec![JxlAuxBoxType::EXIF, XML];
+    let mut decoder = JxlDecoder::new(options);
+    expect_event(
+        advance(&mut decoder, input, None, limits)?,
+        Event::BasicInfo,
+    )?;
+    let info = decoder.basic_info().expect("basic info follows BasicInfo");
+    let embedded_profile = decoder
+        .embedded_color_profile()
+        .expect("color profile follows BasicInfo");
+    // basic_info().size is already oriented when adjust_orientation is enabled.
+    let width = u32::try_from(info.size.0).map_err(|_| DecodeError::SizeOverflow)?;
+    let height = u32::try_from(info.size.1).map_err(|_| DecodeError::SizeOverflow)?;
     validate_dimensions(width, height)?;
-    validate_extra_channels(&image)?;
-    let required_retained_bytes = estimated_memory_cost_bytes(width, height)?;
-    let required_output_and_scratch_bytes = required_retained_bytes
-        .checked_add(estimated_render_scratch_bytes(width, height)?)
-        .ok_or(DecodeError::SizeOverflow)?;
-    validate_output_memory(required_output_and_scratch_bytes, limits)?;
+    for channel in &info.extra_channels {
+        if channel.ec_type != ExtraChannel::Alpha {
+            return Err(DecodeError::UnsupportedExtraChannel(format!(
+                "{:?}",
+                channel.ec_type
+            )));
+        }
+    }
+    let opaque = info.extra_channels.is_empty();
+    let associated_alpha = info
+        .extra_channels
+        .first()
+        .is_some_and(|channel| channel.alpha_associated);
+    let mut metadata = source_metadata(info, embedded_profile);
+    let source = SourceCalibration::from_header(info, embedded_profile)?;
+    if associated_alpha
+        && (source.xyb
+            || embedded_profile.channels() != 3
+            || matches!(
+                source.dynamic_range,
+                SourceDynamicRange::Pq | SourceDynamicRange::Hlg
+            ))
+    {
+        return Err(DecodeError::UnsupportedAssociatedAlphaEncoding);
+    }
+    let required = estimated_memory_cost_bytes(width, height)?;
+    validate_output_memory(
+        required
+            .checked_add(estimated_render_scratch_bytes(width, height)?)
+            .ok_or(DecodeError::SizeOverflow)?,
+        limits,
+    )?;
     if let Some(available) = maximum_retained_bytes
-        && required_retained_bytes > available
+        && required > available
     {
         return Err(DecodeError::PrefetchTooLarge {
-            required: required_retained_bytes,
+            required,
             available,
         });
     }
-    let (render, pixel_format, transform) = if associated_alpha {
-        if xyb_encoded || grayscale || hdr_type.is_some() {
-            return Err(DecodeError::UnsupportedAssociatedAlphaEncoding);
-        }
-        let source_icc = image.rendered_icc();
-        let source_format = image.pixel_format();
-        let render = render_frame(&image, false, limits.memory_ceiling_bytes)?;
-        request_working_space(&mut image);
-        let target_icc = image.rendered_icc();
-        let transform = create_rgb_icc_transform(&source_icc, &target_icc)?;
-        (
-            render,
-            source_format,
-            CanonicalTransform::AssociatedIcc(transform),
-        )
-    } else if let Some(hdr_type) = hdr_type {
-        request_hdr_working_gamut(&mut image, hdr_type);
-        let pixel_format = image.pixel_format();
-        let render = render_frame(
-            &image,
-            matches!(metadata.color_encoding, SourceColorEncoding::Icc { .. }),
-            limits.memory_ceiling_bytes,
-        )?;
-        (
-            render,
-            pixel_format,
-            CanonicalTransform::Hdr {
-                hdr_type,
-                intensity_target: SourceIntensityTarget::from_jxl_metadata(
-                    metadata.tone_mapping.intensity_target_nits,
-                ),
-            },
-        )
-    } else {
-        request_working_space(&mut image);
-        let pixel_format = image.pixel_format();
-        let render = render_frame(
-            &image,
-            matches!(metadata.color_encoding, SourceColorEncoding::Icc { .. }),
-            limits.memory_ceiling_bytes,
-        )?;
-        (render, pixel_format, CanonicalTransform::None)
+    let extra_count = info.extra_channels.len();
+    decoder
+        .set_pixel_format(JxlPixelFormat::rgba_f16(extra_count))
+        .map_err(|error| decoder_error(error, limits))?;
+    let output_profile = decoder
+        .output_color_profile()
+        .expect("output profile follows BasicInfo");
+    let mut conversion = ColorConversion::new(
+        output_profile,
+        associated_alpha,
+        source.dynamic_range,
+        source.intensity,
+    )?;
+    // Integer samples span [0, 1] in their own encoding. Outside it, lossy
+    // reconstruction overshoot would reach SDR gamut mapping as fake color.
+    // XYB sources with an ICC profile decode to linear sRGB instead, where
+    // negative values can be real wide-gamut color.
+    conversion.clamp_to_nominal_range =
+        !source.float_samples && Some(output_profile) == decoder.embedded_color_profile();
+    let mut pixels = allocate_vec::<CanonicalPixel>(checked_pixel_count(width, height)?, true)?;
+    // Coalescing processes hidden/reference frames internally before this frame.
+    expect_event(
+        advance(&mut decoder, input, None, limits)?,
+        Event::FrameHeader,
+    )?;
+    let mut buffers = [JxlOutputBuffer::new(
+        bytemuck::cast_slice_mut(&mut pixels),
+        usize_from_u32(height),
+        usize_from_u32(width) * CANONICAL_BYTES_PER_PIXEL,
+    )];
+    let has_more_frames = match advance(&mut decoder, input, Some(&mut buffers), limits)? {
+        Event::FrameComplete { has_more_frames } => has_more_frames,
+        event => return Err(unexpected_event(event)),
     };
-    let (store, memory_cost_bytes) =
-        render_canonical_store(&render, pixel_format, width, height, &transform)?;
+    let calibrated = calibrate_and_convert(pixels, width, height, opaque, conversion, source)?;
+    finish_metadata(decoder, input, has_more_frames, &mut metadata, limits)?;
+    let memory_cost_bytes = calibrated.store.memory_cost_bytes();
     Ok(Arc::new(DecodedImage {
-        store: Arc::new(store),
+        store: Arc::new(calibrated.store),
         width,
         height,
-        source_dynamic_range,
+        source_dynamic_range: source.dynamic_range,
+        source_peak: calibrated.source_peak,
+        intensity_target: source.intensity,
+        linear_unit: calibrated.linear_unit,
+        hdr_source: calibrated.hdr_source,
         metadata,
         memory_cost_bytes,
     }))
 }
 
-fn estimated_memory_cost_bytes(width: u32, height: u32) -> Result<u64, DecodeError> {
-    let canonical = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|pixels| pixels.checked_mul(CANONICAL_BYTES_PER_PIXEL as u64))
-        .ok_or(DecodeError::SizeOverflow)?;
-    let downsample = coarse_downsample(width, height);
-    let coarse = u64::from(width.div_ceil(downsample))
-        .checked_mul(u64::from(height.div_ceil(downsample)))
-        .and_then(|pixels| pixels.checked_mul(4 * size_of::<f32>() as u64))
-        .ok_or(DecodeError::SizeOverflow)?;
-    canonical
-        .checked_add(coarse)
-        .ok_or(DecodeError::SizeOverflow)
-}
-
-fn estimated_render_scratch_bytes(width: u32, height: u32) -> Result<u64, DecodeError> {
-    let row_bytes = usize::try_from(width)
-        .map_err(|_| DecodeError::SizeOverflow)?
-        .checked_mul(4 * size_of::<f32>())
-        .ok_or(DecodeError::SizeOverflow)?;
-    let rows = render_chunk_rows(row_bytes, usize_from_u32(coarse_downsample(width, height)))
-        .0
-        .min(usize::try_from(height).map_err(|_| DecodeError::SizeOverflow)?);
-    let bytes = rows
-        .checked_mul(row_bytes)
-        .ok_or(DecodeError::SizeOverflow)?;
-    u64::try_from(bytes).map_err(|_| DecodeError::SizeOverflow)
-}
-
-enum CanonicalTransform {
-    None,
-    Hdr {
-        hdr_type: HdrType,
-        intensity_target: SourceIntensityTarget,
-    },
-    AssociatedIcc(Arc<TransformF32Executor>),
-}
-
-impl CanonicalTransform {
-    fn apply(&self, pixels: &mut [f32]) -> Result<(), DecodeError> {
-        match self {
-            Self::None => Ok(()),
-            Self::Hdr {
-                hdr_type,
-                intensity_target,
-            } => {
-                linearize_hdr(pixels, *hdr_type, *intensity_target);
-                Ok(())
+fn finish_metadata(
+    mut decoder: JxlDecoder,
+    input: &mut impl JxlBitstreamInput,
+    has_more_frames: bool,
+    metadata: &mut ImageMetadata,
+    limits: DecodeLimits,
+) -> Result<(), DecodeError> {
+    if has_more_frames {
+        return extract_aux_boxes(&decoder, metadata, limits);
+    }
+    // Always process, even at external EOF: decoder buffers may hold metadata.
+    // The input holds the whole file, and closing it lets EOF end the boxes.
+    decoder.close_input();
+    expect_event(advance(&mut decoder, input, None, limits)?, Event::Complete)?;
+    extract_aux_boxes(&decoder, metadata, limits)?;
+    if let Some(aux) = decoder.trailing_box() {
+        let limit = limits.memory_ceiling_bytes.min(MAX_TRAILING_METADATA_BYTES);
+        let mut required = aux.raw_data().len();
+        if required > limit {
+            return Err(DecodeError::MetadataMemoryLimit { required, limit });
+        }
+        let mut remaining = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            // Include buffered bytes and probe only one byte past the cap.
+            let read_size = buffer.len().min(limit - required + 1);
+            let count = match input.read(&mut [IoSliceMut::new(&mut buffer[..read_size])]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result.map_err(|error| DecodeError::Decoder(Box::new(error)))?,
+            };
+            if count == 0 {
+                break;
             }
-            Self::AssociatedIcc(transform) => {
-                unpremultiply_encoded(pixels);
-                transform_rgb_icc(pixels, transform.as_ref())
+            required += count;
+            if required > limit {
+                return Err(DecodeError::MetadataMemoryLimit { required, limit });
             }
+            remaining
+                .try_reserve(count)
+                .map_err(|source| DecodeError::ScratchAllocation {
+                    required: remaining.len() + count,
+                    source,
+                })?;
+            remaining.extend_from_slice(&buffer[..count]);
         }
+        extract_aux_box(aux, &remaining, metadata, limits)?;
     }
+    Ok(())
 }
 
-fn request_hdr_working_gamut(image: &mut JxlImage, hdr_type: HdrType) {
-    image.request_color_encoding(EnumColourEncoding {
-        colour_space: ColourSpace::Rgb,
-        white_point: WhitePoint::D65,
-        primaries: Primaries::Bt2100,
-        tf: match hdr_type {
-            HdrType::Pq => TransferFunction::Pq,
-            HdrType::Hlg => TransferFunction::Hlg,
-        },
-        rendering_intent: RenderingIntent::Relative,
-    });
-}
-
-#[allow(clippy::cast_possible_truncation)] // Canonical image storage is intentionally f32.
-fn linearize_hdr(pixels: &mut [f32], hdr_type: HdrType, intensity_target: SourceIntensityTarget) {
-    match hdr_type {
-        HdrType::Pq => {
-            let scale = 10_000.0 / HDR_REFERENCE_WHITE_NITS;
-            pixels.par_chunks_exact_mut(4).for_each(|rgba| {
-                for channel in &mut rgba[..3] {
-                    *channel = pq_eotf(*channel) * scale;
-                }
-            });
-        }
-        HdrType::Hlg => {
-            let intensity_target = intensity_target.nits() as f32;
-            let gamma = hlg_system_gamma(intensity_target);
-            let scale = intensity_target / HDR_REFERENCE_WHITE_NITS;
-            pixels.par_chunks_exact_mut(4).for_each(|rgba| {
-                let mut scene = [
-                    hlg_inverse_oetf(rgba[0]),
-                    hlg_inverse_oetf(rgba[1]),
-                    hlg_inverse_oetf(rgba[2]),
-                ];
-                let luminance =
-                    scene[0].mul_add(0.2627, scene[1].mul_add(0.6780, scene[2] * 0.0593));
-                let multiplier = luminance.max(0.0).powf(gamma - 1.0) * scale;
-                for channel in &mut scene {
-                    *channel *= multiplier;
-                }
-                rgba[..3].copy_from_slice(&scene);
-            });
-        }
-    }
-}
-
-fn request_working_space(image: &mut JxlImage) {
-    image.request_color_encoding(EnumColourEncoding {
-        colour_space: ColourSpace::Rgb,
-        white_point: WhitePoint::D65,
-        primaries: Primaries::Bt2100,
-        tf: TransferFunction::Linear,
-        rendering_intent: RenderingIntent::Relative,
-    });
-}
-
-fn render_canonical_store(
-    render: &Render,
-    pixel_format: PixelFormat,
-    width: u32,
-    height: u32,
-    transform: &CanonicalTransform,
-) -> Result<(DecodedTileStore, usize), DecodeError> {
-    if pixel_format.has_black() {
-        return Err(DecodeError::UnsupportedPixelFormat(pixel_format.channels()));
-    }
-    let output_bytes = checked_output_bytes(width, height)?;
-
-    let writer = TileStoreWriter::new(width, height, output_bytes, !pixel_format.has_alpha())?;
-    let writer = stream_canonical_rgba(render, pixel_format, width, height, transform, writer)?;
-    let store = writer.finish()?;
-    let retained_bytes = store.memory_cost_bytes();
-    Ok((store, retained_bytes))
-}
-
-fn render_frame(
-    image: &JxlImage,
-    source_uses_icc: bool,
-    codec_allocation_ceiling: usize,
-) -> Result<Render, DecodeError> {
-    image.render_frame(0).map_err(|error| {
-        if image.num_loaded_keyframes() == 0 {
-            DecodeError::NoDisplayableKeyframe
+fn allocate_vec<T: Default>(count: usize, canonical: bool) -> Result<Vec<T>, DecodeError> {
+    let required = count
+        .checked_mul(size_of::<T>())
+        .ok_or(DecodeError::SizeOverflow)?;
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(count).map_err(|source| {
+        if canonical {
+            DecodeError::OutputAllocation { required, source }
         } else {
-            classify_render_error(error, source_uses_icc, codec_allocation_ceiling)
+            DecodeError::ScratchAllocation { required, source }
+        }
+    })?;
+    buffer.resize_with(count, T::default);
+    Ok(buffer)
+}
+
+fn profile_error(error: impl std::fmt::Display) -> DecodeError {
+    DecodeError::UnsupportedColorProfile(error.to_string())
+}
+
+fn working_profile() -> JxlColorProfile {
+    JxlColorProfile::Simple(JxlColorEncoding::RgbColorSpace {
+        white_point: JxlWhitePoint::D65,
+        primaries: JxlPrimaries::BT2100,
+        transfer_function: JxlTransferFunction::Linear,
+        rendering_intent: RenderingIntent::Relative,
+    })
+}
+
+fn dynamic_range(profile: &JxlColorProfile) -> Result<SourceDynamicRange, DecodeError> {
+    if let JxlColorProfile::Icc(bytes) = profile {
+        let icc = ColorProfile::new_from_slice(bytes).map_err(profile_error)?;
+        if icc.cicp.is_some_and(|cicp| {
+            matches!(
+                cicp.transfer_characteristics,
+                moxcms::TransferCharacteristics::Smpte2084 | moxcms::TransferCharacteristics::Hlg
+            )
+        }) {
+            // Embedded PQ/HLG ICC profiles may contain SDR tone mapping and
+            // placeholder reverse tables. Reject HDR transfers declared by CICP.
+            return Err(profile_error(
+                "embedded PQ/HLG ICC profiles are not supported",
+            ));
+        }
+    }
+    Ok(match profile.transfer_function() {
+        Some(JxlTransferFunction::PQ) => SourceDynamicRange::Pq,
+        Some(JxlTransferFunction::HLG) => SourceDynamicRange::Hlg,
+        Some(JxlTransferFunction::Linear) => SourceDynamicRange::Linear,
+        _ => SourceDynamicRange::Sdr,
+    })
+}
+
+fn profile_intent(source_icc: &[u8]) -> moxcms::RenderingIntent {
+    let value = source_icc.get(64..68).map_or(1, |bytes| {
+        u32::from_be_bytes(bytes.try_into().expect("four-byte intent"))
+    });
+    match value {
+        0 => moxcms::RenderingIntent::Perceptual,
+        2 => moxcms::RenderingIntent::Saturation,
+        3 => moxcms::RenderingIntent::AbsoluteColorimetric,
+        _ => moxcms::RenderingIntent::RelativeColorimetric,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum InverseTransfer {
+    None,
+    Pq,
+    Hlg,
+}
+
+// The decoder outputs the embedded encoding, or a linear fallback for XYB.
+// Any other pairing is inconsistent and rejected rather than guessed.
+fn output_processing(
+    source_dynamic_range: SourceDynamicRange,
+    transfer: Option<&JxlTransferFunction>,
+    intensity: f32,
+) -> Result<(InverseTransfer, f32), DecodeError> {
+    Ok(match (source_dynamic_range, transfer) {
+        (SourceDynamicRange::Sdr, _)
+            if !matches!(
+                transfer,
+                Some(JxlTransferFunction::PQ | JxlTransferFunction::HLG)
+            ) =>
+        {
+            (InverseTransfer::None, 1.0)
+        }
+        // Calibration sets the scale once the decoded samples are known.
+        (SourceDynamicRange::Linear, Some(JxlTransferFunction::Linear)) => {
+            (InverseTransfer::None, 1.0)
+        }
+        (SourceDynamicRange::Pq, Some(JxlTransferFunction::PQ)) => {
+            (InverseTransfer::Pq, PQ_PEAK_NITS / HDR_REFERENCE_WHITE_NITS)
+        }
+        (SourceDynamicRange::Hlg, Some(JxlTransferFunction::HLG)) => {
+            (InverseTransfer::Hlg, intensity / HDR_REFERENCE_WHITE_NITS)
+        }
+        // XYB fallback output is already display-linear and relative
+        // to the intensity target. Do not repeat the HLG OOTF.
+        (SourceDynamicRange::Pq | SourceDynamicRange::Hlg, Some(JxlTransferFunction::Linear)) => {
+            (InverseTransfer::None, intensity / HDR_REFERENCE_WHITE_NITS)
+        }
+        _ => {
+            return Err(profile_error(format!(
+                "unsupported {transfer:?} output for a {source_dynamic_range:?} source"
+            )));
         }
     })
 }
 
-fn stream_canonical_rgba(
-    render: &Render,
-    pixel_format: PixelFormat,
-    width: u32,
-    height: u32,
-    transform: &CanonicalTransform,
-    mut writer: TileStoreWriter,
-) -> Result<TileStoreWriter, DecodeError> {
-    let width_usize = usize::try_from(width).map_err(|_| DecodeError::SizeOverflow)?;
-    let height_usize = usize::try_from(height).map_err(|_| DecodeError::SizeOverflow)?;
-    let channels = pixel_format.channels();
-    let rgba_row_samples = width_usize
-        .checked_mul(4)
-        .ok_or(DecodeError::SizeOverflow)?;
-    let stream_row_samples = width_usize
-        .checked_mul(channels)
-        .ok_or(DecodeError::SizeOverflow)?;
-    let row_bytes = rgba_row_samples
-        .checked_mul(size_of::<f32>())
-        .ok_or(DecodeError::SizeOverflow)?;
-    let coarse_downsample = usize_from_u32(writer.downsample);
-    let (rows_per_chunk, preview_chunks_are_independent) =
-        render_chunk_rows(row_bytes, coarse_downsample);
-    let rows_per_chunk = rows_per_chunk.min(height_usize);
-    let mut stream = render.stream();
-    let expected_samples = width_usize
-        .checked_mul(height_usize)
-        .and_then(|pixels| pixels.checked_mul(channels))
-        .ok_or(DecodeError::SizeOverflow)?;
-    let actual_samples = usize::try_from(stream.width())
-        .unwrap_or(usize::MAX)
-        .saturating_mul(usize::try_from(stream.height()).unwrap_or(usize::MAX))
-        .saturating_mul(usize::try_from(stream.channels()).unwrap_or(usize::MAX));
-    if stream.width() != width
-        || stream.height() != height
-        || usize::try_from(stream.channels()).ok() != Some(channels)
-    {
-        return Err(DecodeError::IncompleteOutput {
-            actual: actual_samples,
-            expected: expected_samples,
-        });
-    }
+struct ColorConversion {
+    transform: Option<Arc<TransformF32Executor>>,
+    gray: bool,
+    associated: bool,
+    inverse_transfer: InverseTransfer,
+    scale: f32,
+    hlg_gamma: Option<f32>,
+    input_range: Option<RangeInclusive<f32>>,
+    clamp_to_nominal_range: bool,
+}
 
-    let scratch_samples = rows_per_chunk
-        .checked_mul(rgba_row_samples)
-        .ok_or(DecodeError::SizeOverflow)?;
-    let scratch_bytes = scratch_samples
-        .checked_mul(size_of::<f32>())
-        .ok_or(DecodeError::SizeOverflow)?;
-    let mut scratch = Vec::new();
-    scratch
-        .try_reserve_exact(scratch_samples)
-        .map_err(|source| DecodeError::ScratchAllocation {
-            required: scratch_bytes,
-            source,
-        })?;
-    scratch.resize(scratch_samples, 0.0_f32);
-    let mut first_row = 0_u32;
-    while first_row < height {
-        let row_count = usize_from_u32(height - first_row).min(rows_per_chunk);
-        let pixel_count = row_count
-            .checked_mul(width_usize)
-            .ok_or(DecodeError::SizeOverflow)?;
-        let stream_samples = row_count
-            .checked_mul(stream_row_samples)
-            .ok_or(DecodeError::SizeOverflow)?;
-        let rgba_samples = pixel_count
-            .checked_mul(4)
-            .ok_or(DecodeError::SizeOverflow)?;
-        let written = stream.write_to_buffer(&mut scratch[..stream_samples]);
-        if written != stream_samples {
-            return Err(DecodeError::IncompleteOutput {
-                actual: written,
-                expected: stream_samples,
-            });
+impl ColorConversion {
+    #[expect(clippy::cast_possible_truncation)] // JXL intensity is f32 metadata.
+    fn new(
+        profile: &JxlColorProfile,
+        associated: bool,
+        source_dynamic_range: SourceDynamicRange,
+        intensity: SourceIntensityTarget,
+    ) -> Result<Self, DecodeError> {
+        let intensity = intensity.nits() as f32;
+        let (inverse_transfer, scale) =
+            output_processing(source_dynamic_range, profile.transfer_function(), intensity)?;
+        let hlg_gamma =
+            (inverse_transfer == InverseTransfer::Hlg).then(|| hlg_system_gamma(intensity));
+        let source = if inverse_transfer == InverseTransfer::None {
+            profile.clone()
+        } else {
+            profile
+                .with_linear_tf()
+                .ok_or_else(|| profile_error("missing linear HDR profile"))?
+        };
+        let target = working_profile();
+        let gray = source.channels() == 1;
+        let mut bounded_below = false;
+        let mut bounded_above = false;
+        let transform = if source.same_color_encoding(&target) {
+            None
+        } else {
+            let source_icc = source
+                .try_as_icc()
+                .ok_or_else(|| profile_error("missing source ICC profile"))?;
+            let target_icc = target
+                .try_as_icc()
+                .ok_or_else(|| profile_error("missing target ICC profile"))?;
+            let source = ColorProfile::new_from_slice(&source_icc).map_err(profile_error)?;
+            let target = ColorProfile::new_from_slice(&target_icc).map_err(profile_error)?;
+            if !matches!(
+                source.color_space,
+                DataColorSpace::Rgb | DataColorSpace::Gray
+            ) {
+                return Err(profile_error(
+                    "only RGB and gray ICC profiles are supported",
+                ));
+            }
+            // LUT profiles do not promise extended-range behavior.
+            let lut = source.lut_a_to_b_perceptual.is_some()
+                || source.lut_a_to_b_colorimetric.is_some()
+                || source.lut_a_to_b_saturation.is_some();
+            bounded_below = lut;
+            bounded_above = lut;
+            Some(
+                source
+                    .create_transform_f32(
+                        if gray { Layout::Gray } else { Layout::Rgb },
+                        &target,
+                        Layout::Rgb,
+                        TransformOptions {
+                            rendering_intent: profile_intent(&source_icc),
+                            prefer_fixed_point: false,
+                            allow_extended_range_rgb_xyz: true,
+                            ..Default::default()
+                        },
+                    )
+                    .map_err(profile_error)?,
+            )
+        };
+        if let Some(transform) = &transform {
+            let support = supported_input_range(transform.as_ref(), if gray { 1 } else { 3 });
+            bounded_below |= !support.below_zero;
+            bounded_above |= !support.above_one;
         }
-        expand_to_rgba_in_place(&mut scratch[..rgba_samples], pixel_format, pixel_count)?;
-        transform.apply(&mut scratch[..rgba_samples])?;
-        let row_count_u32 =
-            u32::try_from(row_count).expect("chunk rows are bounded by the u32 image height");
-        writer.write_rows(
-            first_row,
-            row_count_u32,
-            &scratch[..rgba_samples],
-            preview_chunks_are_independent,
-        )?;
-        first_row += row_count_u32;
+        Ok(Self {
+            transform,
+            gray,
+            associated,
+            inverse_transfer,
+            scale,
+            hlg_gamma,
+            input_range: input_range(bounded_below, bounded_above),
+            clamp_to_nominal_range: false,
+        })
     }
-    Ok(writer)
+
+    fn input_channels(&self) -> usize {
+        if self.gray { 1 } else { 3 }
+    }
+
+    // Writes one chunk of source samples as normalized working-space RGB.
+    fn convert_chunk(
+        &self,
+        chunk: &[CanonicalPixel],
+        input: &mut [f32],
+        output: &mut [f32],
+    ) -> Result<(), DecodeError> {
+        let channels = self.input_channels();
+        let input = &mut input[..chunk.len() * channels];
+        for (pixel, samples) in chunk.iter().zip(input.chunks_exact_mut(channels)) {
+            for (channel, value) in samples.iter_mut().enumerate() {
+                *value = self.unpack(*pixel, channel);
+            }
+        }
+        if let Some(range) = &self.input_range
+            && input
+                .iter()
+                .any(|value| !value.is_finite() || !range.contains(value))
+        {
+            return Err(profile_error(
+                "extended-range samples with a range-limited ICC profile are not supported",
+            ));
+        }
+        if let Some(transform) = &self.transform {
+            transform.transform(input, output).map_err(profile_error)?;
+        } else {
+            output.copy_from_slice(input);
+        }
+        for rgb in output.chunks_exact_mut(3) {
+            self.normalize(rgb);
+        }
+        Ok(())
+    }
+
+    fn unpack(&self, pixel: CanonicalPixel, channel: usize) -> f32 {
+        let mut value = half::f16::from_bits(pixel[channel]).to_f32();
+        // The nominal range bounds stored samples. Unpremultiplication can
+        // recover valid above-white color even from integer samples.
+        if self.clamp_to_nominal_range {
+            value = value.clamp(0.0, 1.0);
+        }
+        if self.associated {
+            let alpha = finite_alpha(half::f16::from_bits(pixel[3]).to_f32());
+            value = if alpha > 0.0 { value / alpha } else { 0.0 };
+        }
+        // jxl clamps only converted XYB output. Original-profile float
+        // samples get the same range: overshoot beyond it is not meaningful
+        // luminance and can overflow f16 storage.
+        match self.inverse_transfer {
+            InverseTransfer::None => value,
+            InverseTransfer::Pq => pq_eotf(value.clamp(0.0, 1.0)),
+            InverseTransfer::Hlg => hlg_inverse_oetf(value.clamp(HLG_SIGNAL_MIN, HLG_SIGNAL_MAX)),
+        }
+    }
+
+    // Only linear RGB uses this matrix probe. Grayscale luminance is
+    // channel zero; RGB weights are the Y row of source -> linear BT.2020.
+    fn maximum_luminance(&self, pixels: &[CanonicalPixel]) -> Result<f32, DecodeError> {
+        let weights = if self.gray {
+            [1.0, 0.0, 0.0]
+        } else if let Some(transform) = &self.transform {
+            let mut columns = [0.0; 9];
+            transform
+                .transform(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], &mut columns)
+                .map_err(profile_error)?;
+            std::array::from_fn(|channel| bt2020_luminance(&columns[channel * 3..channel * 3 + 3]))
+        } else {
+            BT2020_LUMA
+        };
+        let channels = self.input_channels();
+        Ok(pixels
+            .par_iter()
+            .map(|pixel| {
+                let rgba = pixel.map(|value| half::f16::from_bits(value).to_f32());
+                if !rgba[3].is_finite()
+                    || rgba[..channels].iter().any(|value| !value.is_finite())
+                    || (self.associated && rgba[3] <= 0.0)
+                {
+                    return 0.0;
+                }
+                let alpha = if self.associated {
+                    finite_alpha(rgba[3])
+                } else {
+                    1.0
+                };
+                rgba[..channels]
+                    .iter()
+                    .zip(weights)
+                    .map(|(value, weight)| value / alpha * weight)
+                    .sum::<f32>()
+            })
+            .reduce(|| 0.0, f32::max))
+    }
+
+    fn normalize(&self, rgb: &mut [f32]) {
+        let multiplier = self.hlg_gamma.map_or(self.scale, |gamma| {
+            bt2020_luminance(rgb).max(0.0).powf(gamma - 1.0) * self.scale
+        });
+        for value in rgb {
+            *value *= multiplier;
+        }
+    }
 }
 
-fn render_chunk_rows(row_bytes: usize, coarse_downsample: usize) -> (usize, bool) {
-    let maximum_rows = (MAX_RENDER_CHUNK_BYTES / row_bytes.max(1)).max(1);
-    if maximum_rows >= coarse_downsample {
-        (maximum_rows / coarse_downsample * coarse_downsample, true)
+fn bt2020_luminance(rgb: &[f32]) -> f32 {
+    rgb[0].mul_add(
+        BT2020_LUMA[0],
+        rgb[1].mul_add(BT2020_LUMA[1], rgb[2] * BT2020_LUMA[2]),
+    )
+}
+
+/// Header facts that resolve linear calibration and the HDR claim.
+#[derive(Clone, Copy)]
+struct SourceCalibration {
+    dynamic_range: SourceDynamicRange,
+    /// Header value before [`SourceIntensityTarget::from_jxl_metadata`].
+    raw_intensity: f32,
+    intensity: SourceIntensityTarget,
+    xyb: bool,
+    float_samples: bool,
+}
+
+impl SourceCalibration {
+    fn from_header(
+        info: &JxlBasicInfo,
+        embedded_profile: &JxlColorProfile,
+    ) -> Result<Self, DecodeError> {
+        let raw_intensity = info.tone_mapping.intensity_target;
+        Ok(Self {
+            dynamic_range: dynamic_range(embedded_profile)?,
+            raw_intensity,
+            intensity: SourceIntensityTarget::from_jxl_metadata(raw_intensity),
+            xyb: !info.uses_original_profile,
+            float_samples: matches!(info.bit_depth, JxlBitDepth::Float { .. }),
+        })
+    }
+
+    // libjxl writes 255 when the author set no target. An explicit 255 is
+    // indistinguishable and is treated as the default.
+    #[expect(clippy::float_cmp)] // The encoder default is an exact binary16 sentinel.
+    fn default_target(self) -> bool {
+        self.raw_intensity == 255.0
+    }
+
+    // Only non-XYB float sources with an explicit target call `maximum_luminance`.
+    #[expect(clippy::cast_possible_truncation)] // Metadata originated as f32.
+    fn linear_unit(
+        self,
+        maximum_luminance: impl FnOnce() -> Result<f32, DecodeError>,
+    ) -> Result<LinearUnit, DecodeError> {
+        let target = self.intensity.nits() as f32;
+        let nits = if self.default_target() {
+            // Uncalibrated: relative, like gamma-encoded SDR.
+            HDR_REFERENCE_WHITE_NITS
+        } else if self.xyb || !self.float_samples {
+            // The XYB transform and the integer maximum-value rule define 1.0.
+            target
+        } else {
+            // For original-profile floats the target only bounds luminance.
+            target / maximum_luminance()?.max(1.0)
+        };
+        Ok(LinearUnit {
+            nits,
+            assumed: self.default_target(),
+        })
+    }
+
+    fn hdr_source(self, source_peak: SourceIntensityTarget) -> bool {
+        let evidence = match self.dynamic_range {
+            // XYB samples with the default target carry neither a calibration nor
+            // exact values; codec overshoot alone can lift their peak above white.
+            SourceDynamicRange::Linear if self.xyb && self.default_target() => return false,
+            SourceDynamicRange::Sdr | SourceDynamicRange::Linear => source_peak,
+            // The transfer declares HDR intent. The measured peak may sit near
+            // white or include codec overshoot.
+            SourceDynamicRange::Pq | SourceDynamicRange::Hlg => self.intensity,
+        };
+        evidence.nits() > f64::from(HDR_REFERENCE_WHITE_NITS)
+    }
+}
+
+fn measured_source_peak(observed_peak_linear: f32) -> SourceIntensityTarget {
+    // Half the f16 spacing above canonical white absorbs CMS coefficient error.
+    // Darker content presents at white, where tone mapping is the identity.
+    let peak_linear = if observed_peak_linear <= 1.0 + 1.0 / 2048.0 {
+        1.0
     } else {
-        (maximum_rows, false)
+        observed_peak_linear
+    };
+    let nits = (peak_linear * HDR_REFERENCE_WHITE_NITS).min(PQ_PEAK_NITS);
+    SourceIntensityTarget::new(f64::from(nits))
+        .expect("measured peaks lie between reference white and 10,000 nits")
+}
+
+// Extended-range support is profile dependent even with the feature and runtime
+// option enabled. Probe neutral samples on either side of the nominal domain.
+// Reject out-of-domain pixels for transforms that clip or cannot evaluate them.
+fn supported_input_range(transform: &TransformF32Executor, channels: usize) -> RangeSupport {
+    const PROBES: [f32; 4] = [0.0, 1.0, -0.25, 2.0];
+    let mut source = [0.0; 3 * PROBES.len()];
+    for (pixel, value) in source.chunks_exact_mut(channels).zip(PROBES) {
+        pixel.fill(value);
+    }
+    let mut output = [[0.0_f32; 3]; PROBES.len()];
+    if transform
+        .transform(
+            &source[..channels * PROBES.len()],
+            output.as_flattened_mut(),
+        )
+        .is_err()
+        || output.as_flattened().iter().any(|value| !value.is_finite())
+    {
+        return RangeSupport::default();
+    }
+    let [zero, one, below_zero, above_one] = output;
+    RangeSupport {
+        below_zero: (0..3).all(|channel| below_zero[channel] < zero[channel] - 0.0001),
+        above_one: (0..3).all(|channel| above_one[channel] > one[channel] + 0.0001),
     }
 }
 
-struct TileStoreWriter {
+/// Out-of-domain inputs that a color transform preserves instead of clipping.
+#[derive(Clone, Copy, Debug, Default)]
+struct RangeSupport {
+    below_zero: bool,
+    above_one: bool,
+}
+
+fn input_range(bounded_below: bool, bounded_above: bool) -> Option<RangeInclusive<f32>> {
+    (bounded_below || bounded_above).then(|| {
+        let lower = if bounded_below {
+            0.0
+        } else {
+            f32::NEG_INFINITY
+        };
+        let upper = if bounded_above { 1.0 } else { f32::INFINITY };
+        lower..=upper
+    })
+}
+
+fn conversion_workers(width: u32, height: u32) -> usize {
+    rayon::current_num_threads()
+        .min(MAX_WORKERS)
+        .min(
+            checked_pixel_count(width, height)
+                .unwrap_or(usize::MAX)
+                .div_ceil(CHUNK_PIXELS),
+        )
+        .min(usize_from_u32(
+            height.div_ceil(coarse_downsample(width, height)),
+        ))
+        .max(1)
+}
+
+struct CalibratedImage {
+    store: DecodedTileStore,
+    source_peak: SourceIntensityTarget,
+    linear_unit: Option<LinearUnit>,
+    hdr_source: bool,
+}
+
+// Linear calibration needs the decoded samples, and the measured peak exists
+// only after conversion.
+fn calibrate_and_convert(
     pixels: Vec<CanonicalPixel>,
     width: u32,
     height: u32,
-    coarse_width: u32,
-    coarse_height: u32,
-    downsample: u32,
     opaque: bool,
-    coarse_pixels: Vec<CoarsePixel>,
-    coarse_accumulator: Vec<[f64; 4]>,
-    coarse_counts: Vec<u32>,
-    current_coarse_row: u32,
+    mut conversion: ColorConversion,
+    source: SourceCalibration,
+) -> Result<CalibratedImage, DecodeError> {
+    let linear_unit = if source.dynamic_range == SourceDynamicRange::Linear {
+        let unit = source.linear_unit(|| conversion.maximum_luminance(&pixels))?;
+        conversion.scale = unit.nits / HDR_REFERENCE_WHITE_NITS;
+        Some(unit)
+    } else {
+        None
+    };
+    let (store, observed_peak) = convert_pixels(pixels, width, height, opaque, &conversion)?;
+    // The PQ and HLG target only bounds the content; their pixels may stay far
+    // below it or exceed it. HLG decoding still uses the target for its OOTF.
+    let source_peak = match source.dynamic_range {
+        SourceDynamicRange::Sdr => SourceIntensityTarget::REFERENCE_WHITE,
+        SourceDynamicRange::Linear | SourceDynamicRange::Pq | SourceDynamicRange::Hlg => {
+            measured_source_peak(observed_peak)
+        }
+    };
+    Ok(CalibratedImage {
+        store,
+        source_peak,
+        linear_unit,
+        hdr_source: source.hdr_source(source_peak),
+    })
 }
 
-impl TileStoreWriter {
-    fn new(
-        width: u32,
-        height: u32,
-        canonical_bytes: usize,
-        opaque: bool,
-    ) -> Result<Self, DecodeError> {
-        let downsample = coarse_downsample(width, height);
-        let coarse_width = width.div_ceil(downsample);
-        let coarse_height = height.div_ceil(downsample);
-        let coarse_width_usize =
-            usize::try_from(coarse_width).map_err(|_| DecodeError::SizeOverflow)?;
-        let coarse_height_usize =
-            usize::try_from(coarse_height).map_err(|_| DecodeError::SizeOverflow)?;
-        let coarse_pixel_count = coarse_width_usize
-            .checked_mul(coarse_height_usize)
-            .ok_or(DecodeError::SizeOverflow)?;
-        debug_assert!(canonical_bytes.is_multiple_of(size_of::<CanonicalPixel>()));
-        let canonical_pixel_count = canonical_bytes / size_of::<CanonicalPixel>();
-        let mut pixels = Vec::new();
-        pixels
-            .try_reserve_exact(canonical_pixel_count)
-            .map_err(|source| DecodeError::OutputAllocation {
-                required: canonical_bytes,
-                source,
-            })?;
-        Ok(Self {
-            pixels,
+fn convert_pixels(
+    mut pixels: Vec<CanonicalPixel>,
+    width: u32,
+    height: u32,
+    opaque: bool,
+    conversion: &ColorConversion,
+) -> Result<(DecodedTileStore, f32), DecodeError> {
+    let downsample = coarse_downsample(width, height);
+    let coarse_width = width.div_ceil(downsample);
+    let coarse_height = height.div_ceil(downsample);
+    let mut preview =
+        allocate_vec::<CoarsePixel>(checked_pixel_count(coarse_width, coarse_height)?, false)?;
+    let coarse_rows_per_worker =
+        usize_from_u32(coarse_height).div_ceil(conversion_workers(width, height));
+    let rows_per_worker = coarse_rows_per_worker
+        .checked_mul(usize_from_u32(downsample))
+        .ok_or(DecodeError::SizeOverflow)?;
+    let band_pixels = rows_per_worker
+        .checked_mul(usize_from_u32(width))
+        .ok_or(DecodeError::SizeOverflow)?;
+    let peak = pixels
+        .par_chunks_mut(band_pixels)
+        .zip(preview.par_chunks_mut(coarse_rows_per_worker * usize_from_u32(coarse_width)))
+        .map(|(pixels, preview)| {
+            convert_band(pixels, preview, width, downsample, opaque, conversion)
+        })
+        .try_reduce(|| 0.0_f32, |left, right| Ok(left.max(right)))?;
+    Ok((
+        DecodedTileStore::new(
             width,
             height,
             coarse_width,
             coarse_height,
             downsample,
+            preview,
+            pixels,
+        ),
+        peak,
+    ))
+}
+
+fn convert_band(
+    pixels: &mut [CanonicalPixel],
+    preview: &mut [CoarsePixel],
+    width: u32,
+    downsample: u32,
+    opaque: bool,
+    conversion: &ColorConversion,
+) -> Result<f32, DecodeError> {
+    let rows = pixels.len() / usize_from_u32(width);
+    let scratch_pixels = pixels.len().min(CHUNK_PIXELS);
+    let mut input = allocate_vec::<f32>(scratch_pixels * conversion.input_channels(), false)?;
+    let mut output = allocate_vec::<f32>(scratch_pixels * 3, false)?;
+    let mut preview = BandPreview::new(preview, width, downsample, opaque)?;
+    let mut peak = 0.0_f32;
+    for (chunk_index, chunk) in pixels.chunks_mut(CHUNK_PIXELS).enumerate() {
+        let output = &mut output[..chunk.len() * 3];
+        conversion.convert_chunk(chunk, &mut input, output)?;
+        for (index, (pixel, rgb)) in chunk.iter_mut().zip(output.chunks_exact(3)).enumerate() {
+            let alpha = if opaque {
+                1.0
+            } else {
+                finite_alpha(half::f16::from_bits(pixel[3]).to_f32())
+            };
+            if alpha > 0.0 {
+                peak = rgb.iter().copied().fold(peak, f32::max);
+            }
+            preview.add(chunk_index * CHUNK_PIXELS + index, rgb, alpha);
+            *pixel = pack_premultiplied(rgb, alpha)?;
+        }
+    }
+    preview.finish(rows);
+    Ok(peak)
+}
+
+// Zero alpha also hides color that is not finite.
+fn premultiply(rgb: &[f32], alpha: f32) -> [f32; 3] {
+    if alpha > 0.0 {
+        [rgb[0] * alpha, rgb[1] * alpha, rgb[2] * alpha]
+    } else {
+        [0.0; 3]
+    }
+}
+
+fn pack_premultiplied(rgb: &[f32], alpha: f32) -> Result<CanonicalPixel, DecodeError> {
+    let [red, green, blue] = premultiply(rgb, alpha).map(half::f16::from_f32);
+    let pixel = [red, green, blue, half::f16::from_f32(alpha)];
+    if pixel.iter().all(|value| value.is_finite()) {
+        Ok(pixel.map(half::f16::to_bits))
+    } else {
+        Err(DecodeError::NonFiniteOutput)
+    }
+}
+
+// Builds one band's coarse preview while its pixels are converted.
+struct BandPreview<'a> {
+    preview: &'a mut [CoarsePixel],
+    width: usize,
+    downsample: usize,
+    coarse_width: usize,
+    opaque: bool,
+    // Premultiplied RGB and alpha of the coarse row being filled.
+    sums: Vec<[f64; 4]>,
+    coarse_y: usize,
+}
+
+impl<'a> BandPreview<'a> {
+    fn new(
+        preview: &'a mut [CoarsePixel],
+        width: u32,
+        downsample: u32,
+        opaque: bool,
+    ) -> Result<Self, DecodeError> {
+        let width = usize_from_u32(width);
+        let downsample = usize_from_u32(downsample);
+        let coarse_width = width.div_ceil(downsample);
+        let accumulator_width = if downsample == 1 { 0 } else { coarse_width };
+        Ok(Self {
+            preview,
+            width,
+            downsample,
+            coarse_width,
             opaque,
-            coarse_pixels: Vec::with_capacity(coarse_pixel_count),
-            coarse_accumulator: vec![[0.0; 4]; coarse_width_usize],
-            coarse_counts: vec![0; coarse_width_usize],
-            current_coarse_row: 0,
+            sums: allocate_vec(accumulator_width, false)?,
+            coarse_y: 0,
         })
     }
 
-    fn flush_coarse_row(&mut self) {
-        for (sum, count) in self
-            .coarse_accumulator
-            .iter_mut()
-            .zip(&mut self.coarse_counts)
-        {
-            self.coarse_pixels
-                .push(finalize_coarse_pixel(*sum, *count, self.opaque));
-            *sum = [0.0; 4];
-            *count = 0;
+    fn add(&mut self, position: usize, rgb: &[f32], alpha: f32) {
+        if self.downsample == 1 {
+            self.preview[position] = if alpha > 0.0 {
+                [rgb[0], rgb[1], rgb[2], alpha]
+            } else {
+                [0.0; 4]
+            };
+            return;
+        }
+        if position / self.width / self.downsample != self.coarse_y {
+            self.finish_row(self.downsample);
+        }
+        let sum = &mut self.sums[position % self.width / self.downsample];
+        for (total, value) in sum[..3].iter_mut().zip(premultiply(rgb, alpha)) {
+            *total += f64::from(value);
+        }
+        sum[3] += f64::from(alpha);
+    }
+
+    fn finish(mut self, rows: usize) {
+        if self.downsample > 1 {
+            self.finish_row(rows - self.coarse_y * self.downsample);
         }
     }
 
-    fn accumulate_partial_coarse_rows(&mut self, first_row: u32, pixels: &[f32]) {
-        let width = usize_from_u32(self.width);
-        for (local_row, row) in pixels.chunks_exact(width * 4).enumerate() {
-            let source_y = first_row
-                + u32::try_from(local_row)
-                    .expect("chunk-local rows are bounded by the u32 image height");
-            let coarse_y = source_y / self.downsample;
-            if coarse_y != self.current_coarse_row {
-                self.flush_coarse_row();
-                self.current_coarse_row = coarse_y;
-            }
-            for (x, rgba) in row.chunks_exact(4).enumerate() {
-                let alpha = if self.opaque {
-                    1.0
-                } else {
-                    finite_alpha(rgba[3])
-                };
-                let coarse_x = x / usize_from_u32(self.downsample);
-                let sum = &mut self.coarse_accumulator[coarse_x];
-                sum[0] += f64::from(rgba[0] * alpha);
-                sum[1] += f64::from(rgba[1] * alpha);
-                sum[2] += f64::from(rgba[2] * alpha);
-                sum[3] += f64::from(alpha);
-                self.coarse_counts[coarse_x] += 1;
-            }
-        }
-    }
-
-    fn write_rows(
-        &mut self,
-        first_row: u32,
-        row_count: u32,
-        pixels: &[f32],
-        preview_chunks_are_independent: bool,
-    ) -> Result<(), DecodeError> {
-        let width = usize_from_u32(self.width);
-        let expected = width
-            .checked_mul(usize_from_u32(row_count))
-            .and_then(|pixel_count| pixel_count.checked_mul(4))
-            .ok_or(DecodeError::SizeOverflow)?;
-        if pixels.len() != expected {
-            return Err(DecodeError::IncompleteOutput {
-                actual: pixels.len(),
-                expected,
-            });
-        }
-        if preview_chunks_are_independent {
-            debug_assert!(first_row.is_multiple_of(self.downsample));
-            debug_assert!(
-                row_count.is_multiple_of(self.downsample)
-                    || first_row.saturating_add(row_count) == self.height
-            );
-        }
-
-        append_premultiplied_rgba16f(pixels, &mut self.pixels, self.opaque);
-
-        if preview_chunks_are_independent {
-            append_coarse_preview_rows(
-                pixels,
-                self.width,
-                row_count,
-                self.downsample,
-                self.opaque,
-                &mut self.coarse_pixels,
-            );
-        } else {
-            self.accumulate_partial_coarse_rows(first_row, pixels);
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<DecodedTileStore, DecodeError> {
-        if self.coarse_counts.iter().any(|count| *count != 0) {
-            self.flush_coarse_row();
-        }
-        let expected_samples = usize_from_u32(self.coarse_width)
-            .checked_mul(usize_from_u32(self.coarse_height))
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or(DecodeError::SizeOverflow)?;
-        let actual_samples = self.coarse_pixels.len().saturating_mul(4);
-        if actual_samples != expected_samples {
-            return Err(DecodeError::IncompleteOutput {
-                actual: actual_samples,
-                expected: expected_samples,
-            });
-        }
-        let expected_bytes = usize_from_u32(self.width)
-            .checked_mul(usize_from_u32(self.height))
-            .and_then(|pixels| pixels.checked_mul(CANONICAL_BYTES_PER_PIXEL))
-            .ok_or(DecodeError::SizeOverflow)?;
-        let actual_bytes = self
-            .pixels
-            .len()
-            .saturating_mul(size_of::<CanonicalPixel>());
-        if actual_bytes != expected_bytes {
-            return Err(DecodeError::IncompleteOutput {
-                actual: actual_bytes,
-                expected: expected_bytes,
-            });
-        }
-        Ok(DecodedTileStore::new(
+    fn finish_row(&mut self, rows: usize) {
+        let start = self.coarse_y * self.coarse_width;
+        finish_preview_row(
+            &self.sums,
+            &mut self.preview[start..start + self.coarse_width],
             self.width,
-            self.height,
-            self.coarse_width,
-            self.coarse_height,
             self.downsample,
-            self.coarse_pixels,
-            self.pixels.into_boxed_slice(),
-        ))
+            rows,
+            self.opaque,
+        );
+        self.sums.fill([0.0; 4]);
+        self.coarse_y += 1;
     }
 }
 
-fn coarse_downsample(width: u32, height: u32) -> u32 {
-    let mut minimum = 1_u32;
-    let mut maximum = width.max(height).max(1);
-    while minimum < maximum {
-        let candidate = minimum + (maximum - minimum) / 2;
-        if coarse_preview_fits(width, height, candidate) {
-            maximum = candidate;
+#[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // Averaged preview intentionally uses f32.
+fn finish_preview_row(
+    sums: &[[f64; 4]],
+    preview: &mut [CoarsePixel],
+    width: usize,
+    downsample: usize,
+    rows: usize,
+    opaque: bool,
+) {
+    for (x, (sum, pixel)) in sums.iter().zip(preview).enumerate() {
+        let count = (width - x * downsample).min(downsample) as f64 * rows as f64;
+        let alpha = if opaque { 1.0 } else { (sum[3] / count) as f32 };
+        *pixel = if sum[3] > 0.0 {
+            [
+                (sum[0] / sum[3]) as f32,
+                (sum[1] / sum[3]) as f32,
+                (sum[2] / sum[3]) as f32,
+                alpha,
+            ]
         } else {
-            minimum = candidate + 1;
-        }
+            [0.0, 0.0, 0.0, alpha]
+        };
     }
-    minimum
-}
-
-fn coarse_preview_fits(width: u32, height: u32, downsample: u32) -> bool {
-    let coarse_width = width.div_ceil(downsample);
-    let coarse_height = height.div_ceil(downsample);
-    if coarse_width > MAX_COARSE_DIMENSION || coarse_height > MAX_COARSE_DIMENSION {
-        return false;
-    }
-    u64::from(coarse_width)
-        .checked_mul(u64::from(coarse_height))
-        .and_then(|pixels| pixels.checked_mul(size_of::<CoarsePixel>() as u64))
-        .is_some_and(|bytes| bytes <= MAX_COARSE_BYTES)
 }
 
 fn finite_alpha(alpha: f32) -> f32 {
@@ -670,344 +1034,72 @@ fn finite_alpha(alpha: f32) -> f32 {
     }
 }
 
-fn append_premultiplied_rgba16f(
-    source: &[f32],
-    destination: &mut Vec<CanonicalPixel>,
-    opaque: bool,
-) {
-    assert_eq!(source.len() % 4, 0);
-    if opaque {
-        destination.par_extend(source.par_chunks_exact(4).map(|rgba| {
-            encode_canonical_pixel([
-                half::f16::from_f32(rgba[0]).to_bits(),
-                half::f16::from_f32(rgba[1]).to_bits(),
-                half::f16::from_f32(rgba[2]).to_bits(),
-                half::f16::ONE.to_bits(),
-            ])
-        }));
-    } else {
-        destination.par_extend(source.par_chunks_exact(4).map(|rgba| {
-            let alpha = finite_alpha(rgba[3]);
-            encode_canonical_pixel([
-                half::f16::from_f32(rgba[0] * alpha).to_bits(),
-                half::f16::from_f32(rgba[1] * alpha).to_bits(),
-                half::f16::from_f32(rgba[2] * alpha).to_bits(),
-                half::f16::from_f32(alpha).to_bits(),
-            ])
-        }));
-    }
-}
-
-fn encode_canonical_pixel(channels: [u16; 4]) -> CanonicalPixel {
-    let red = channels[0].to_le_bytes();
-    let green = channels[1].to_le_bytes();
-    let blue = channels[2].to_le_bytes();
-    let alpha = channels[3].to_le_bytes();
-    [
-        red[0], red[1], green[0], green[1], blue[0], blue[1], alpha[0], alpha[1],
-    ]
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CoarseBlock {
-    first_x: usize,
-    end_x: usize,
-    first_y: usize,
-    end_y: usize,
-}
-
-impl CoarseBlock {
-    fn at(
-        coarse_index: usize,
-        coarse_width: usize,
-        width: usize,
-        row_count: usize,
-        downsample: usize,
-    ) -> Self {
-        let coarse_x = coarse_index % coarse_width;
-        let coarse_y = coarse_index / coarse_width;
-        let first_x = coarse_x * downsample;
-        let first_y = coarse_y * downsample;
-        Self {
-            first_x,
-            end_x: (first_x + downsample).min(width),
-            first_y,
-            end_y: (first_y + downsample).min(row_count),
-        }
-    }
-
-    fn sample_count(self) -> u32 {
-        u32::try_from((self.end_x - self.first_x) * (self.end_y - self.first_y))
-            .expect("coarse blocks contain at most u32-sized source geometry")
-    }
-}
-
-#[allow(clippy::cast_possible_truncation)] // The retained coarse preview intentionally uses f32.
-fn finalize_coarse_pixel(sum: [f64; 4], count: u32, opaque: bool) -> CoarsePixel {
-    let divisor = f64::from(count.max(1));
-    if opaque {
-        return [
-            (sum[0] / divisor) as f32,
-            (sum[1] / divisor) as f32,
-            (sum[2] / divisor) as f32,
-            1.0,
-        ];
-    }
-
-    let alpha = (sum[3] / divisor) as f32;
-    if sum[3] > 0.0 && sum[3].is_finite() {
-        [
-            (sum[0] / sum[3]) as f32,
-            (sum[1] / sum[3]) as f32,
-            (sum[2] / sum[3]) as f32,
-            alpha,
-        ]
-    } else {
-        [0.0, 0.0, 0.0, alpha]
-    }
-}
-
-fn average_opaque_coarse_block(source: &[f32], width: usize, block: CoarseBlock) -> CoarsePixel {
-    let mut sum = [0.0_f64; 4];
-    for y in block.first_y..block.end_y {
-        let row = &source[y * width * 4..(y + 1) * width * 4];
-        for rgba in row[block.first_x * 4..block.end_x * 4].chunks_exact(4) {
-            sum[0] += f64::from(rgba[0]);
-            sum[1] += f64::from(rgba[1]);
-            sum[2] += f64::from(rgba[2]);
-        }
-    }
-    finalize_coarse_pixel(sum, block.sample_count(), true)
-}
-
-fn average_transparent_coarse_block(
-    source: &[f32],
-    width: usize,
-    block: CoarseBlock,
-) -> CoarsePixel {
-    let mut sum = [0.0_f64; 4];
-    for y in block.first_y..block.end_y {
-        let row = &source[y * width * 4..(y + 1) * width * 4];
-        for rgba in row[block.first_x * 4..block.end_x * 4].chunks_exact(4) {
-            let alpha = finite_alpha(rgba[3]);
-            sum[0] += f64::from(rgba[0] * alpha);
-            sum[1] += f64::from(rgba[1] * alpha);
-            sum[2] += f64::from(rgba[2] * alpha);
-            sum[3] += f64::from(alpha);
-        }
-    }
-    finalize_coarse_pixel(sum, block.sample_count(), false)
-}
-
-fn average_coarse_block(
-    source: &[f32],
-    width: usize,
-    block: CoarseBlock,
-    opaque: bool,
-) -> CoarsePixel {
-    if opaque {
-        average_opaque_coarse_block(source, width, block)
-    } else {
-        average_transparent_coarse_block(source, width, block)
-    }
-}
-
-fn append_coarse_preview_rows(
-    source: &[f32],
-    width: u32,
-    row_count: u32,
-    downsample: u32,
-    opaque: bool,
-    destination: &mut Vec<CoarsePixel>,
-) {
-    let width = usize_from_u32(width);
-    let row_count = usize_from_u32(row_count);
-    let downsample = usize_from_u32(downsample);
-    let coarse_width = width.div_ceil(downsample);
-    let coarse_rows = row_count.div_ceil(downsample);
-    destination.par_extend(
-        (0..coarse_width * coarse_rows)
-            .into_par_iter()
-            .map(|coarse_index| {
-                let block =
-                    CoarseBlock::at(coarse_index, coarse_width, width, row_count, downsample);
-                average_coarse_block(source, width, block, opaque)
-            }),
-    );
-}
-
-fn expand_to_rgba_in_place(
-    pixels: &mut [f32],
-    pixel_format: PixelFormat,
-    pixel_count: usize,
-) -> Result<(), DecodeError> {
-    match pixel_format {
-        PixelFormat::Rgb => {
-            for index in (0..pixel_count).rev() {
-                let source = index * 3;
-                let destination = index * 4;
-                let rgba = [pixels[source], pixels[source + 1], pixels[source + 2], 1.0];
-                pixels[destination..destination + 4].copy_from_slice(&rgba);
-            }
-        }
-        PixelFormat::Rgba => {}
-        PixelFormat::Gray => {
-            for index in (0..pixel_count).rev() {
-                let gray = pixels[index];
-                let destination = index * 4;
-                pixels[destination..destination + 4].copy_from_slice(&[gray, gray, gray, 1.0]);
-            }
-        }
-        PixelFormat::Graya => {
-            for index in (0..pixel_count).rev() {
-                let source = index * 2;
-                let gray = pixels[source];
-                let alpha = pixels[source + 1];
-                let destination = index * 4;
-                pixels[destination..destination + 4].copy_from_slice(&[gray, gray, gray, alpha]);
-            }
-        }
-        PixelFormat::Cmyk | PixelFormat::Cmyka => {
-            return Err(DecodeError::UnsupportedPixelFormat(pixel_format.channels()));
-        }
-    }
-    Ok(())
-}
-
-fn classify_render_error(
-    error: Box<dyn std::error::Error + Send + Sync + 'static>,
-    source_uses_icc: bool,
-    codec_allocation_ceiling: usize,
-) -> DecodeError {
-    if error_chain_contains::<jxl_grid::OutOfMemory>(error.as_ref()) {
-        DecodeError::DecoderMemoryLimit {
-            limit: codec_allocation_ceiling,
-        }
-    } else if source_uses_icc && error_chain_contains::<moxcms::CmsError>(error.as_ref()) {
-        DecodeError::UnsupportedColorProfile(error.to_string())
-    } else {
-        DecodeError::Decoder(error)
-    }
-}
-
-fn classify_decoder_error(
-    error: Box<dyn std::error::Error + Send + Sync + 'static>,
-    codec_allocation_ceiling: usize,
-) -> DecodeError {
-    if error_chain_contains::<jxl_grid::OutOfMemory>(error.as_ref()) {
-        DecodeError::DecoderMemoryLimit {
-            limit: codec_allocation_ceiling,
-        }
-    } else {
-        DecodeError::Decoder(error)
-    }
-}
-
-fn error_chain_contains<T>(mut error: &(dyn std::error::Error + 'static)) -> bool
-where
-    T: std::error::Error + 'static,
-{
-    loop {
-        if error.downcast_ref::<T>().is_some() {
-            return true;
-        }
-        let Some(source) = error.source() else {
-            return false;
-        };
-        error = source;
-    }
-}
-
-fn unpremultiply_encoded(pixels: &mut [f32]) {
-    for rgba in pixels.chunks_exact_mut(4) {
-        let alpha = rgba[3];
-        if alpha > 0.0 && alpha.is_finite() {
-            rgba[0] /= alpha;
-            rgba[1] /= alpha;
-            rgba[2] /= alpha;
-        } else {
-            rgba[0] = 0.0;
-            rgba[1] = 0.0;
-            rgba[2] = 0.0;
-        }
-    }
-}
-
-fn create_rgb_icc_transform(
-    source_icc: &[u8],
-    target_icc: &[u8],
-) -> Result<Arc<TransformF32Executor>, DecodeError> {
-    let source = ColorProfile::new_from_slice(source_icc)
-        .map_err(|error| DecodeError::UnsupportedColorProfile(error.to_string()))?;
-    let target = ColorProfile::new_from_slice(target_icc)
-        .map_err(|error| DecodeError::UnsupportedColorProfile(error.to_string()))?;
-    if source.color_space != DataColorSpace::Rgb || target.color_space != DataColorSpace::Rgb {
-        return Err(DecodeError::UnsupportedColorProfile(
-            "associated alpha currently requires RGB profiles".to_owned(),
-        ));
-    }
-    source
-        .create_transform_f32(
-            Layout::Rgb,
-            &target,
-            Layout::Rgb,
-            TransformOptions {
-                rendering_intent: moxcms::RenderingIntent::RelativeColorimetric,
-                ..Default::default()
-            },
+fn estimated_memory_cost_bytes(width: u32, height: u32) -> Result<u64, DecodeError> {
+    let canonical = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(u64_from_usize(CANONICAL_BYTES_PER_PIXEL)))
+        .ok_or(DecodeError::SizeOverflow)?;
+    let downsample = coarse_downsample(width, height);
+    canonical
+        .checked_add(
+            u64::from(width.div_ceil(downsample))
+                * u64::from(height.div_ceil(downsample))
+                * u64_from_usize(size_of::<CoarsePixel>()),
         )
-        .map_err(|error| DecodeError::UnsupportedColorProfile(error.to_string()))
+        .ok_or(DecodeError::SizeOverflow)
 }
 
-fn transform_rgb_icc(
-    pixels: &mut [f32],
-    transform: &TransformF32Executor,
-) -> Result<(), DecodeError> {
-    let mut input = vec![0.0_f32; 1024 * 3];
-    let mut output = vec![0.0_f32; 1024 * 3];
-    for chunk in pixels.chunks_mut(1024 * 4) {
-        let pixel_count = chunk.len() / 4;
-        for (rgb, rgba) in input[..pixel_count * 3]
-            .chunks_exact_mut(3)
-            .zip(chunk.chunks_exact(4))
+fn estimated_render_scratch_bytes(width: u32, height: u32) -> Result<u64, DecodeError> {
+    let pixels = checked_pixel_count(width, height)?.min(CHUNK_PIXELS);
+    let downsample = coarse_downsample(width, height);
+    let row = if downsample == 1 {
+        0
+    } else {
+        usize_from_u32(width.div_ceil(downsample)) * size_of::<[f64; 4]>()
+    };
+    Ok(u64_from_usize(
+        (pixels * 6 * size_of::<f32>() + row) * conversion_workers(width, height),
+    ))
+}
+
+fn coarse_downsample(width: u32, height: u32) -> u32 {
+    let mut minimum = 1_u32;
+    let mut maximum = width.max(height).max(1);
+    while minimum < maximum {
+        let candidate = minimum + (maximum - minimum) / 2;
+        let (w, h) = (width.div_ceil(candidate), height.div_ceil(candidate));
+        if w <= MAX_COARSE_DIMENSION
+            && h <= MAX_COARSE_DIMENSION
+            && u64::from(w) * u64::from(h) * u64_from_usize(size_of::<CoarsePixel>())
+                <= MAX_COARSE_BYTES
         {
-            rgb.copy_from_slice(&rgba[..3]);
-        }
-        transform
-            .transform(&input[..pixel_count * 3], &mut output[..pixel_count * 3])
-            .map_err(|error| DecodeError::UnsupportedColorProfile(error.to_string()))?;
-        for (rgba, rgb) in chunk
-            .chunks_exact_mut(4)
-            .zip(output[..pixel_count * 3].chunks_exact(3))
-        {
-            rgba[..3].copy_from_slice(rgb);
+            maximum = candidate;
+        } else {
+            minimum = candidate + 1;
         }
     }
-    Ok(())
+    minimum
 }
 
 fn checked_pixel_count(width: u32, height: u32) -> Result<usize, DecodeError> {
-    let width = usize::try_from(width).map_err(|_| DecodeError::SizeOverflow)?;
-    let height = usize::try_from(height).map_err(|_| DecodeError::SizeOverflow)?;
-    width.checked_mul(height).ok_or(DecodeError::SizeOverflow)
-}
-
-fn checked_output_bytes(width: u32, height: u32) -> Result<usize, DecodeError> {
-    let pixel_count = checked_pixel_count(width, height)?;
-    pixel_count
-        .checked_mul(CANONICAL_BYTES_PER_PIXEL)
+    usize_from_u32(width)
+        .checked_mul(usize_from_u32(height))
         .ok_or(DecodeError::SizeOverflow)
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<(), DecodeError> {
     if width == 0 || height == 0 {
-        return Err(DecodeError::InvalidDimensions { width, height });
+        Err(DecodeError::InvalidDimensions { width, height })
+    } else {
+        checked_pixel_count(width, height)?
+            .checked_mul(CANONICAL_BYTES_PER_PIXEL)
+            .ok_or(DecodeError::SizeOverflow)
+            .map(|_| ())
     }
-    Ok(())
 }
 
 fn validate_output_memory(required: u64, limits: DecodeLimits) -> Result<(), DecodeError> {
-    let limit = u64::try_from(limits.memory_ceiling_bytes).unwrap_or(u64::MAX);
+    let limit = u64_from_usize(limits.memory_ceiling_bytes);
     if required > limit {
         Err(DecodeError::OutputMemoryLimit { required, limit })
     } else {
@@ -1015,469 +1107,150 @@ fn validate_output_memory(required: u64, limits: DecodeLimits) -> Result<(), Dec
     }
 }
 
-fn validate_extra_channels(image: &JxlImage) -> Result<(), DecodeError> {
-    for channel in &image.image_header().metadata.ec_info {
-        if !matches!(channel.ty, ExtraChannelType::Alpha { .. }) {
-            return Err(DecodeError::UnsupportedExtraChannel(format!(
-                "{:?}",
-                channel.ty
-            )));
+fn source_metadata(info: &JxlBasicInfo, profile: &JxlColorProfile) -> ImageMetadata {
+    let color_encoding = match profile {
+        JxlColorProfile::Icc(bytes) => SourceColorEncoding::Icc {
+            color_space: if profile.channels() == 1 {
+                "Grayscale"
+            } else {
+                "RGB"
+            }
+            .to_owned(),
+            profile_bytes: bytes.len(),
+        },
+        JxlColorProfile::Simple(encoding) => {
+            let (space, white, primaries, transfer) = match encoding {
+                JxlColorEncoding::RgbColorSpace {
+                    white_point,
+                    primaries,
+                    transfer_function,
+                    ..
+                } => (
+                    "RGB",
+                    white_point_label(white_point),
+                    Some(primaries_label(primaries)),
+                    transfer_label(transfer_function),
+                ),
+                JxlColorEncoding::GrayscaleColorSpace {
+                    white_point,
+                    transfer_function,
+                    ..
+                } => (
+                    "Grayscale",
+                    white_point_label(white_point),
+                    None,
+                    transfer_label(transfer_function),
+                ),
+                JxlColorEncoding::XYB { .. } => (
+                    "XYB",
+                    "D65".to_owned(),
+                    Some("sRGB".to_owned()),
+                    "Unknown".to_owned(),
+                ),
+            };
+            SourceColorEncoding::Enumerated {
+                color_space: space.to_owned(),
+                white_point: white,
+                primaries,
+                transfer_function: transfer,
+            }
+        }
+    };
+    ImageMetadata {
+        color_encoding,
+        tone_mapping: ToneMappingMetadata {
+            intensity_target_nits: info.tone_mapping.intensity_target,
+            min_nits: info.tone_mapping.min_nits,
+        },
+        exif: None,
+        xmp: None,
+    }
+}
+
+// Display names follow ITU-R and SMPTE usage rather than the jxl crate's
+// identifiers or its compact `Display` codes.
+fn primaries_label(primaries: &JxlPrimaries) -> String {
+    match primaries {
+        JxlPrimaries::SRGB => "sRGB",
+        // BT.2100 reuses the BT.2020 primaries.
+        JxlPrimaries::BT2100 => "BT.2020",
+        JxlPrimaries::P3 => "P3",
+        JxlPrimaries::Chromaticities { .. } => "custom",
+    }
+    .to_owned()
+}
+
+fn white_point_label(white_point: &JxlWhitePoint) -> String {
+    // ICC-derived encodings signal D50 as a custom chromaticity.
+    const D50: (f32, f32) = (0.3457, 0.3585);
+    const D50_TOLERANCE: f32 = 5.0e-4;
+    match white_point {
+        JxlWhitePoint::D65 => "D65".to_owned(),
+        JxlWhitePoint::DCI => "DCI".to_owned(),
+        JxlWhitePoint::E => "E (equal-energy)".to_owned(),
+        JxlWhitePoint::Chromaticity { wx, wy }
+            if (wx - D50.0).abs() <= D50_TOLERANCE && (wy - D50.1).abs() <= D50_TOLERANCE =>
+        {
+            "D50".to_owned()
+        }
+        JxlWhitePoint::Chromaticity { wx, wy } => format!("x {wx:.4}, y {wy:.4}"),
+    }
+}
+
+fn transfer_label(transfer: &JxlTransferFunction) -> String {
+    match transfer {
+        JxlTransferFunction::SRGB => "sRGB".to_owned(),
+        JxlTransferFunction::BT709 => "BT.709".to_owned(),
+        JxlTransferFunction::Linear => "Linear".to_owned(),
+        JxlTransferFunction::PQ => "PQ".to_owned(),
+        JxlTransferFunction::HLG => "HLG".to_owned(),
+        JxlTransferFunction::DCI => "DCI gamma 2.6".to_owned(),
+        // JPEG XL stores the encoding exponent; display gamma is its inverse.
+        JxlTransferFunction::Gamma(exponent) => {
+            let gamma = format!("{:.2}", 1.0 / exponent);
+            format!(
+                "Gamma {}",
+                gamma.trim_end_matches('0').trim_end_matches('.')
+            )
+        }
+    }
+}
+
+fn extract_aux_boxes(
+    decoder: &JxlDecoder,
+    metadata: &mut ImageMetadata,
+    limits: DecodeLimits,
+) -> Result<(), DecodeError> {
+    for box_type in [JxlAuxBoxType::EXIF, XML] {
+        for aux in decoder.aux_boxes(box_type) {
+            extract_aux_box(aux, &[], metadata, limits)?;
         }
     }
     Ok(())
 }
 
-fn colour_space_label(colour_space: ColourSpace) -> String {
-    match colour_space {
-        ColourSpace::Rgb => "Rgb",
-        ColourSpace::Grey => "Grey",
-        ColourSpace::Xyb => "Xyb",
-        ColourSpace::Unknown => "Unknown",
+fn extract_aux_box(
+    aux: &JxlAuxBox,
+    trailing: &[u8],
+    metadata: &mut ImageMetadata,
+    limits: DecodeLimits,
+) -> Result<(), DecodeError> {
+    let data = aux
+        .data(trailing)
+        .map_err(|error| decoder_error(error, limits))?;
+    if aux.box_type() == JxlAuxBoxType::EXIF && metadata.exif.is_none() {
+        let offset = data
+            .get(..4)
+            .ok_or_else(|| DecodeError::Decoder(Box::new(jxl::error::Error::InvalidBox)))?;
+        metadata.exif = Some(parse_exif(
+            &data[4..],
+            u32::from_be_bytes(offset.try_into().expect("four-byte offset")),
+        ));
+    } else if aux.box_type() == XML && metadata.xmp.is_none() {
+        metadata.xmp = Some(parse_xmp(&data));
     }
-    .to_owned()
-}
-
-fn white_point_label(white_point: WhitePoint) -> String {
-    match white_point {
-        WhitePoint::D65 => "D65".to_owned(),
-        WhitePoint::Custom(coordinates) => format!("Custom({coordinates:?})"),
-        WhitePoint::E => "E".to_owned(),
-        WhitePoint::Dci => "Dci".to_owned(),
-    }
-}
-
-fn primaries_label(primaries: Primaries) -> String {
-    match primaries {
-        Primaries::Srgb => "Srgb".to_owned(),
-        Primaries::Custom { red, green, blue } => {
-            format!("Custom {{ red: {red:?}, green: {green:?}, blue: {blue:?} }}")
-        }
-        Primaries::Bt2100 => "Bt2100".to_owned(),
-        Primaries::P3 => "P3".to_owned(),
-    }
-}
-
-fn transfer_function_label(transfer_function: TransferFunction) -> String {
-    match transfer_function {
-        TransferFunction::Gamma { g, inverted } => {
-            format!("Gamma {{ g: {g}, inverted: {inverted} }}")
-        }
-        TransferFunction::Bt709 => "BT.709".to_owned(),
-        TransferFunction::Unknown => "Unknown".to_owned(),
-        TransferFunction::Linear => "Linear".to_owned(),
-        TransferFunction::Srgb => "sRGB".to_owned(),
-        TransferFunction::Pq => "PQ".to_owned(),
-        TransferFunction::Dci => "DCI".to_owned(),
-        TransferFunction::Hlg => "HLG".to_owned(),
-    }
-}
-
-fn extract_metadata(image: &JxlImage) -> ImageMetadata {
-    let header = image.image_header();
-    let source = &header.metadata;
-    let color_encoding = match &source.colour_encoding {
-        ColourEncoding::Enum(encoding) => SourceColorEncoding::Enumerated {
-            colour_space: colour_space_label(encoding.colour_space),
-            white_point: white_point_label(encoding.white_point),
-            primaries: primaries_label(encoding.primaries),
-            transfer_function: transfer_function_label(encoding.tf),
-        },
-        ColourEncoding::IccProfile(colour_space) => SourceColorEncoding::Icc {
-            colour_space: colour_space_label(*colour_space),
-            profile_bytes: image.original_icc().map_or(0, <[u8]>::len),
-        },
-    };
-    let tone_mapping = &source.tone_mapping;
-    let exif = match image.aux_boxes().first_exif() {
-        Ok(AuxBoxData::Data(exif)) => Some(parse_exif(exif.payload(), exif.tiff_header_offset())),
-        Ok(AuxBoxData::Decoding | AuxBoxData::NotFound) | Err(_) => None,
-    };
-    let xmp = match image.aux_boxes().first_xml() {
-        AuxBoxData::Data(xml) => Some(parse_xmp(xml)),
-        AuxBoxData::Decoding | AuxBoxData::NotFound => None,
-    };
-
-    ImageMetadata {
-        color_encoding,
-        tone_mapping: ToneMappingMetadata {
-            intensity_target_nits: tone_mapping.intensity_target,
-            min_nits: tone_mapping.min_nits,
-        },
-        exif,
-        xmp,
-    }
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_utils::fixture_path;
-
-    struct ChunkedReader<R> {
-        inner: R,
-        maximum_chunk_bytes: usize,
-        reads: usize,
-    }
-
-    impl<R: Read> Read for ChunkedReader<R> {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            self.reads += 1;
-            let chunk_bytes = buffer.len().min(self.maximum_chunk_bytes);
-            self.inner.read(&mut buffer[..chunk_bytes])
-        }
-    }
-
-    #[test]
-    fn parallel_rgba16f_packing_matches_the_scalar_reference() {
-        let source: Vec<f32> = (0..65_537)
-            .flat_map(|index| {
-                let code = f32::from(u16::try_from(index % 4_096).unwrap()) / 4_095.0;
-                let alpha = match index % 6 {
-                    0 => -0.5,
-                    1 => 0.0,
-                    2 => 0.5,
-                    3 => 1.0,
-                    4 => 1.5,
-                    _ => f32::NAN,
-                };
-                [code * 4.0 - 1.0, code * 0.75, code * 16.0, alpha]
-            })
-            .collect();
-        let expected = encode_premultiplied_rgba16f_scalar_reference(&source);
-        let mut actual = Vec::with_capacity(expected.len());
-        let split = source.len() / 8 * 4;
-        append_premultiplied_rgba16f(&source[..split], &mut actual, false);
-        append_premultiplied_rgba16f(&source[split..], &mut actual, false);
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn opaque_rgba16f_packing_skips_alpha_work() {
-        let source = [-1.0, 0.25, 4.0, f32::NAN, 0.5, 1.5, 65_504.0, -1.0];
-        let expected = source
-            .chunks_exact(4)
-            .map(|rgba| {
-                encode_canonical_pixel([
-                    half::f16::from_f32(rgba[0]).to_bits(),
-                    half::f16::from_f32(rgba[1]).to_bits(),
-                    half::f16::from_f32(rgba[2]).to_bits(),
-                    half::f16::ONE.to_bits(),
-                ])
-            })
-            .collect::<Vec<_>>();
-        let mut actual = Vec::with_capacity(expected.len());
-        append_premultiplied_rgba16f(&source, &mut actual, true);
-        assert_eq!(actual, expected);
-    }
-
-    fn encode_premultiplied_rgba16f_scalar_reference(source: &[f32]) -> Vec<CanonicalPixel> {
-        source
-            .chunks_exact(4)
-            .map(|rgba| {
-                let alpha = finite_alpha(rgba[3]);
-                encode_canonical_pixel([
-                    half::f16::from_f32(rgba[0] * alpha).to_bits(),
-                    half::f16::from_f32(rgba[1] * alpha).to_bits(),
-                    half::f16::from_f32(rgba[2] * alpha).to_bits(),
-                    half::f16::from_f32(alpha).to_bits(),
-                ])
-            })
-            .collect()
-    }
-
-    #[test]
-    fn parallel_coarse_preview_matches_the_scalar_reference_across_chunks() {
-        const WIDTH: u32 = 7;
-        const ROW_COUNT: u32 = 5;
-        const DOWNSAMPLE: u32 = 3;
-        let source = (0..WIDTH * ROW_COUNT)
-            .flat_map(|index| {
-                let value = f32::from(u16::try_from(index).unwrap()) / 10.0 - 0.5;
-                let alpha = match index % 6 {
-                    0 => -0.5,
-                    1 => 0.0,
-                    2 => 0.25,
-                    3 => 0.75,
-                    4 => 1.5,
-                    _ => f32::NAN,
-                };
-                [value, value * 0.5, value * 2.0, alpha]
-            })
-            .collect::<Vec<_>>();
-        let second_chunk_start = usize::try_from(DOWNSAMPLE * WIDTH * 4).unwrap();
-
-        for opaque in [false, true] {
-            let expected =
-                coarse_preview_scalar_reference(&source, WIDTH, ROW_COUNT, DOWNSAMPLE, opaque);
-            let mut actual = Vec::with_capacity(expected.len());
-            append_coarse_preview_rows(
-                &source[..second_chunk_start],
-                WIDTH,
-                DOWNSAMPLE,
-                DOWNSAMPLE,
-                opaque,
-                &mut actual,
-            );
-            append_coarse_preview_rows(
-                &source[second_chunk_start..],
-                WIDTH,
-                ROW_COUNT - DOWNSAMPLE,
-                DOWNSAMPLE,
-                opaque,
-                &mut actual,
-            );
-            assert_eq!(actual, expected);
-        }
-    }
-
-    #[allow(clippy::cast_possible_truncation)] // Test dimensions bound every scalar-reference accumulator before f32 storage.
-    fn coarse_preview_scalar_reference(
-        source: &[f32],
-        width: u32,
-        row_count: u32,
-        downsample: u32,
-        opaque: bool,
-    ) -> Vec<CoarsePixel> {
-        let width = usize::try_from(width).unwrap();
-        let row_count = usize::try_from(row_count).unwrap();
-        let downsample = usize::try_from(downsample).unwrap();
-        let coarse_width = width.div_ceil(downsample);
-        let coarse_rows = row_count.div_ceil(downsample);
-        let mut sums = vec![[0.0_f64; 4]; coarse_width * coarse_rows];
-        let mut counts = vec![0_u32; sums.len()];
-
-        for y in 0..row_count {
-            let row = &source[y * width * 4..(y + 1) * width * 4];
-            for (x, rgba) in row.chunks_exact(4).enumerate() {
-                let index = y / downsample * coarse_width + x / downsample;
-                let sum = &mut sums[index];
-                let alpha = if opaque { 1.0 } else { finite_alpha(rgba[3]) };
-                sum[0] += f64::from(rgba[0] * alpha);
-                sum[1] += f64::from(rgba[1] * alpha);
-                sum[2] += f64::from(rgba[2] * alpha);
-                sum[3] += f64::from(alpha);
-                counts[index] += 1;
-            }
-        }
-
-        sums.into_iter()
-            .zip(counts)
-            .map(|(sum, count)| {
-                let divisor = f64::from(count.max(1));
-                let alpha = (sum[3] / divisor) as f32;
-                if sum[3] > 0.0 && sum[3].is_finite() {
-                    [
-                        (sum[0] / sum[3]) as f32,
-                        (sum[1] / sum[3]) as f32,
-                        (sum[2] / sum[3]) as f32,
-                        alpha,
-                    ]
-                } else {
-                    [0.0, 0.0, 0.0, alpha]
-                }
-            })
-            .collect()
-    }
-
-    #[test]
-    fn dimensions_have_no_fixed_upper_bound() {
-        assert!(matches!(
-            validate_dimensions(0, 1),
-            Err(DecodeError::InvalidDimensions { .. })
-        ));
-        validate_dimensions(u32::MAX, 1).unwrap();
-        validate_dimensions(1, u32::MAX).unwrap();
-    }
-
-    #[test]
-    fn maximum_header_dimensions_cannot_overflow_output_storage() {
-        assert!(matches!(
-            checked_output_bytes(u32::MAX, u32::MAX),
-            Err(DecodeError::SizeOverflow)
-        ));
-    }
-
-    #[test]
-    fn memory_limit_bounds_output_without_a_fixed_pixel_cap() {
-        let one_gigapixel_width = 50_000;
-        let one_gigapixel_height = 20_000;
-        let generous_limits = DecodeLimits::from_memory_ceiling_mib(8 * 1024);
-        let required = estimated_memory_cost_bytes(one_gigapixel_width, one_gigapixel_height)
-            .unwrap()
-            .checked_add(
-                estimated_render_scratch_bytes(one_gigapixel_width, one_gigapixel_height).unwrap(),
-            )
-            .unwrap();
-        validate_output_memory(required, generous_limits).unwrap();
-
-        let constrained_limits = DecodeLimits::from_memory_ceiling_mib(4 * 1024);
-        assert!(matches!(
-            validate_output_memory(required, constrained_limits),
-            Err(DecodeError::OutputMemoryLimit { .. })
-        ));
-    }
-
-    #[test]
-    fn extreme_single_row_is_governed_by_memory() {
-        let width = u32::MAX;
-        let required = estimated_memory_cost_bytes(width, 1)
-            .unwrap()
-            .checked_add(estimated_render_scratch_bytes(width, 1).unwrap())
-            .unwrap();
-        validate_output_memory(required, DecodeLimits::from_memory_ceiling_mib(128 * 1024))
-            .unwrap();
-        assert!(matches!(
-            validate_output_memory(required, DecodeLimits::from_memory_ceiling_mib(64 * 1024),),
-            Err(DecodeError::OutputMemoryLimit { .. })
-        ));
-    }
-
-    #[test]
-    fn canonical_store_reports_reservation_failure() {
-        assert!(matches!(
-            TileStoreWriter::new(1, 1, usize::MAX - 7, false),
-            Err(DecodeError::OutputAllocation { .. })
-        ));
-    }
-
-    #[test]
-    fn every_image_uses_the_same_bounded_preview_policy() {
-        assert_eq!(coarse_downsample(1_024, 1_024), 1);
-        assert_eq!(coarse_downsample(6_000, 4_000), 3);
-        assert_eq!(coarse_downsample(20_000, 5_000), 5);
-        assert_eq!(coarse_downsample(28_000, 7_143), 7);
-        assert_eq!(coarse_downsample(u32::MAX, 1), 1_048_576);
-        assert_eq!(coarse_downsample(1, u32::MAX), 1_048_576);
-        assert_eq!(coarse_downsample(u32::MAX, u32::MAX), 2_097_152);
-    }
-
-    #[test]
-    fn render_chunks_align_to_preview_bands_without_exceeding_the_byte_limit() {
-        let ordinary_row_bytes = 20_000 * 4 * size_of::<f32>();
-        let (ordinary_rows, ordinary_is_independent) = render_chunk_rows(ordinary_row_bytes, 8);
-        assert!(ordinary_is_independent);
-        assert!(ordinary_rows.is_multiple_of(8));
-        assert!(ordinary_rows * ordinary_row_bytes <= MAX_RENDER_CHUNK_BYTES);
-
-        let wide_row_bytes = 1_000_000 * 4 * size_of::<f32>();
-        let (wide_rows, wide_is_independent) = render_chunk_rows(wide_row_bytes, 256);
-        assert!(!wide_is_independent);
-        assert!(wide_rows * wide_row_bytes <= MAX_RENDER_CHUNK_BYTES);
-        assert_eq!(estimated_render_scratch_bytes(1, 1).unwrap(), 16);
-    }
-
-    #[test]
-    fn retained_memory_estimate_matches_completed_storage() {
-        let bytes = fs::read(fixture_path("test_pattern-sRGB.jxl")).unwrap();
-        let image = decode_memory(&bytes, DecodeLimits::from_memory_ceiling_mib(64)).unwrap();
-        assert_eq!(
-            estimated_memory_cost_bytes(image.width, image.height).unwrap(),
-            u64::try_from(image.memory_cost_bytes).unwrap()
-        );
-    }
-
-    #[test]
-    fn decoder_accepts_streamed_input() {
-        let bytes = fs::read(fixture_path("test_pattern-sRGB.jxl")).unwrap();
-        let limits = DecodeLimits::from_memory_ceiling_mib(64);
-        let mut reader = ChunkedReader {
-            inner: Cursor::new(bytes),
-            maximum_chunk_bytes: 7,
-            reads: 0,
-        };
-
-        let image = read_image(&mut reader, limits).unwrap();
-        assert!(reader.reads > 1);
-        let decoded = decode_initialized_image(image, limits, None).unwrap();
-        assert_eq!((decoded.width, decoded.height), (1_024, 1_024));
-    }
-
-    #[test]
-    fn oversized_prefetch_stops_after_header_inspection() {
-        let bytes = fs::read(fixture_path("test_pattern-sRGB.jxl")).unwrap();
-        let limits = DecodeLimits::from_memory_ceiling_mib(64);
-        assert!(matches!(
-            decode_initialized_image(
-                read_image(Cursor::new(&bytes), limits).unwrap(),
-                limits,
-                Some(1),
-            ),
-            Err(DecodeError::PrefetchTooLarge { .. })
-        ));
-    }
-
-    #[test]
-    fn lower_channel_formats_expand_backward_without_a_second_buffer() {
-        for (pixel_format, source, expected) in [
-            (
-                PixelFormat::Rgb,
-                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0][..],
-                &[1.0, 2.0, 3.0, 1.0, 4.0, 5.0, 6.0, 1.0][..],
-            ),
-            (
-                PixelFormat::Gray,
-                &[0.25, 0.75][..],
-                &[0.25, 0.25, 0.25, 1.0, 0.75, 0.75, 0.75, 1.0][..],
-            ),
-            (
-                PixelFormat::Graya,
-                &[0.25, 0.5, 0.75, 1.0][..],
-                &[0.25, 0.25, 0.25, 0.5, 0.75, 0.75, 0.75, 1.0][..],
-            ),
-        ] {
-            let mut pixels = vec![0.0; expected.len()];
-            pixels[..source.len()].copy_from_slice(source);
-            expand_to_rgba_in_place(&mut pixels, pixel_format, 2).unwrap();
-            assert_eq!(pixels, expected);
-        }
-    }
-
-    #[test]
-    fn unsupported_pixel_formats_and_incomplete_storage_are_typed() {
-        for (pixel_format, channels) in [(PixelFormat::Cmyk, 4), (PixelFormat::Cmyka, 5)] {
-            assert!(matches!(
-                expand_to_rgba_in_place(&mut [0.0; 4], pixel_format, 1),
-                Err(DecodeError::UnsupportedPixelFormat(actual)) if actual == channels
-            ));
-        }
-
-        let mut writer = TileStoreWriter::new(2, 2, 32, false).unwrap();
-        assert!(matches!(
-            writer.write_rows(0, 1, &[0.0; 7], true),
-            Err(DecodeError::IncompleteOutput {
-                actual: 7,
-                expected: 8,
-            })
-        ));
-        assert!(matches!(
-            writer.finish(),
-            Err(DecodeError::IncompleteOutput { .. })
-        ));
-    }
-
-    #[test]
-    fn cms_failures_have_a_specific_profile_error() {
-        let error = Box::new(moxcms::CmsError::UnsupportedProfileConnection);
-        assert!(matches!(
-            classify_render_error(error, true, 1024),
-            DecodeError::UnsupportedColorProfile(_)
-        ));
-
-        let error = Box::new(moxcms::CmsError::UnsupportedProfileConnection);
-        assert!(matches!(
-            classify_render_error(error, false, 1024),
-            DecodeError::Decoder(_)
-        ));
-    }
-
-    #[test]
-    fn decoder_allocation_failures_have_a_specific_error() {
-        let tracker = AllocTracker::with_limit(0);
-        let allocation_error = tracker.alloc::<u8>(1).unwrap_err();
-
-        assert!(matches!(
-            classify_decoder_error(Box::new(allocation_error), 0),
-            DecodeError::DecoderMemoryLimit { limit: 0 }
-        ));
-    }
-}
+mod tests;

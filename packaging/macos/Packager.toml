@@ -2,7 +2,7 @@
 # fields such as the version in sync with Cargo.toml.
 name = "xl-view"
 product-name = "XL-View"
-version = "0.3.1"
+version = "0.4.0"
 # Apple bundle identifiers cannot contain underscores, so macOS intentionally
 # uses a hyphen where the Linux and Windows application ID uses an underscore.
 identifier = "io.github.andrinbr.xl-view"

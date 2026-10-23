@@ -12,7 +12,7 @@ use wayland_protocols::wp::color_management::v1::client::{
 };
 
 use super::{HdrTarget, HdrUnavailableReason, wayland_target};
-use crate::gpu::DisplayChangeNotifier;
+use crate::gpu::{DisplayChangeNotifier, lock_unpoisoned};
 
 // Retain the raw protocol input so diagnostics and target selection share one
 // source of truth without re-querying the compositor.
@@ -109,9 +109,10 @@ impl DisplayTargetProvider {
             notify_changed,
         };
 
-        // Four roundtrips cap synchronous bootstrap latency; a slower
-        // compositor may publish an incomplete first snapshot, then the event
-        // thread completes it and emits the normal changed notification.
+        // Synchronous bootstrap is limited to four roundtrips, not to a fixed
+        // time. A compositor that needs more may publish an incomplete first
+        // snapshot; the event thread then completes it and emits the normal
+        // changed notification.
         for _ in 0..4 {
             if let Err(error) = event_queue.roundtrip(&mut state) {
                 tracing::warn!(%error, "cannot query Wayland color-management output information");
@@ -132,17 +133,11 @@ impl DisplayTargetProvider {
     }
 
     pub(in crate::gpu) fn target(&self, monitor_name: Option<&str>) -> HdrTarget {
-        self.snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .target(monitor_name)
+        lock_unpoisoned(&self.snapshot).target(monitor_name)
     }
 
     pub(in crate::gpu) fn raw_display_information(&self, monitor_name: Option<&str>) -> String {
-        let snapshot = self
-            .snapshot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = lock_unpoisoned(&self.snapshot);
         // Include every output, not just the current match. Names and raw
         // luminances make an OutputUnmatched result diagnosable.
         format!(
@@ -180,12 +175,7 @@ struct DescriptionKey {
 fn target_from_luminances(luminances: Option<WaylandLuminances>) -> HdrTarget {
     luminances.map_or_else(
         || Err(HdrUnavailableReason::MissingDisplayInformation),
-        |luminances| {
-            wayland_target(
-                Some(luminances.reference_white_nits),
-                Some(luminances.maximum_nits),
-            )
-        },
+        |luminances| wayland_target(luminances.reference_white_nits, luminances.maximum_nits),
     )
 }
 
@@ -246,10 +236,7 @@ impl State {
                 .collect(),
         };
         let changed = {
-            let mut current = self
-                .snapshot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut current = lock_unpoisoned(&self.snapshot);
             if *current == next {
                 false
             } else {

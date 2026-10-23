@@ -107,7 +107,7 @@ fn srgb_format_preference_is_stable() {
 }
 
 #[test]
-#[allow(clippy::float_cmp)] // The selected target and fixed white are exact fixtures.
+#[expect(clippy::float_cmp)] // The selected target and fixed white are exact fixtures.
 fn selection_carries_a_validated_presentation_peak() {
     let pq_capabilities = [capability(
         TextureFormat::Rgb10a2Unorm,
@@ -156,4 +156,23 @@ fn reselecting_the_same_candidate_does_not_require_surface_reconfiguration() {
     assert!(!same.requires_surface_reconfiguration(current));
     assert!(!new_peak.requires_surface_reconfiguration(current));
     assert!(sdr.requires_surface_reconfiguration(current));
+}
+
+#[test]
+fn output_errors_explain_the_cause_and_the_remedy() {
+    assert_eq!(
+        SurfaceOutputError::PqSurfaceUnavailable.to_string(),
+        "requested PQ output is unavailable because the GPU surface does not advertise BT.2100 PQ with Rgb10a2Unorm; use '--output auto' or '--output sdr'"
+    );
+    let reason = HdrUnavailableReason::MissingDisplayInformation;
+    assert_eq!(
+        SurfaceOutputError::HdrTargetUnavailable(reason).to_string(),
+        format!(
+            "requested PQ output is unavailable from {DISPLAY_INFORMATION_SOURCE}: {reason}; use '--output auto' or '--output sdr'"
+        )
+    );
+    assert_eq!(
+        SurfaceOutputError::SrgbSurfaceUnavailable.to_string(),
+        "sRGB output is unavailable because the GPU surface does not advertise an sRGB 8-bit format/color-space pair; check the display connection and GPU driver"
+    );
 }
