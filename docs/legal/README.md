@@ -6,8 +6,11 @@ Run these commands from the repository root.
 
 ```console
 cargo install --locked cargo-deny
-cargo install --locked cargo-about --features="cli"
+cargo install --locked cargo-about@0.9.2 --features="cli"
 ```
+
+Use the cargo-about version pinned in `.github/workflows/ci.yml`. Other
+versions can produce different notices, which fails the CI check.
 
 ## Check dependency licenses
 

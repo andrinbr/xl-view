@@ -30,9 +30,9 @@ jobs:
         run: rustup toolchain install
 
       - name: Install Cargo tools
-        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # pin v2.84.1
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # pin v2.87.30
         with:
-          tool: cargo-llvm-cov,cargo-deny,cargo-about
+          tool: cargo-llvm-cov,cargo-deny,cargo-about@0.9.2
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # pin v2.9.1
@@ -189,7 +189,7 @@ jobs:
         run: rustup toolchain install
 
       - name: Install cargo-packager
-        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # pin v2.84.1
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # pin v2.87.30
         with:
           tool: cargo-packager@0.11.8
 
@@ -226,7 +226,7 @@ jobs:
         run: rustup toolchain install
 
       - name: Install cargo-packager
-        uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # pin v2.84.1
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # pin v2.87.30
         with:
           tool: cargo-packager@0.11.8
 
