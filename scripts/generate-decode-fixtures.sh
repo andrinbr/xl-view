@@ -11,7 +11,7 @@ trap 'exit 1' HUP INT TERM
 # HDR test pattern.
 #
 # The RGB sample values are identical for all three outputs. Only the tagged
-# colour space and transfer function differ.
+# color space and transfer function differ.
 #
 # Layout:
 #   y=0..400     Eight grayscale patches
@@ -58,7 +58,7 @@ cjxl "$work/test-pattern.ppm" "$fixtures/test_pattern-PQ.jxl" \
     --distance=0 --modular=1 --effort=3 --num_threads=1 \
     --intensity_target=10000 -x color_space=Rec2100PQ --quiet
 
-# FP16 linear sources go through OpenEXR. cjxl takes an EXR's colour space from
+# FP16 linear sources go through OpenEXR. cjxl takes an EXR's color space from
 # its chromaticities attribute, defaulting to BT.709/sRGB, and ignores
 # -x color_space. ImageMagick writes no chromaticities, so BT.2020 sources are
 # tagged explicitly.
@@ -123,7 +123,7 @@ cjxl "$work/linear-stripes.pfm" "$fixtures/linear-xyb-sdr.jxl" \
     --distance=1 --effort=3 --num_threads=1 \
     -x color_space=RGB_D65_SRG_Rel_Lin --quiet
 
-# A linear-in-luminance grayscale ramp. PQ code values are absolute; HLG code
+# A linear-in-luminance grayscale ramp. PQ code values are absolute. HLG code
 # values include the nominal display OOTF for the selected peak.
 magick -size 1024x64 xc:black -colorspace RGB -channel RGB \
     -fx 'pow((3424.0/4096.0+(2413.0/128.0)*pow((1000.0/10000.0)*i/(w-1),2610.0/16384.0))/(1.0+(2392.0/128.0)*pow((1000.0/10000.0)*i/(w-1),2610.0/16384.0)),2523.0/32.0)' \

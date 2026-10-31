@@ -1232,7 +1232,7 @@ fn render_offscreen_scene(
     pixels
 }
 
-#[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // Packed values are at most ten bits; decoded sRGB fits f32.
+#[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // Packed values are at most ten bits. Decoded sRGB fits f32.
 fn decode_readback_row(bytes: &[u8], format: TextureFormat, width: u32) -> Vec<[f32; 4]> {
     let width = width as usize;
     match format {
@@ -1273,7 +1273,7 @@ fn gpu_failures_have_actionable_messages() {
     };
     assert_eq!(
         device_lost.to_string(),
-        "the GPU device was lost (Unknown): driver reset; restart xl-view"
+        "the GPU device was lost (Unknown): driver reset. Restart xl-view"
     );
     assert_eq!(device_lost.category(), "gpu_device_lost");
     let out_of_memory = GpuFailure::OutOfMemory;

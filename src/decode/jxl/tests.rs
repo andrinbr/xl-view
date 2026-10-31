@@ -198,7 +198,7 @@ fn nominal_sample_clamping_precedes_unpremultiplication() {
         let mut conversion = linear_conversion(&working_profile(), associated);
         conversion.clamp_to_nominal_range = true;
         // Lossy integer reconstruction overshoots both bounds. Only the stored
-        // samples are bounded; recovering straight color can exceed white.
+        // samples are bounded. Recovering straight color can exceed white.
         let (store, _) = convert_pixels(
             vec![packed([-0.25, 1.25, 0.25, 0.5])],
             1,
@@ -577,7 +577,7 @@ fn hdr_signals_present_their_measured_peak_and_decode_by_their_target() {
         (Pq, PQ, 1_000.0, 0.8125, pq_nits(0.8125), true),
         // and makes no HDR claim when the target sits below white.
         (Pq, PQ, 150.0, 0.75, pq_nits(0.75), false),
-        // HLG 0.5 displays at 51 nits; content below white presents at white.
+        // HLG 0.5 displays at 51 nits. Content below white presents at white.
         (Hlg, HLG, 1_000.0, 0.5, 203.0, true),
         (Hlg, HLG, 2_000.0, 1.0, 2_000.0, true),
         // The XYB fallback output is relative to the target.
@@ -658,7 +658,7 @@ fn conversion_table_rejects_inconsistent_outputs_and_keeps_sdr_fallback_relative
             rendering_intent: RenderingIntent::Relative,
         })
     };
-    // The decoder cannot produce these pairs; reject them instead of guessing.
+    // The decoder cannot produce these pairs, so reject them instead of guessing.
     for (range, output) in [
         (Linear, SRGB),
         (Sdr, PQ),

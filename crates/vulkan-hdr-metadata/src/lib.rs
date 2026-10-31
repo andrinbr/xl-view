@@ -66,8 +66,10 @@ impl fmt::Display for SignalStatus {
         formatter.write_str(match self {
             Self::Signaled => "signaled through VK_EXT_hdr_metadata",
             Self::NotRequested => "HDR metadata not requested",
-            Self::Unsupported => "VK_EXT_hdr_metadata unavailable; compositor fallback",
-            Self::SurfaceUnavailable => "native Vulkan swapchain unavailable; compositor fallback",
+            Self::Unsupported => "VK_EXT_hdr_metadata unavailable, using compositor fallback",
+            Self::SurfaceUnavailable => {
+                "native Vulkan swapchain unavailable, using compositor fallback"
+            }
         })
     }
 }

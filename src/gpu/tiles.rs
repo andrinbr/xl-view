@@ -21,7 +21,7 @@ const MISSING_TILE_SLOT: u32 = u32::MAX;
 ///
 /// `mapping[logical_tile]` names its resident slot, or
 /// [`MISSING_TILE_SLOT`]. `slot_tiles[slot] = Some(logical_tile)` reserves a
-/// slot for either a pending load or a resident tile; it is resident only when
+/// slot for either a pending load or a resident tile. It is resident only when
 /// the reverse `mapping` entry points back to that slot. `last_used` has one
 /// entry per slot. Generations let the worker reject stale jobs before their
 /// reserved slots can become resident.
@@ -53,7 +53,7 @@ struct TileJob {
 #[derive(Debug)]
 enum TileWorkResult {
     Ready(TileJob),
-    Cancelled(TileJob),
+    Canceled(TileJob),
     Failed(TileJob, io::Error),
 }
 
@@ -102,9 +102,9 @@ impl TileWorker {
     fn replace_pending(&self, generation: u64) -> Vec<TileJob> {
         let (state, wake) = self.state.as_ref();
         let mut state = lock_unpoisoned(state);
-        let cancelled = replace_pending_jobs(&mut state, generation);
+        let canceled = replace_pending_jobs(&mut state, generation);
         wake.notify_one();
-        cancelled
+        canceled
     }
 
     fn append(&self, generation: u64, jobs: Vec<TileJob>) -> Vec<TileJob> {
@@ -195,7 +195,7 @@ fn run_tile_worker(
                 Err(error) => TileWorkResult::Failed(job, error),
             }
         } else {
-            TileWorkResult::Cancelled(job)
+            TileWorkResult::Canceled(job)
         };
         if results.send(result).is_err() {
             return;
@@ -414,11 +414,11 @@ impl TileCache {
 
         self.request_generation = self.request_generation.wrapping_add(1);
         let generation = self.request_generation;
-        let cancelled = self
+        let canceled = self
             .worker
             .as_ref()
             .map_or_else(Vec::new, |worker| worker.replace_pending(generation));
-        for job in cancelled {
+        for job in canceled {
             self.release_loading_job(job);
         }
         self.desired_tiles = next_desired;
@@ -459,7 +459,7 @@ impl TileCache {
                         visual_change = true;
                     }
                 }
-                TileWorkResult::Cancelled(job) => self.release_loading_job(job),
+                TileWorkResult::Canceled(job) => self.release_loading_job(job),
                 TileWorkResult::Failed(job, error) => {
                     self.release_loading_job(job);
                     if job.generation == self.request_generation {

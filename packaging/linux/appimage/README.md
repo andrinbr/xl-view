@@ -16,7 +16,9 @@ podman run --rm --userns=keep-id:uid=1000,gid=1000 --volume "$PWD:/work:Z" xl-vi
 ```
 
 The container compiles, packages, and audits the mounted source tree. The result
-is written to `target/appimage/xl-view-vX.Y.Z-linux-x86_64.AppImage`.
+is written to `target/appimage/xl-view-vX.Y.Z-linux-x86_64.AppImage`, together
+with the `.zsync` file that AppImage updaters such as Gear Lever and
+AppImageUpdate download from the latest GitHub release.
 
 Verify that it starts with:
 

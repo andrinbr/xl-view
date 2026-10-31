@@ -733,7 +733,7 @@ fn native_linear_patterns_match_the_absolute_hlg_reference() {
                 continue;
             }
             let magnitude = expected[..3].iter().copied().fold(0.0_f32, f32::max);
-            // HLG input f16 contributes <=0.25%; linear source f16 and ICC
+            // HLG input f16 contributes <=0.25%. Linear source f16 and ICC
             // round trips add <=0.1%. XYB distance 1 adds a 1% peak allowance.
             let tolerance = magnitude * 0.0035 + if lossy { 0.05 } else { 0.0005 };
             for channel in 0..3 {

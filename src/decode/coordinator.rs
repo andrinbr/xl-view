@@ -239,7 +239,7 @@ impl DecodeCoordinator {
 
     /// Removes queued prefetches from older plans.
     ///
-    /// Demand and active jobs are never cancelled; the retained generation is
+    /// Demand and active jobs are never canceled. The retained generation is
     /// supplied by the session that owns the current prefetch plan.
     pub fn cancel_queued_prefetches_except(&self, prefetch_generation: u64) {
         let (state, _) = self.state.as_ref();
@@ -281,7 +281,7 @@ impl DecodeCoordinator {
     ///
     /// Requests made after shutdown are recorded but never run. The codec
     /// cannot interrupt an in-flight decode, and application shutdown must not
-    /// wait for one to finish. An already-finished worker is joined; otherwise
+    /// wait for one to finish. An already-finished worker is joined. Otherwise,
     /// its handle is detached. The worker owns the state and callbacks it still
     /// needs, checks `shutdown` before delivery, and releases those resources
     /// when the codec call eventually returns. A completion that passed that
@@ -380,7 +380,7 @@ fn synchronize_initial_attempt(
 ) -> AttemptOutcome {
     // Copy any active-prefetch promotion into the completed attempt. A demand
     // that failed only because of the former prefetch admission limit is
-    // retried without that limit; all other attempts leave the queue index
+    // retried without that limit. All other attempts leave the queue index
     // before delivery.
     let (state, _) = shared;
     let mut state = state
@@ -469,7 +469,7 @@ mod tests {
     }
 
     fn failed_decode() -> DecodeResult {
-        Err(DecodeError::Cancelled)
+        Err(DecodeError::Canceled)
     }
 
     #[test]
@@ -673,8 +673,8 @@ mod tests {
             coordinator.request_demand(PathBuf::from("demand-new"), demand.clone(), 9),
             DecodeQueueDisposition::Coalesced
         );
-        let cancelled = key("cancelled");
-        coordinator.request_prefetch(PathBuf::from("cancelled"), cancelled.clone(), 1, 1, 100);
+        let canceled = key("canceled");
+        coordinator.request_prefetch(PathBuf::from("canceled"), canceled.clone(), 1, 1, 100);
         let retained = key("retained");
         coordinator.request_prefetch(PathBuf::from("retained"), retained.clone(), 2, 2, 100);
         assert_eq!(
@@ -688,11 +688,11 @@ mod tests {
             DecodeQueueDisposition::Coalesced
         );
         assert!(coordinator.contains(&demand));
-        assert!(coordinator.contains(&cancelled));
+        assert!(coordinator.contains(&canceled));
         assert!(coordinator.contains(&retained));
 
         coordinator.cancel_queued_prefetches_except(2);
-        assert!(!coordinator.contains(&cancelled));
+        assert!(!coordinator.contains(&canceled));
         assert!(coordinator.contains(&retained));
 
         release_sender.send(()).unwrap();

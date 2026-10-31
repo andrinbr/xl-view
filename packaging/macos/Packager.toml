@@ -21,7 +21,7 @@ file-associations = [
 ]
 
 # `license-file` is also intentionally omitted because cargo-packager maps it to
-# a click-through DMG EULA; the license files are bundled as resources instead.
+# a click-through DMG EULA. The license files are bundled as resources instead.
 resources = [
     { src = "../../LICENSE", target = "licenses/LICENSE" },
     { src = "../../COPYRIGHT", target = "licenses/COPYRIGHT" },

@@ -129,7 +129,7 @@ impl SourceIntensityTarget {
 }
 
 /// Destination output encoding. Values returned for `SdrSrgbHardware` are
-/// linear; an sRGB texture view applies the OETF exactly once.
+/// linear. An sRGB texture view applies the OETF exactly once.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OutputEncoding {
     Pq,
@@ -430,7 +430,7 @@ fn gamut_map_bt2020_to_bt709_ictcp_hard(rgb_nits: [f64; 3], upper: f64) -> [f64;
     let ictcp = bt2020_nits_to_ictcp(rgb_nits);
     let neutral_bt709 = [pq_eotf_f64(ictcp[0]) * PQ_PEAK_NITS_F64; 3];
     if !rgb_is_within_cube(neutral_bt709, upper) {
-        // Invalid or mis-signalled values can put even the equal-intensity
+        // Invalid or mis-signaled values can put even the equal-intensity
         // neutral outside the target cube, so retain the bounded fallback.
         return bound_rgb_preserving_luminance(direct, BT709_LUMA, upper);
     }

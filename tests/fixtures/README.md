@@ -19,10 +19,10 @@ and SHA-256 checksum for review. The fixtures were last generated with:
 
 - libjxl command-line tools 0.12.0 (`cjxl`, `djxl`, and `jxlinfo`), with OpenEXR input
   enabled in `cjxl`
-- ImageMagick 7 with HDRI and the OpenEXR delegate (`magick`); the linear
+- ImageMagick 7 with HDRI and the OpenEXR delegate (`magick`). The linear
   fixtures were generated with 7.1.2-32, earlier fixtures with 7.1.2-13
 - OpenEXR 3.5.1 (`exrstdattr`), which tags BT.2020 EXR sources. `cjxl` reads an
-  EXR's colour space only from its chromaticities and otherwise assumes BT.709.
+  EXR's color space only from its chromaticities and otherwise assumes BT.709.
 - libjpeg-turbo 3.2.0, build 20260630 (`cjpeg`)
 - exif 0.6.22
 - Exiv2 0.28.6

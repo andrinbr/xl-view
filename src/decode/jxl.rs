@@ -594,7 +594,7 @@ impl ColorConversion {
     }
 
     // Only linear RGB uses this matrix probe. Grayscale luminance is
-    // channel zero; RGB weights are the Y row of source -> linear BT.2020.
+    // channel zero. RGB weights are the Y row of source -> linear BT.2020.
     fn maximum_luminance(&self, pixels: &[CanonicalPixel]) -> Result<f32, DecodeError> {
         let weights = if self.gray {
             [1.0, 0.0, 0.0]
@@ -708,7 +708,7 @@ impl SourceCalibration {
     fn hdr_source(self, source_peak: SourceIntensityTarget) -> bool {
         let evidence = match self.dynamic_range {
             // XYB samples with the default target carry neither a calibration nor
-            // exact values; codec overshoot alone can lift their peak above white.
+            // exact values. Codec overshoot alone can lift their peak above white.
             SourceDynamicRange::Linear if self.xyb && self.default_target() => return false,
             SourceDynamicRange::Sdr | SourceDynamicRange::Linear => source_peak,
             // The transfer declares HDR intent. The measured peak may sit near
@@ -817,7 +817,7 @@ fn calibrate_and_convert(
         None
     };
     let (store, observed_peak) = convert_pixels(pixels, width, height, opaque, &conversion)?;
-    // The PQ and HLG target only bounds the content; their pixels may stay far
+    // The PQ and HLG target only bounds the content. Their pixels may stay far
     // below it or exceed it. HLG decoding still uses the target for its OOTF.
     let source_peak = match source.dynamic_range {
         SourceDynamicRange::Sdr => SourceIntensityTarget::REFERENCE_WHITE,
@@ -1205,7 +1205,7 @@ fn transfer_label(transfer: &JxlTransferFunction) -> String {
         JxlTransferFunction::PQ => "PQ".to_owned(),
         JxlTransferFunction::HLG => "HLG".to_owned(),
         JxlTransferFunction::DCI => "DCI gamma 2.6".to_owned(),
-        // JPEG XL stores the encoding exponent; display gamma is its inverse.
+        // JPEG XL stores the encoding exponent. Display gamma is its inverse.
         JxlTransferFunction::Gamma(exponent) => {
             let gamma = format!("{:.2}", 1.0 / exponent);
             format!(

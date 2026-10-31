@@ -45,7 +45,7 @@ pub fn initialize_logging() {
             rust_log = %directives,
             %error,
             fallback = DEFAULT_LOG_FILTER,
-            "invalid RUST_LOG; using the default filter"
+            "invalid RUST_LOG. Using the default filter"
         );
     }
 }

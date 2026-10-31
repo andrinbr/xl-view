@@ -69,7 +69,7 @@ fn invalid_log_filter_is_reported_before_falling_back() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("invalid RUST_LOG; using the default filter"));
+    assert!(stderr.contains("invalid RUST_LOG. Using the default filter"));
     assert!(stderr.contains("rust_log=[invalid"));
     assert!(stderr.contains("fallback=\"xl_view=info\""));
     assert_eq!(stderr.matches("invalid RUST_LOG").count(), 1);

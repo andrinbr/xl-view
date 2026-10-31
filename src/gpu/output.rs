@@ -79,16 +79,16 @@ impl SurfaceSelection {
 #[expect(clippy::enum_variant_names)] // Each planned name identifies the unavailable resource.
 pub(crate) enum SurfaceOutputError {
     #[error(
-        "requested PQ output is unavailable because the GPU surface does not advertise BT.2100 PQ with Rgb10a2Unorm; use '--output auto' or '--output sdr'"
+        "requested PQ output is unavailable because the GPU surface does not advertise BT.2100 PQ with Rgb10a2Unorm. Use '--output auto' or '--output sdr'"
     )]
     PqSurfaceUnavailable,
     #[error(
-        "requested PQ output is unavailable from {provider}: {0}; use '--output auto' or '--output sdr'",
+        "requested PQ output is unavailable from {provider}: {0}. Use '--output auto' or '--output sdr'",
         provider = DISPLAY_INFORMATION_SOURCE
     )]
     HdrTargetUnavailable(HdrUnavailableReason),
     #[error(
-        "sRGB output is unavailable because the GPU surface does not advertise an sRGB 8-bit format/color-space pair; check the display connection and GPU driver"
+        "sRGB output is unavailable because the GPU surface does not advertise an sRGB 8-bit format/color-space pair. Check the display connection and GPU driver"
     )]
     SrgbSurfaceUnavailable,
 }

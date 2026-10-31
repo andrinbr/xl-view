@@ -66,7 +66,7 @@ impl RuntimeError {
 pub enum AppError {
     #[cfg(target_os = "linux")]
     #[error(
-        "xl-view requires a native Wayland session; neither WAYLAND_DISPLAY nor WAYLAND_SOCKET is set"
+        "xl-view requires a native Wayland session. Neither WAYLAND_DISPLAY nor WAYLAND_SOCKET is set"
     )]
     NoNativeWayland,
 

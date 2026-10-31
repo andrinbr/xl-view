@@ -289,7 +289,7 @@ impl Application {
             Err(error) => {
                 tracing::warn!(%error, "cannot start the file picker");
                 self.session.set_status_message(format!(
-                    "Cannot open the file picker: {error}; drop an image or open one from the command line"
+                    "Cannot open the file picker: {error}. Drop an image or open one from the command line"
                 ));
                 self.update_window_title();
             }
@@ -300,11 +300,11 @@ impl Application {
         self.file_picker_state = FilePickerState::Closed;
         match result {
             FilePickerResult::Selected(path) => self.select_path(path, None),
-            FilePickerResult::Cancelled => {}
+            FilePickerResult::Canceled => {}
             FilePickerResult::Unsupported(path) => {
                 tracing::warn!(path = %path.display(), "selected file is not a supported image");
                 self.session.set_status_message(
-                    "Cannot open the selected file: the selected file is not a supported image; choose an image",
+                    "Cannot open the selected file: the selected file is not a supported image. Choose an image",
                 );
                 self.update_window_title();
             }
@@ -917,7 +917,7 @@ impl Application {
             return;
         };
 
-        // Continuing into the stop stays at fit; reversing releases it.
+        // Continuing into the stop stays at fit. Reversing releases it.
         if self.pinch_fit_block == Some(direction) {
             return;
         }
@@ -939,7 +939,7 @@ impl Application {
             self.pinch_fit_block = None;
         }
 
-        // Started and Ended may carry real magnification on macOS; Wayland sends zero there.
+        // Started and Ended may carry real magnification on macOS. Wayland sends zero there.
         if phase != TouchPhase::Cancelled {
             self.apply_pinch_delta(delta);
         }

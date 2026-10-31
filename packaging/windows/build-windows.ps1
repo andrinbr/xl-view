@@ -54,7 +54,7 @@ try {
     $forbiddenImport = $imports | Select-String -Pattern '(?i)\b(?:vcruntime|msvcp)[a-z0-9_]*\.dll\b' |
         Select-Object -First 1
     if ($forbiddenImport) {
-        throw "$releaseExecutable imports $($forbiddenImport.Matches[0].Value); the Visual C++ runtime is not static."
+        throw "$releaseExecutable imports $($forbiddenImport.Matches[0].Value). The Visual C++ runtime is not static."
     }
 
     # Stage the portable directory with the executable and its license files.

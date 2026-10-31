@@ -19,7 +19,7 @@ pub(super) fn dropped_file_paths(value: &dyn TypedData) -> std::io::Result<Vec<P
 #[derive(Debug)]
 pub(super) enum FilePickerResult {
     Selected(PathBuf),
-    Cancelled,
+    Canceled,
     Unsupported(PathBuf),
 }
 
@@ -118,7 +118,7 @@ pub(super) fn select_image_file(
     match chooser.pick_file() {
         Some(path) if is_supported_image_path(&path) => FilePickerResult::Selected(path),
         Some(path) => FilePickerResult::Unsupported(path),
-        None => FilePickerResult::Cancelled,
+        None => FilePickerResult::Canceled,
     }
 }
 

@@ -59,13 +59,13 @@ impl fmt::Display for GpuFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DeviceLost { reason, message } if message.is_empty() => {
-                write!(formatter, "the GPU device was lost ({reason:?}); restart xl-view")
+                write!(formatter, "the GPU device was lost ({reason:?}). Restart xl-view")
             }
             Self::DeviceLost { reason, message } => {
-                write!(formatter, "the GPU device was lost ({reason:?}): {message}; restart xl-view")
+                write!(formatter, "the GPU device was lost ({reason:?}): {message}. Restart xl-view")
             }
             Self::OutOfMemory => formatter.write_str(
-                "the GPU ran out of memory; close other GPU-intensive applications or open a smaller image",
+                "the GPU ran out of memory. Close other GPU-intensive applications or open a smaller image",
             ),
             Self::Internal(message) => write!(formatter, "an internal GPU error occurred: {message}"),
             Self::Validation(message) => {
@@ -160,7 +160,7 @@ pub(crate) enum SurfaceCapabilities {
 /// Shader-visible resources that exist for both the empty and loaded states.
 ///
 /// The fallback state owns one set because every presentation bind group must
-/// remain complete before an image is installed; replacing that state drops
+/// remain complete before an image is installed. Replacing that state drops
 /// the fallback allocations.
 struct ImageBindings {
     coarse_texture: wgpu::Texture,
@@ -443,7 +443,7 @@ fn select_surface_with_wayland_bootstrap(
         // A new Wayland surface has no wl_output association until its first
         // commit. On multi-output systems that makes strict PQ selection
         // impossible during synchronous GPU initialization. Configure an sRGB
-        // bootstrap surface so the compositor can identify the output; the
+        // bootstrap surface so the compositor can identify the output. The
         // next display refresh then re-runs strict PQ selection before the
         // startup diagnostics report is emitted.
         tracing::debug!("waiting for Wayland to identify the window output before selecting PQ");
@@ -874,7 +874,7 @@ impl GpuState {
                         required_mib = bytes_to_mib(required),
                         available_mib = bytes_to_mib(available),
                         gpu_memory_limit_mib = bytes_to_mib(self.gpu_memory_limit_bytes),
-                        "GPU memory budget cannot hold the resampled viewport; using image tiles or the coarse preview"
+                        "GPU memory budget cannot hold the resampled viewport. Using image tiles or the coarse preview"
                     );
                     image.resampling_memory_shortfall_warned = true;
                 }
@@ -916,7 +916,7 @@ impl GpuState {
         ) {
             Ok(cache) => cache,
             Err(error) => {
-                tracing::warn!(%error, "cannot resize the GPU tile cache; using the coarse preview");
+                tracing::warn!(%error, "cannot resize the GPU tile cache. Using the coarse preview");
                 TileCache::fallback(&self.device)
             }
         };

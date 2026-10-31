@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.andrinbr.xl-view</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <name>XL-View</name>
+  <summary>HDR image viewer for large images</summary>
+  <developer id="io.github.andrinbr">
+    <name>Andrin Brunner</name>
+  </developer>
+  <description>
+    <p>
+      XL-View is a native HDR still-image viewer for Linux, Windows, and macOS.
+      It targets JPEG XL and handles large images such as panoramas.
+    </p>
+    <ul>
+      <li>HDR output: present images through BT.2100 PQ on HDR displays or sRGB on SDR displays. HDR images are tone-mapped when they exceed the display's available brightness range.</li>
+      <li>Accurate color: preserve HDR and color profile information through the image-processing pipeline</li>
+      <li>Responsive large-image viewing: open panoramas and other large images without blocking the UI, with smooth panning</li>
+      <li>Sharp scaling: high-quality resampling for a detailed view</li>
+      <li>Image cache and preloading: keep recent images in memory and preload adjacent files for faster browsing</li>
+      <li>Metadata overlay: inspect image, output, and EXIF details without leaving the viewer</li>
+      <li>Exposure adjustment: brighten or darken an image to inspect highlights and shadows</li>
+      <li>Selectable backgrounds: assess contrast, edges, and transparency on different backgrounds</li>
+      <li>Display diagnostics: show a test pattern and runtime/display information</li>
+    </ul>
+    <p>
+      XL-View uses Vulkan and requires a native Wayland session. There is no X11
+      fallback. HDR output additionally requires an HDR-capable display and
+      compositor HDR and Wayland color-management support.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.andrinbr.xl-view.desktop</launchable>
+  <url type="homepage">https://github.com/andrinbr/xl-view</url>
+  <url type="bugtracker">https://github.com/andrinbr/xl-view/issues</url>
+  <url type="vcs-browser">https://github.com/andrinbr/xl-view</url>
+  <provides>
+    <mediatype>image/jxl</mediatype>
+  </provides>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <branding>
+    <color type="primary" scheme_preference="light">#c0ebf7</color>
+    <color type="primary" scheme_preference="dark">#0d4f73</color>
+  </branding>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/andrinbr/xl-view/v0.4.0/docs/screenshots/xl-view-example-image.png</image>
+      <caption>A large HDR panorama with the metadata overlay open</caption>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.4.0" date="2026-10-23">
+      <url type="details">https://github.com/andrinbr/xl-view/releases/tag/v0.4.0</url>
+      <description>
+        <p>This release switches to a faster JPEG XL decoder, adds support for linear HDR images, and improves HDR tone mapping.</p>
+        <ul>
+          <li>Switched to the jxl-rs decoder, making JPEG XL decoding up to 3x faster</li>
+          <li>Added support for linear images, including scRGB</li>
+          <li>Improved HDR tone mapping by using the peak brightness measured from the image instead of relying only on its metadata</li>
+          <li>Fixed the AppImage failing to launch when run by a different user, such as inside Firejail</li>
+          <li>Updated dependencies and documentation, and extended CI checks to Windows and macOS</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.3.1" date="2026-08-28">
+      <url type="details">https://github.com/andrinbr/xl-view/releases/tag/v0.3.1</url>
+      <description>
+        <p>This release improves support for large images, macOS integration, and image panning ergonomics.</p>
+        <ul>
+          <li>Increased the automatic decoder memory limit to support larger images</li>
+          <li>Added macOS Finder support for opening .jxl files via double-click or Open With</li>
+          <li>Improved mouse panning and double-click handling, preventing drags from being interpreted as double-clicks</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.3.0" date="2026-08-22">
+      <url type="details">https://github.com/andrinbr/xl-view/releases/tag/v0.3.0</url>
+      <description>
+        <p>This release adds native macOS support and improves HDR rendering with application-side tone mapping.</p>
+        <ul>
+          <li>Added macOS support with an Apple silicon DMG build</li>
+          <li>Added application-side tone mapping for more consistent HDR and SDR output</li>
+          <li>Improved HDR output handling across Linux, Windows, and macOS</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.2.0" date="2026-08-15">
+      <url type="details">https://github.com/andrinbr/xl-view/releases/tag/v0.2.0</url>
+      <description>
+        <p>This release adds Windows support and includes improvements to image navigation, resampling performance, and HDR output handling.</p>
+        <ul>
+          <li>Added native Windows support, including installer and portable builds</li>
+          <li>Added touchpad gestures for panning and pinch-to-zoom (Linux only)</li>
+          <li>Improved image resampling performance</li>
+          <li>Improved HDR output selection and HDR-to-SDR tone mapping</li>
+          <li>Updated packaging, diagnostics, dependencies, and documentation</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-07-25">
+      <url type="details">https://github.com/andrinbr/xl-view/releases/tag/v0.1.0</url>
+      <description>
+        <p>First public release: an HDR image viewer for JPEG XL files on Linux, with smooth panning of large images, preloading of neighboring files, and an EXIF overlay.</p>
+      </description>
+    </release>
+  </releases>
+</component>

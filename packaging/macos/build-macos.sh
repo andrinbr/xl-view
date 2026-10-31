@@ -37,7 +37,7 @@ assert_equal() {
     local description="$3"
 
     if [[ "$actual" != "$expected" ]]; then
-        echo "$description is '$actual'; expected '$expected'" >&2
+        echo "$description is '$actual', expected '$expected'" >&2
         exit 1
     fi
 }

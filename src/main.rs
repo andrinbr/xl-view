@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 #[cfg(target_os = "linux")]
-const APPLICATION_ID: &str = "io.github.andrinbr.xl_view";
+const APPLICATION_ID: &str = "io.github.andrinbr.xl-view";
 const APPLICATION_NAME: &str = "XL-View";
 
 fn main() -> ExitCode {

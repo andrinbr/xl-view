@@ -85,7 +85,7 @@ impl DecodeQueue for DecodeCoordinator {
 /// Owns non-GPU state for one committed image and at most one pending open.
 ///
 /// `current_key`, `current_path`, and `loaded_image` describe the same image
-/// and change together only in `commit_install`; `decoded_image` optionally
+/// and change together only in `commit_install`. `decoded_image` optionally
 /// retains that image until a GPU becomes available. `pending_open` is the
 /// authoritative in-flight selection. Selection, navigation, and prefetch
 /// generations independently invalidate their corresponding asynchronous
@@ -188,7 +188,7 @@ impl PrefetchPlan {
 /// First-presentation status for the installed image.
 ///
 /// `Pending(None)` means presentation has not completed but its timing was
-/// deliberately cancelled, for example during replacement or shutdown.
+/// deliberately canceled, for example during replacement or shutdown.
 #[derive(Debug)]
 enum ImagePresentationState {
     Pending(Option<PendingPresentation>),

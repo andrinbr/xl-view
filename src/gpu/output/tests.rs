@@ -162,17 +162,17 @@ fn reselecting_the_same_candidate_does_not_require_surface_reconfiguration() {
 fn output_errors_explain_the_cause_and_the_remedy() {
     assert_eq!(
         SurfaceOutputError::PqSurfaceUnavailable.to_string(),
-        "requested PQ output is unavailable because the GPU surface does not advertise BT.2100 PQ with Rgb10a2Unorm; use '--output auto' or '--output sdr'"
+        "requested PQ output is unavailable because the GPU surface does not advertise BT.2100 PQ with Rgb10a2Unorm. Use '--output auto' or '--output sdr'"
     );
     let reason = HdrUnavailableReason::MissingDisplayInformation;
     assert_eq!(
         SurfaceOutputError::HdrTargetUnavailable(reason).to_string(),
         format!(
-            "requested PQ output is unavailable from {DISPLAY_INFORMATION_SOURCE}: {reason}; use '--output auto' or '--output sdr'"
+            "requested PQ output is unavailable from {DISPLAY_INFORMATION_SOURCE}: {reason}. Use '--output auto' or '--output sdr'"
         )
     );
     assert_eq!(
         SurfaceOutputError::SrgbSurfaceUnavailable.to_string(),
-        "sRGB output is unavailable because the GPU surface does not advertise an sRGB 8-bit format/color-space pair; check the display connection and GPU driver"
+        "sRGB output is unavailable because the GPU surface does not advertise an sRGB 8-bit format/color-space pair. Check the display connection and GPU driver"
     );
 }

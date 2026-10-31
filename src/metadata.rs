@@ -49,7 +49,7 @@ pub fn parse_exif(raw_payload: &[u8], tiff_header_offset: u32) -> ExifMetadata {
     let mut metadata = ExifMetadata::default();
     if raw_payload.len() > MAX_EXIF_BYTES {
         metadata.parse_error = Some(format!(
-            "EXIF payload is {} bytes; limit is {MAX_EXIF_BYTES} bytes",
+            "EXIF payload is {} bytes. The limit is {MAX_EXIF_BYTES} bytes",
             raw_payload.len()
         ));
         return metadata;
@@ -159,9 +159,9 @@ fn format_partial_errors(errors: &[ExifError]) -> String {
         .take(3)
         .map(ToString::to_string)
         .collect::<Vec<_>>()
-        .join("; ");
+        .join(", ");
     if errors.len() > 3 {
-        write!(details, "; and {} more", errors.len() - 3).unwrap();
+        write!(details, ", and {} more", errors.len() - 3).unwrap();
     }
     if details.is_empty() {
         "partially parsed EXIF".to_owned()
@@ -192,7 +192,7 @@ pub fn parse_xmp(raw_payload: &[u8]) -> XmpMetadata {
 fn parse_xmp_rating(raw_payload: &[u8]) -> Result<Option<f64>, String> {
     if raw_payload.len() > MAX_XMP_BYTES {
         return Err(format!(
-            "XMP payload is {} bytes; limit is {MAX_XMP_BYTES} bytes",
+            "XMP payload is {} bytes. The limit is {MAX_XMP_BYTES} bytes",
             raw_payload.len()
         ));
     }

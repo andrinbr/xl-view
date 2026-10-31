@@ -24,8 +24,8 @@ struct OutputSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WaylandLuminances {
-    // The protocol transports minimum luminance as cd/m² multiplied by 10,000;
-    // maximum and reference white are unscaled integer cd/m² values.
+    // The protocol transports minimum luminance as cd/m² multiplied by 10,000.
+    // Maximum and reference white are unscaled integer cd/m² values.
     minimum_nits_times_10000: u32,
     maximum_nits: u32,
     reference_white_nits: u32,
@@ -111,7 +111,7 @@ impl DisplayTargetProvider {
 
         // Synchronous bootstrap is limited to four roundtrips, not to a fixed
         // time. A compositor that needs more may publish an incomplete first
-        // snapshot; the event thread then completes it and emits the normal
+        // snapshot. The event thread then completes it and emits the normal
         // changed notification.
         for _ in 0..4 {
             if let Err(error) = event_queue.roundtrip(&mut state) {

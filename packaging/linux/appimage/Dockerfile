@@ -15,6 +15,7 @@ RUN apt-get update \
         curl \
         desktop-file-utils \
         file \
+        zsync \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-packager \
         --git https://github.com/crabnebula-dev/cargo-packager \

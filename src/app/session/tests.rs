@@ -191,7 +191,7 @@ fn current_demand_failure_clears_pending_state_and_reports_the_error() {
         purpose: DecodePurpose::Demand {
             selection_generation: 1,
         },
-        result: Err(DecodeError::Cancelled),
+        result: Err(DecodeError::Canceled),
     });
 
     assert!(matches!(effect, DecodeEffect::StatusChanged));
@@ -245,7 +245,7 @@ fn stale_demand_failure_does_not_disturb_the_current_selection() {
         purpose: DecodePurpose::Demand {
             selection_generation: 1,
         },
-        result: Err(DecodeError::Cancelled),
+        result: Err(DecodeError::Canceled),
     });
 
     assert!(matches!(effect, DecodeEffect::None));
@@ -390,7 +390,7 @@ fn prefetch_failure_is_silent_and_queues_the_second_neighbor() {
                 neighbor_index: first.3,
                 maximum_retained_bytes: first.4,
             },
-            result: Err(DecodeError::Cancelled),
+            result: Err(DecodeError::Canceled),
         }),
         DecodeEffect::None
     ));

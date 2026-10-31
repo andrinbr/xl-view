@@ -32,7 +32,7 @@ source: narrow-range HLG/BT.2020, nominal peak 1,000 nits
 |           |         |          |         |         |         |          |         |           |
 |           |         |          |         |         |         |          |         |           |
 |           |         |          |         |         |         |          |         |           |
-| 40% grey  |  75% W  |  75% Y   |  75% C  |  75% G  |  75% M  |  75% R   |  75% B  | 40% grey  |
+| 40% gray  |  75% W  |  75% Y   |  75% C  |  75% G  |  75% M  |  75% R   |  75% B  | 40% gray  |
 |           |         |          |         |         |         |          |         |           |
 |           |         |          |         |         |         |          |         |           |
 |           |         |          |         |         |         |          |         |           |
@@ -54,7 +54,7 @@ source: narrow-range HLG/BT.2020, nominal peak 1,000 nits
 +---+---+---+------+--+---+--+---+--+-----------+---------------------+-------------+---+---+---+
 
 W/Y/C/G/M/R/B = white/yellow/cyan/green/magenta/red/blue
-709             = BT.709-equivalent colour bars";
+709             = BT.709-equivalent color bars";
 
 pub(super) struct ImageWorkDiagnostics {
     pub(super) tile_cache: String,

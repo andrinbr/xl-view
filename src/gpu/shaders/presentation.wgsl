@@ -79,7 +79,7 @@ fn canonical_input(uv: vec2f, position: vec2u) -> vec4f {
     let image_position = vec2f(params.view_center_x, params.view_center_y)
         + (vec2f(position) + vec2f(0.5) - viewport_center) / params.view_scale;
     // Derive LOD from continuous image coordinates. Tile-local UV wraps at
-    // every boundary; implicit derivatives there see an almost-one-texture
+    // every boundary. Implicit derivatives there see an almost-one-texture
     // jump and incorrectly select the smallest mip for the boundary quad.
     let image_position_dx = dpdx(image_position);
     let image_position_dy = dpdy(image_position);
@@ -126,8 +126,8 @@ fn canonical_input(uv: vec2f, position: vec2u) -> vec4f {
         }
     }
     let alpha = clamp(sanitize(rgba.a), 0.0, 1.0);
-    // The sampled texture is premultiplied for fringe-free linear filtering;
-    // both operands are canonical linear BT.2020 values. Composite before
+    // The sampled texture is premultiplied for fringe-free linear filtering.
+    // Both operands are canonical linear BT.2020 values. Composite before
     // exposure, tone mapping, gamut mapping, and transfer encoding.
     return vec4f(
         finite_or_zero(rgba.r), finite_or_zero(rgba.g), finite_or_zero(rgba.b),

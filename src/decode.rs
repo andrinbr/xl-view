@@ -453,12 +453,12 @@ pub enum DecodeError {
     Decoder(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("JPEG XL decoder sample or allocation limit exceeded ({limit} byte budget)")]
     DecoderMemoryLimit { limit: usize },
-    #[error("JPEG XL metadata needs {required} bytes; limit is {limit} bytes")]
+    #[error("JPEG XL metadata needs {required} bytes. The limit is {limit} bytes")]
     MetadataMemoryLimit { required: usize, limit: usize },
     #[error("invalid image dimensions {width}x{height}")]
     InvalidDimensions { width: u32, height: u32 },
     #[error(
-        "decoded image and render scratch need {required} bytes; memory limit is {limit} bytes"
+        "decoded image and render scratch need {required} bytes. The memory limit is {limit} bytes"
     )]
     OutputMemoryLimit { required: u64, limit: u64 },
     #[error(
@@ -488,7 +488,7 @@ pub enum DecodeError {
     #[error("unsupported color profile: {0}")]
     UnsupportedColorProfile(String),
     #[error("decode coordinator stopped before completing the request")]
-    Cancelled,
+    Canceled,
 }
 
 pub type DecodeResult = Result<Arc<DecodedImage>, DecodeError>;

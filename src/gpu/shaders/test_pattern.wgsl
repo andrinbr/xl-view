@@ -32,8 +32,8 @@ const HLG_STAIR = array<f32, 13>(
 );
 
 // Right edges in the 1920-pixel reference raster. The -7% step occupies the
-// complete first colour bar. Subsequent steps occupy d/2 or e/2, so every pair
-// lines up with the yellow-through-blue colour-bar boundaries in Figure 1.
+// complete first color bar. Subsequent steps occupy d/2 or e/2, so every pair
+// lines up with the yellow-through-blue color-bar boundaries in Figure 1.
 const HLG_STAIR_END_X = array<f32, 13>(
     446.0, 549.0, 652.0, 755.0, 858.0, 960.0, 1062.0,
     1165.0, 1268.0, 1371.0, 1474.0, 1577.0, 1680.0,

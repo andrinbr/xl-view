@@ -22,8 +22,8 @@ use xl_view::decode::{CANONICAL_BYTES_PER_PIXEL, DecodedTileStore, HALF_CONVERSI
 use super::ViewportRequest;
 use xl_view::units::usize_from_u32;
 
-// Small batches expose row-independent work without delaying cancellation;
-// the byte cap prevents unusually wide images from multiplying scratch use.
+// Small batches expose row-independent work without delaying cancellation.
+// The byte cap prevents unusually wide images from multiplying scratch use.
 const RESAMPLING_ROWS_PER_WORKER: usize = 2;
 const MAX_RESAMPLING_ROW_BATCH_BYTES: usize = 32 * 1024 * 1024;
 const MAX_COEFFICIENT_BYTES: usize = 64 * 1024 * 1024;
@@ -31,7 +31,7 @@ const MAX_FINITE_F16: f32 = half::f16::MAX.to_f32_const();
 
 #[derive(Debug)]
 pub(super) enum ResampleError {
-    Cancelled,
+    Canceled,
     Failed(io::Error),
 }
 
@@ -88,14 +88,14 @@ fn validate_weight_sum(sum: f64) -> Result<(), ResampleError> {
     Ok(())
 }
 
-#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Dimensions bound the non-negative pixel indices; weights intentionally use f32 storage.
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Dimensions bound the non-negative pixel indices. Weights intentionally use f32 storage.
 fn build_axis_contributions(
     source_size: u32,
     target_size: u32,
     view_center: f64,
     view_scale: f64,
     contributions: &mut AxisContributions,
-    is_cancelled: &mut impl FnMut() -> bool,
+    is_canceled: &mut impl FnMut() -> bool,
 ) -> Result<(), ResampleError> {
     contributions.clear();
     if axis_inputs_are_invalid(source_size, target_size, view_center, view_scale) {
@@ -120,7 +120,7 @@ fn build_axis_contributions(
         .ok_or_else(|| io::Error::other("Lanczos2 coefficient size overflowed"))?;
     if coefficient_bytes > MAX_COEFFICIENT_BYTES {
         return Err(io::Error::other(format!(
-            "Lanczos2 coefficient table needs {coefficient_bytes} bytes; limit is {MAX_COEFFICIENT_BYTES}"
+            "Lanczos2 coefficient table needs {coefficient_bytes} bytes. The limit is {MAX_COEFFICIENT_BYTES}"
         ))
         .into());
     }
@@ -135,8 +135,8 @@ fn build_axis_contributions(
         .map_err(|error| io::Error::other(format!("cannot allocate Lanczos2 weights: {error}")))?;
 
     for target in 0..target_size {
-        if target % 32 == 0 && is_cancelled() {
-            return Err(ResampleError::Cancelled);
+        if target % 32 == 0 && is_canceled() {
+            return Err(ResampleError::Canceled);
         }
         let source_center = view_center
             + (f64::from(target) + 0.5 - f64::from(target_size) * 0.5) * source_per_target;
@@ -356,23 +356,23 @@ pub(super) fn resample_lanczos2(
     source: &DecodedTileStore,
     view: ViewportRequest,
     scratch: &mut ResamplingScratch,
-    is_cancelled: impl FnMut() -> bool,
+    is_canceled: impl FnMut() -> bool,
 ) -> Result<usize, ResampleError> {
     resample_lanczos2_rows(
         source.dimensions(),
         view,
         scratch,
-        is_cancelled,
+        is_canceled,
         |row, start, destination| source.read_canonical_row_range_rgba_f32(row, start, destination),
     )
 }
 
-#[expect(clippy::too_many_lines)] // Keeps the cancellable convolution, memory-limited output, and 64 MiB-per-axis coefficient tables in one transaction.
+#[expect(clippy::too_many_lines)] // Keeps the cancelable convolution, memory-limited output, and 64 MiB-per-axis coefficient tables in one transaction.
 fn resample_lanczos2_rows(
     (source_width, source_height): (u32, u32),
     view: ViewportRequest,
     scratch: &mut ResamplingScratch,
-    mut is_cancelled: impl FnMut() -> bool,
+    mut is_canceled: impl FnMut() -> bool,
     read_source_row: impl Fn(u32, u32, &mut [f32]) -> Result<(), io::Error> + Sync,
 ) -> Result<usize, ResampleError> {
     let target = view.target;
@@ -382,7 +382,7 @@ fn resample_lanczos2_rows(
         view.center_x,
         view.scale,
         &mut scratch.horizontal,
-        &mut is_cancelled,
+        &mut is_canceled,
     )?;
     build_axis_contributions(
         source_height,
@@ -390,10 +390,10 @@ fn resample_lanczos2_rows(
         view.center_y,
         view.scale,
         &mut scratch.vertical,
-        &mut is_cancelled,
+        &mut is_canceled,
     )?;
-    if is_cancelled() {
-        return Err(ResampleError::Cancelled);
+    if is_canceled() {
+        return Err(ResampleError::Canceled);
     }
 
     let horizontal_source_range = contribution_source_range(&scratch.horizontal);
@@ -433,8 +433,8 @@ fn resample_lanczos2_rows(
     let source_x_start = horizontal_source_range.map_or(0, |range| range.0);
     let mut batch_start_y = first_source_y;
     while batch_start_y < end_source_y {
-        if is_cancelled() {
-            return Err(ResampleError::Cancelled);
+        if is_canceled() {
+            return Err(ResampleError::Canceled);
         }
         let batch_row_count = usize_from_u32(end_source_y - batch_start_y).min(batch_capacity);
         let source_batch_len = source_row_pixels * batch_row_count;
@@ -476,8 +476,8 @@ fn resample_lanczos2_rows(
         for (row_offset, horizontal_row) in
             horizontal_batch.chunks_exact(target_row_pixels).enumerate()
         {
-            if is_cancelled() {
-                return Err(ResampleError::Cancelled);
+            if is_canceled() {
+                return Err(ResampleError::Canceled);
             }
             let row_offset = u32::try_from(row_offset)
                 .expect("a resampling row batch contains at most u32 rows");
@@ -639,10 +639,10 @@ mod tests {
         dimensions: (u32, u32),
         source: &[f32],
         view: ViewportRequest,
-        is_cancelled: impl FnMut() -> bool,
+        is_canceled: impl FnMut() -> bool,
     ) -> Result<Vec<[f32; 4]>, ResampleError> {
         let mut scratch = ResamplingScratch::default();
-        resample_test_into_scratch(dimensions, source, view, &mut scratch, is_cancelled)?;
+        resample_test_into_scratch(dimensions, source, view, &mut scratch, is_canceled)?;
         Ok(scratch
             .output
             .chunks_exact(CANONICAL_BYTES_PER_PIXEL)
@@ -660,14 +660,14 @@ mod tests {
         source: &[f32],
         view: ViewportRequest,
         scratch: &mut ResamplingScratch,
-        is_cancelled: impl FnMut() -> bool,
+        is_canceled: impl FnMut() -> bool,
     ) -> Result<usize, ResampleError> {
         let source_row_samples = usize::try_from(dimensions.0).unwrap() * 4;
         resample_lanczos2_rows(
             dimensions,
             view,
             scratch,
-            is_cancelled,
+            is_canceled,
             |row, source_x, destination| {
                 let start = usize::try_from(row).unwrap() * source_row_samples
                     + usize::try_from(source_x).unwrap() * 4;
@@ -733,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn coefficient_generation_is_cancellable() {
+    fn coefficient_generation_is_cancelable() {
         let mut checks = 0;
         let mut axis = AxisContributions::default();
         let result =
@@ -741,7 +741,7 @@ mod tests {
                 checks += 1;
                 checks > 2
             });
-        assert!(matches!(result, Err(ResampleError::Cancelled)));
+        assert!(matches!(result, Err(ResampleError::Canceled)));
     }
 
     #[test]
@@ -1080,7 +1080,7 @@ mod tests {
                 Ok(())
             },
         );
-        assert!(matches!(result, Err(ResampleError::Cancelled)));
+        assert!(matches!(result, Err(ResampleError::Canceled)));
         let rows_read = usize::try_from(rows_read.load(Ordering::Relaxed)).unwrap();
         assert!((1..=maximum_rows_read).contains(&rows_read));
     }

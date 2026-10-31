@@ -2,9 +2,10 @@
 set -eu
 
 # Use the fixed paths provided by the builder image.
-APPLICATION_ID=io.github.andrinbr.xl_view
+APPLICATION_ID=io.github.andrinbr.xl-view
 OUTPUT_DIR=/work/target/appimage
 PACKAGER_CONFIG=packaging/linux/Packager.toml
+UPDATE_INFORMATION='gh-releases-zsync|andrinbr|xl-view|latest|xl-view-*-linux-x86_64.AppImage.zsync'
 release_dir=${CARGO_TARGET_DIR:?CARGO_TARGET_DIR must be set by the builder image}/release
 
 # Create an isolated workspace for packaging and inspection.
@@ -27,7 +28,7 @@ ln -f \
     "$package_dir/$APPLICATION_ID.bin"
 
 # Package the binaries and metadata as an AppImage.
-APPIMAGE_EXTRACT_AND_RUN=1 cargo packager \
+APPIMAGE_EXTRACT_AND_RUN=1 LDAI_UPDATE_INFORMATION="$UPDATE_INFORMATION" cargo packager \
     --config "$PACKAGER_CONFIG" \
     --out-dir "$package_dir"
 
@@ -49,12 +50,16 @@ appimage=$1
 appdir="$audit_dir/squashfs-root"
 binary="$appdir/usr/bin/xl-view"
 desktop="$appdir/usr/share/applications/$APPLICATION_ID.desktop"
-appdata="$appdir/usr/share/metainfo/$APPLICATION_ID.appdata.xml"
+metainfo="$appdir/usr/share/metainfo/$APPLICATION_ID.metainfo.xml"
 license_dir="$appdir/usr/share/licenses/xl-view"
 
 # AppRun must also be executable by non-owners, such as in Firejail mounts.
 test "$(stat -c '%a' "$appdir/AppRun")" = 755 \
     || { echo "AppRun must have mode 0755 so non-owners can execute it" >&2; exit 1; }
+
+# Updaters find new releases through the embedded update information.
+test "$("$appimage" --appimage-updateinformation)" = "$UPDATE_INFORMATION" \
+    || { echo "AppImage update information is missing or wrong" >&2; exit 1; }
 
 # Check AppImage integration files and license payloads.
 test -e "$appdir/$APPLICATION_ID.desktop"
@@ -69,10 +74,10 @@ test -s "$license_dir/AppImage-RUNTIME-LICENSE.txt"
 
 # Validate desktop and AppStream metadata.
 desktop-file-validate "$desktop"
-appstreamcli validate --no-net "$appdata"
+appstreamcli validate --no-net "$metainfo"
 grep -Fqx "Exec=xl-view %f" "$desktop"
 grep -Fqx "Icon=$APPLICATION_ID" "$desktop"
-grep -Fq "<launchable type=\"desktop-id\">$APPLICATION_ID.desktop</launchable>" "$appdata"
+grep -Fq "<launchable type=\"desktop-id\">$APPLICATION_ID.desktop</launchable>" "$metainfo"
 
 # Display and GPU libraries must come from the host.
 dynamic_info="$audit_dir/dynamic.txt"
@@ -100,11 +105,16 @@ version=$(APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version)
 version=${version#xl-view }
 grep -Fqx "version = \"$version\"" "$PACKAGER_CONFIG" \
     || { echo "$PACKAGER_CONFIG version does not match xl-view $version" >&2; exit 1; }
-grep -Fq "<release version=\"$version\"" "$appdata" \
-    || { echo "$appdata has no <release version=\"$version\"> entry" >&2; exit 1; }
+grep -Fq "<release version=\"$version\"" "$metainfo" \
+    || { echo "$metainfo has no <release version=\"$version\"> entry" >&2; exit 1; }
 
 # Publish only the audited AppImage to the mounted source tree.
 OUTPUT="$OUTPUT_DIR/xl-view-v${version}-linux-x86_64.AppImage"
 mkdir -p "$OUTPUT_DIR"
 install -m 0755 "$appimage" "$OUTPUT"
+
+# The .zsync records the published file name, so create it after renaming.
+zsyncmake -o "$OUTPUT.zsync" \
+    -u "https://github.com/andrinbr/xl-view/releases/download/v$version/${OUTPUT##*/}" \
+    "$OUTPUT"
 printf '%s\n' "AppImage built and audited: $OUTPUT"

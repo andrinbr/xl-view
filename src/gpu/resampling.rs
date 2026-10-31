@@ -75,7 +75,7 @@ struct ResampledViewport {
 
 enum ResamplingWorkResult {
     Ready(ResampledViewport),
-    Cancelled,
+    Canceled,
     Failed(ResamplingJob, io::Error),
 }
 
@@ -271,7 +271,7 @@ impl ResamplerLifecycle {
 }
 
 pub(super) struct ViewportResampler {
-    // Presentation always needs a valid binding; the lifecycle says whether this is
+    // Presentation always needs a valid binding. The lifecycle says whether this is
     // the fallback or the active resampled viewport.
     texture: wgpu::Texture,
     lifecycle: ResamplerLifecycle,
@@ -413,7 +413,7 @@ impl ViewportResampler {
                     binding_changed = true;
                 }
                 ResamplingWorkResult::Failed(job, error) if self.lifecycle.is_current(job) => {
-                    tracing::warn!(%error, "viewport resampling failed; keeping tile renderer");
+                    tracing::warn!(%error, "viewport resampling failed. Keeping tile renderer");
                     self.lifecycle.mark_failed();
                 }
                 ResamplingWorkResult::Failed(job, error) => {
@@ -424,7 +424,7 @@ impl ViewportResampler {
                     );
                     self.discarded_results = self.discarded_results.saturating_add(1);
                 }
-                ResamplingWorkResult::Ready(_) | ResamplingWorkResult::Cancelled => {
+                ResamplingWorkResult::Ready(_) | ResamplingWorkResult::Canceled => {
                     self.discarded_results = self.discarded_results.saturating_add(1);
                 }
             }
@@ -532,7 +532,7 @@ fn run_resampling_worker(
             submission_lock,
         ) {
             Ok(ready) => ResamplingWorkResult::Ready(ready),
-            Err(ResampleError::Cancelled) => ResamplingWorkResult::Cancelled,
+            Err(ResampleError::Canceled) => ResamplingWorkResult::Canceled,
             Err(ResampleError::Failed(error)) => ResamplingWorkResult::Failed(job, error),
         };
         record_scratch_peak(state, scratch.allocated_bytes());
@@ -558,7 +558,7 @@ fn resample_job(
         !resampling_job_is_current(state, job.generation)
     })?;
     if !resampling_job_is_current(state, job.generation) {
-        return Err(ResampleError::Cancelled);
+        return Err(ResampleError::Canceled);
     }
     let texture = create_resampled_texture(device, job.view.target);
     upload_resampled_texture(
@@ -571,7 +571,7 @@ fn resample_job(
         submission_lock,
     )?;
     if !resampling_job_is_current(state, job.generation) {
-        return Err(ResampleError::Cancelled);
+        return Err(ResampleError::Canceled);
     }
     Ok(ResampledViewport {
         job,
@@ -695,12 +695,12 @@ fn upload_resampled_texture(
     )?;
     for stripe in upload_layout.stripes() {
         if !resampling_job_is_current(state, job.generation) {
-            return Err(ResampleError::Cancelled);
+            return Err(ResampleError::Canceled);
         }
         upload_layout.copy_stripe(pixels, stripe, staging);
         let _submission_guard = lock_unpoisoned(submission_lock);
         if !resampling_job_is_current(state, job.generation) {
-            return Err(ResampleError::Cancelled);
+            return Err(ResampleError::Canceled);
         }
         upload_layout.write_stripe(queue, texture, 0, staging, stripe);
     }
