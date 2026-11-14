@@ -27,6 +27,9 @@ license = "GPL-3.0-only"
 repository = "https://github.com/andrinbr/xl-view"
 
 [dependencies]
+# Already part of jxl's "brotli" feature. Used directly to decompress gain map
+# boxes within a byte limit.
+brotli-decompressor = "6.0.1"
 bytemuck = "1.25"
 clap = { version = "4.5", features = ["derive"] }
 fontdue = { version = "0.9.3", default-features = false, features = ["std"] }

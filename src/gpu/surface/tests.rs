@@ -1288,3 +1288,14 @@ fn gpu_failures_have_actionable_messages() {
         "an internal GPU error occurred: queue failure"
     );
 }
+
+#[test]
+fn gain_map_images_use_their_sdr_base_until_the_surface_is_hdr() {
+    assert!(!prefers_hdr_rendition(OutputMode::Auto, false));
+    assert!(prefers_hdr_rendition(OutputMode::Auto, true));
+    assert!(!prefers_hdr_rendition(OutputMode::Sdr, false));
+    // Forced PQ may start on an SDR surface until Wayland identifies the
+    // window's output, but it never stays there.
+    assert!(prefers_hdr_rendition(OutputMode::Pq, false));
+    assert!(prefers_hdr_rendition(OutputMode::Pq, true));
+}

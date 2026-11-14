@@ -8,7 +8,7 @@ use jxl::api::{
     Event, ExtraChannel, JxlAuxBox, JxlAuxBoxType, JxlBasicInfo, JxlBitDepth, JxlBitstreamInput,
     JxlColorEncoding, JxlColorProfile, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer,
     JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat, JxlPrimaries, JxlTransferFunction,
-    JxlWhitePoint, RenderingIntent,
+    JxlWhitePoint, Orientation, RenderingIntent,
 };
 use moxcms::{ColorProfile, DataColorSpace, Layout, TransformF32Executor, TransformOptions};
 use rayon::prelude::*;
@@ -20,9 +20,10 @@ use crate::color::{
 use crate::metadata::{parse_exif, parse_xmp};
 use crate::units::{u64_from_usize, usize_from_u32};
 
+use super::gain_map::{self, BaseImage, CaptureInput, GainMap};
 use super::{
     CANONICAL_BYTES_PER_PIXEL, CanonicalPixel, CoarsePixel, DecodeError, DecodeLimits,
-    DecodeResult, DecodedImage, DecodedTileStore, ImageKey, ImageMetadata, LinearUnit,
+    DecodeResult, DecodedImage, DecodedTileStore, ImageKey, ImageMetadata, LinearUnit, Rendition,
     SourceColorEncoding, ToneMappingMetadata,
 };
 
@@ -41,20 +42,26 @@ const WORKER_SCRATCH_BYTES: usize =
     CHUNK_PIXELS * 6 * size_of::<f32>() + MAX_COARSE_DIMENSION as usize * size_of::<[f64; 4]>();
 const MAX_WORKERS: usize = MAX_SCRATCH_BYTES / WORKER_SCRATCH_BYTES;
 
-/// Decodes a filesystem source within the supplied limits.
+/// Decodes a filesystem source within the supplied limits. A gain map
+/// reconstructs the HDR rendition.
 ///
 /// # Errors
 /// Returns a typed error for I/O, malformed input, unsupported content, or a
 /// configured resource limit.
 pub fn decode_file(path: &Path, limits: DecodeLimits) -> DecodeResult {
     let file = open_file(path)?;
-    decode_input(&mut FileInput(BufReader::new(file)), limits, None)
+    decode_input(&mut FileInput(BufReader::new(file)), limits, None, &|| {
+        Rendition::Hdr
+    })
 }
 
+/// `rendition` is called once, when the decoded base image is ready for its
+/// gain map, so a decode started before the display is known can still follow it.
 pub(super) fn decode_file_for_key(
     key: &ImageKey,
     limits: DecodeLimits,
     maximum_retained_bytes: Option<u64>,
+    rendition: &dyn Fn() -> Rendition,
 ) -> DecodeResult {
     let file = open_file(&key.normalized_path)?;
     let metadata_error = |source| DecodeError::SourceMetadata {
@@ -63,7 +70,7 @@ pub(super) fn decode_file_for_key(
     };
     verify_source_identity(key, &file.metadata().map_err(metadata_error)?)?;
     let mut input = FileInput(BufReader::new(file));
-    let decoded = decode_input(&mut input, limits, maximum_retained_bytes);
+    let decoded = decode_input(&mut input, limits, maximum_retained_bytes, rendition);
     let after = input.0.get_ref().metadata().map_err(metadata_error)?;
     let path_after = fs::metadata(&key.normalized_path).map_err(metadata_error)?;
     verify_source_identity(key, &after)?;
@@ -105,16 +112,30 @@ impl JxlBitstreamInput for FileInput {
     }
 }
 
-/// Decodes an in-memory JPEG XL source within the supplied limits.
+/// Decodes an in-memory JPEG XL source within the supplied limits. A gain map
+/// reconstructs the HDR rendition.
 ///
 /// # Errors
 /// Returns a typed error for malformed input, unsupported content, or a
 /// configured resource limit.
-pub fn decode_memory(mut bytes: &[u8], limits: DecodeLimits) -> DecodeResult {
-    decode_input(&mut bytes, limits, None)
+pub fn decode_memory(bytes: &[u8], limits: DecodeLimits) -> DecodeResult {
+    decode_memory_with_rendition(bytes, limits, Rendition::Hdr)
 }
 
-struct RayonRunner;
+/// Decodes an in-memory JPEG XL source as the requested rendition.
+///
+/// # Errors
+/// Returns a typed error for malformed input, unsupported content, or a
+/// configured resource limit.
+pub fn decode_memory_with_rendition(
+    mut bytes: &[u8],
+    limits: DecodeLimits,
+    rendition: Rendition,
+) -> DecodeResult {
+    decode_input(&mut bytes, limits, None, &|| rendition)
+}
+
+pub(super) struct RayonRunner;
 impl JxlParallelRunner for RayonRunner {
     fn run(&mut self, count: usize, fun: &JxlParallelRunnerFun<'_>) -> jxl::error::Result<()> {
         (0..count).into_par_iter().try_for_each(fun)
@@ -172,7 +193,11 @@ fn decode_input(
     input: &mut impl JxlBitstreamInput,
     limits: DecodeLimits,
     maximum_retained_bytes: Option<u64>,
+    rendition: &dyn Fn() -> Rendition,
 ) -> DecodeResult {
+    // The gain map box is captured from the input instead of being requested
+    // here: `jxl` would buffer it without a limit.
+    let input = &mut CaptureInput::new(input, limits.memory_ceiling_bytes);
     let mut options = JxlDecoderOptions::default();
     options.sample_limit = Some(limits.memory_ceiling_bytes / size_of::<f32>());
     options.request_aux_boxes = vec![JxlAuxBoxType::EXIF, XML];
@@ -198,6 +223,7 @@ fn decode_input(
         }
     }
     let opaque = info.extra_channels.is_empty();
+    let identity_orientation = info.orientation == Orientation::Identity;
     let associated_alpha = info
         .extra_channels
         .first()
@@ -214,21 +240,8 @@ fn decode_input(
     {
         return Err(DecodeError::UnsupportedAssociatedAlphaEncoding);
     }
-    let required = estimated_memory_cost_bytes(width, height)?;
-    validate_output_memory(
-        required
-            .checked_add(estimated_render_scratch_bytes(width, height)?)
-            .ok_or(DecodeError::SizeOverflow)?,
-        limits,
-    )?;
-    if let Some(available) = maximum_retained_bytes
-        && required > available
-    {
-        return Err(DecodeError::PrefetchTooLarge {
-            required,
-            available,
-        });
-    }
+    let gain_map_budget = gain_map_budget(width, height, limits, maximum_retained_bytes)?;
+    input.set_budget(gain_map_budget);
     let extra_count = info.extra_channels.len();
     decoder
         .set_pixel_format(JxlPixelFormat::rgba_f16(extra_count))
@@ -248,23 +261,37 @@ fn decode_input(
     // negative values can be real wide-gamut color.
     conversion.clamp_to_nominal_range =
         !source.float_samples && Some(output_profile) == decoder.embedded_color_profile();
-    let mut pixels = allocate_vec::<CanonicalPixel>(checked_pixel_count(width, height)?, true)?;
-    // Coalescing processes hidden/reference frames internally before this frame.
-    expect_event(
-        advance(&mut decoder, input, None, limits)?,
-        Event::FrameHeader,
-    )?;
-    let mut buffers = [JxlOutputBuffer::new(
-        bytemuck::cast_slice_mut(&mut pixels),
-        usize_from_u32(height),
-        usize_from_u32(width) * CANONICAL_BYTES_PER_PIXEL,
-    )];
-    let has_more_frames = match advance(&mut decoder, input, Some(&mut buffers), limits)? {
-        Event::FrameComplete { has_more_frames } => has_more_frames,
-        event => return Err(unexpected_event(event)),
+    let mut base = BaseImage {
+        width,
+        height,
+        encoding: gain_map::base_encoding(output_profile, decoder.embedded_color_profile()),
+        dynamic_range: source.dynamic_range,
+        identity_orientation,
+        animated: false,
     };
-    let calibrated = calibrate_and_convert(pixels, width, height, opaque, conversion, source)?;
+    let (pixels, has_more_frames) = decode_frame(&mut decoder, input, width, height, limits)?;
+    // Trailing boxes come first: a gain map may follow the codestream, and
+    // conversion overwrites the pixels it applies to. This also releases the
+    // main decoder before the gain map is decoded.
     finish_metadata(decoder, input, has_more_frames, &mut metadata, limits)?;
+    base.animated = has_more_frames;
+    // Boxes after the first frame of an animation are not read.
+    let capture = input
+        .finish(!has_more_frames)
+        .map_err(|error| DecodeError::Decoder(Box::new(error)))?;
+    // Everything that can fail for the gain map happens here, so a failure
+    // leaves the base image exactly as a decode without the gain map.
+    let (gain_map, gain_map_status) =
+        gain_map::prepare(capture, &base, gain_map_budget, limits, rendition);
+    let calibrated = calibrate_and_convert(
+        pixels,
+        width,
+        height,
+        opaque,
+        conversion,
+        source,
+        gain_map.as_ref(),
+    )?;
     let memory_cost_bytes = calibrated.store.memory_cost_bytes();
     Ok(Arc::new(DecodedImage {
         store: Arc::new(calibrated.store),
@@ -275,9 +302,60 @@ fn decode_input(
         intensity_target: source.intensity,
         linear_unit: calibrated.linear_unit,
         hdr_source: calibrated.hdr_source,
+        gain_map: gain_map_status,
         metadata,
         memory_cost_bytes,
     }))
+}
+
+/// Checks that the image fits the memory ceiling and returns what it leaves
+/// for a gain map.
+fn gain_map_budget(
+    width: u32,
+    height: u32,
+    limits: DecodeLimits,
+    maximum_retained_bytes: Option<u64>,
+) -> Result<usize, DecodeError> {
+    let required = estimated_memory_cost_bytes(width, height)?;
+    let required_with_scratch = required
+        .checked_add(estimated_render_scratch_bytes(width, height)?)
+        .ok_or(DecodeError::SizeOverflow)?;
+    validate_output_memory(required_with_scratch, limits)?;
+    if let Some(available) = maximum_retained_bytes
+        && required > available
+    {
+        return Err(DecodeError::PrefetchTooLarge {
+            required,
+            available,
+        });
+    }
+    Ok(usize::try_from(
+        u64_from_usize(limits.memory_ceiling_bytes).saturating_sub(required_with_scratch),
+    )
+    .unwrap_or(usize::MAX))
+}
+
+/// Decodes the first displayable frame into a new canonical buffer. Also
+/// returns whether more frames follow.
+fn decode_frame(
+    decoder: &mut JxlDecoder,
+    input: &mut impl JxlBitstreamInput,
+    width: u32,
+    height: u32,
+    limits: DecodeLimits,
+) -> Result<(Vec<CanonicalPixel>, bool), DecodeError> {
+    let mut pixels = allocate_vec::<CanonicalPixel>(checked_pixel_count(width, height)?, true)?;
+    // Coalescing processes hidden/reference frames internally before this frame.
+    expect_event(advance(decoder, input, None, limits)?, Event::FrameHeader)?;
+    let mut buffers = [JxlOutputBuffer::new(
+        bytemuck::cast_slice_mut(&mut pixels),
+        usize_from_u32(height),
+        usize_from_u32(width) * CANONICAL_BYTES_PER_PIXEL,
+    )];
+    match advance(decoder, input, Some(&mut buffers), limits)? {
+        Event::FrameComplete { has_more_frames } => Ok((pixels, has_more_frames)),
+        event => Err(unexpected_event(event)),
+    }
 }
 
 fn finish_metadata(
@@ -350,7 +428,7 @@ fn profile_error(error: impl std::fmt::Display) -> DecodeError {
     DecodeError::UnsupportedColorProfile(error.to_string())
 }
 
-fn working_profile() -> JxlColorProfile {
+pub(super) fn working_profile() -> JxlColorProfile {
     JxlColorProfile::Simple(JxlColorEncoding::RgbColorSpace {
         white_point: JxlWhitePoint::D65,
         primaries: JxlPrimaries::BT2100,
@@ -383,7 +461,7 @@ fn dynamic_range(profile: &JxlColorProfile) -> Result<SourceDynamicRange, Decode
     })
 }
 
-fn profile_intent(source_icc: &[u8]) -> moxcms::RenderingIntent {
+pub(super) fn profile_intent(source_icc: &[u8]) -> moxcms::RenderingIntent {
     let value = source_icc.get(64..68).map_or(1, |bytes| {
         u32::from_be_bytes(bytes.try_into().expect("four-byte intent"))
     });
@@ -800,7 +878,7 @@ struct CalibratedImage {
 }
 
 // Linear calibration needs the decoded samples, and the measured peak exists
-// only after conversion.
+// only after conversion. A gain map reconstructs the HDR image on the way.
 fn calibrate_and_convert(
     pixels: Vec<CanonicalPixel>,
     width: u32,
@@ -808,6 +886,7 @@ fn calibrate_and_convert(
     opaque: bool,
     mut conversion: ColorConversion,
     source: SourceCalibration,
+    gain_map: Option<&GainMap>,
 ) -> Result<CalibratedImage, DecodeError> {
     let linear_unit = if source.dynamic_range == SourceDynamicRange::Linear {
         let unit = source.linear_unit(|| conversion.maximum_luminance(&pixels))?;
@@ -816,14 +895,16 @@ fn calibrate_and_convert(
     } else {
         None
     };
-    let (store, observed_peak) = convert_pixels(pixels, width, height, opaque, &conversion)?;
+    let (store, observed_peak) =
+        convert_pixels(pixels, width, height, opaque, &conversion, gain_map)?;
     // The PQ and HLG target only bounds the content. Their pixels may stay far
     // below it or exceed it. HLG decoding still uses the target for its OOTF.
     let source_peak = match source.dynamic_range {
-        SourceDynamicRange::Sdr => SourceIntensityTarget::REFERENCE_WHITE,
-        SourceDynamicRange::Linear | SourceDynamicRange::Pq | SourceDynamicRange::Hlg => {
-            measured_source_peak(observed_peak)
-        }
+        SourceDynamicRange::Sdr if gain_map.is_none() => SourceIntensityTarget::REFERENCE_WHITE,
+        SourceDynamicRange::Sdr
+        | SourceDynamicRange::Linear
+        | SourceDynamicRange::Pq
+        | SourceDynamicRange::Hlg => measured_source_peak(observed_peak),
     };
     Ok(CalibratedImage {
         store,
@@ -839,6 +920,7 @@ fn convert_pixels(
     height: u32,
     opaque: bool,
     conversion: &ColorConversion,
+    gain_map: Option<&GainMap>,
 ) -> Result<(DecodedTileStore, f32), DecodeError> {
     let downsample = coarse_downsample(width, height);
     let coarse_width = width.div_ceil(downsample);
@@ -856,8 +938,12 @@ fn convert_pixels(
     let peak = pixels
         .par_chunks_mut(band_pixels)
         .zip(preview.par_chunks_mut(coarse_rows_per_worker * usize_from_u32(coarse_width)))
-        .map(|(pixels, preview)| {
-            convert_band(pixels, preview, width, downsample, opaque, conversion)
+        .enumerate()
+        .map(|(band, (pixels, preview))| {
+            let gain_map = gain_map.map(|gain_map| (gain_map, band * band_pixels));
+            convert_band(
+                pixels, preview, width, downsample, opaque, conversion, gain_map,
+            )
         })
         .try_reduce(|| 0.0_f32, |left, right| Ok(left.max(right)))?;
     Ok((
@@ -874,6 +960,7 @@ fn convert_pixels(
     ))
 }
 
+// `gain_map` carries the index of the band's first pixel within the image.
 fn convert_band(
     pixels: &mut [CanonicalPixel],
     preview: &mut [CoarsePixel],
@@ -881,6 +968,7 @@ fn convert_band(
     downsample: u32,
     opaque: bool,
     conversion: &ColorConversion,
+    gain_map: Option<(&GainMap, usize)>,
 ) -> Result<f32, DecodeError> {
     let rows = pixels.len() / usize_from_u32(width);
     let scratch_pixels = pixels.len().min(CHUNK_PIXELS);
@@ -891,6 +979,9 @@ fn convert_band(
     for (chunk_index, chunk) in pixels.chunks_mut(CHUNK_PIXELS).enumerate() {
         let output = &mut output[..chunk.len() * 3];
         conversion.convert_chunk(chunk, &mut input, output)?;
+        if let Some((gain_map, first_pixel)) = gain_map {
+            gain_map.apply(output, first_pixel + chunk_index * CHUNK_PIXELS);
+        }
         for (index, (pixel, rgb)) in chunk.iter_mut().zip(output.chunks_exact(3)).enumerate() {
             let alpha = if opaque {
                 1.0

@@ -72,7 +72,7 @@ fn decoder_handles_short_reads_and_rejects_prefetch_before_frame_decoding() {
         remaining: &bytes,
         reads: 0,
     };
-    let decoded = decode_input(&mut input, limits(), None).unwrap();
+    let decoded = decode_input(&mut input, limits(), None, &|| Rendition::Hdr).unwrap();
     assert_eq!((decoded.width, decoded.height), (1_024, 1_024));
     assert!(input.reads > 1);
     assert_eq!(
@@ -84,7 +84,7 @@ fn decoder_handles_short_reads_and_rejects_prefetch_before_frame_decoding() {
         reads: 0,
     };
     assert!(matches!(
-        decode_input(&mut input, limits(), Some(1)),
+        decode_input(&mut input, limits(), Some(1), &|| Rendition::Hdr),
         Err(DecodeError::PrefetchTooLarge { .. })
     ));
     assert!(input.remaining.len() > bytes.len() / 2);
@@ -137,6 +137,7 @@ fn in_place_conversion_keeps_allocation_and_averages_straight_alpha_across_chunk
         downsample,
         false,
         &conversion,
+        None,
     )
     .unwrap();
     assert_eq!(address, pixels.as_ptr());
@@ -176,7 +177,7 @@ fn matrix_profiles_preserve_negative_and_above_white_values() {
         .into_iter()
         .map(|p: [f32; 4]| p.map(half::f16::from_f32).map(half::f16::to_bits))
         .collect();
-        let (store, _) = convert_pixels(pixels, 5, 1, true, &conversion).unwrap();
+        let (store, _) = convert_pixels(pixels, 5, 1, true, &conversion, None).unwrap();
         for value in &store.coarse_pixels()[..3] {
             assert!((*value + 0.25).abs() < 0.0001);
         }
@@ -205,6 +206,7 @@ fn nominal_sample_clamping_precedes_unpremultiplication() {
             1,
             false,
             &conversion,
+            None,
         )
         .unwrap();
         assert_eq!(store.coarse_pixels(), expected);
@@ -224,6 +226,7 @@ fn integer_associated_alpha_preserves_above_white_color() {
         false,
         conversion,
         linear_source(255.0, false, false),
+        None,
     )
     .unwrap();
     assert_eq!(&image.store.coarse_pixels()[..3], &[1.5, 1.0, 0.5]);
@@ -290,7 +293,7 @@ fn gray_matrix_transform_preserves_supported_extended_values() {
             .map(half::f16::from_f32)
             .map(half::f16::to_bits)
     });
-    let (store, _) = convert_pixels(pixels.to_vec(), 2, 1, true, &conversion).unwrap();
+    let (store, _) = convert_pixels(pixels.to_vec(), 2, 1, true, &conversion, None).unwrap();
     assert!(store.coarse_pixels()[0] < -0.24);
     assert!(store.coarse_pixels()[4] > 1.99);
     assert_eq!(
@@ -310,7 +313,7 @@ fn publication_keeps_the_decoders_canonical_allocation() {
     .unwrap();
     let pixels = vec![[half::f16::ONE.to_bits(); 4]; 2];
     let address = pixels.as_ptr();
-    let (store, _) = convert_pixels(pixels, 2, 1, true, &conversion).unwrap();
+    let (store, _) = convert_pixels(pixels, 2, 1, true, &conversion, None).unwrap();
     assert_eq!(address, store.pixels.as_ptr());
 }
 
@@ -348,11 +351,11 @@ fn sampled_rgb_and_gray_curves_accept_nominal_samples_and_reject_clipping() {
                 .map(half::f16::from_f32)
                 .map(half::f16::to_bits)
         };
-        let (store, _) = convert_pixels(vec![pixel(0.5)], 1, 1, true, &conversion).unwrap();
+        let (store, _) = convert_pixels(vec![pixel(0.5)], 1, 1, true, &conversion, None).unwrap();
         assert!((store.coarse_pixels()[0] - 0.25).abs() < 0.0005);
         for value in [-0.1, 1.1] {
             assert!(matches!(
-                convert_pixels(vec![pixel(value)], 1, 1, true, &conversion),
+                convert_pixels(vec![pixel(value)], 1, 1, true, &conversion, None),
                 Err(DecodeError::UnsupportedColorProfile(_))
             ));
         }
@@ -383,7 +386,7 @@ fn gamma_profiles_preserve_above_white_even_when_negative_values_are_unsupported
     let pixel = [2.0_f32, 2.0, 2.0, 1.0]
         .map(half::f16::from_f32)
         .map(half::f16::to_bits);
-    let (store, _) = convert_pixels(vec![pixel], 1, 1, true, &conversion).unwrap();
+    let (store, _) = convert_pixels(vec![pixel], 1, 1, true, &conversion, None).unwrap();
     assert!((store.coarse_pixels()[0] - 4.0).abs() < 0.0005);
 }
 
@@ -436,7 +439,7 @@ fn lut_profiles_use_declared_intent_and_reject_extended_domain() {
                 .map(half::f16::from_f32)
                 .map(half::f16::to_bits),
         ];
-        let (store, _) = convert_pixels(pixels, 1, 1, true, &conversion).unwrap();
+        let (store, _) = convert_pixels(pixels, 1, 1, true, &conversion, None).unwrap();
         results.push(store.coarse_pixels()[0]);
         let pixels = vec![
             [-0.1_f32, 1.2, 0.6, 1.0]
@@ -444,7 +447,7 @@ fn lut_profiles_use_declared_intent_and_reject_extended_domain() {
                 .map(half::f16::to_bits),
         ];
         assert!(matches!(
-            convert_pixels(pixels, 1, 1, true, &conversion),
+            convert_pixels(pixels, 1, 1, true, &conversion, None),
             Err(DecodeError::UnsupportedColorProfile(_))
         ));
     }
@@ -600,7 +603,8 @@ fn hdr_signals_present_their_measured_peak_and_decode_by_their_target() {
             float_samples: true,
         };
         let pixels = vec![packed([sample, sample, sample, 1.0])];
-        let calibrated = calibrate_and_convert(pixels, 1, 1, true, conversion, source).unwrap();
+        let calibrated =
+            calibrate_and_convert(pixels, 1, 1, true, conversion, source, None).unwrap();
         let peak = calibrated.source_peak.nits();
         assert!(
             (peak - expected).abs() <= expected * 1e-5,
@@ -640,7 +644,7 @@ fn hdr_signals_beyond_the_decoder_range_saturate_instead_of_overflowing() {
             );
         }
         let pixels = samples.map(|sample| packed([sample, sample, sample, 1.0]));
-        convert_pixels(pixels.to_vec(), 3, 1, true, &conversion).unwrap();
+        convert_pixels(pixels.to_vec(), 3, 1, true, &conversion, None).unwrap();
     }
 }
 
@@ -770,7 +774,7 @@ fn native_linear_peak_is_visible_full_resolution_straight_color_without_a_target
         let mut conversion = linear_conversion(&working_profile(), false);
         conversion.scale = unit_nits / HDR_REFERENCE_WHITE_NITS;
         let pixels = vec![packed([sample, sample, sample, 1.0])];
-        let (_, peak) = convert_pixels(pixels, 1, 1, true, &conversion).unwrap();
+        let (_, peak) = convert_pixels(pixels, 1, 1, true, &conversion, None).unwrap();
         assert!((measured_source_peak(peak).nits() - expected).abs() < tolerance);
     }
     let conversion = linear_conversion(&working_profile(), false);
@@ -779,7 +783,7 @@ fn native_linear_peak_is_visible_full_resolution_straight_color_without_a_target
     let mut pixels = vec![packed([0.5, 0.5, 0.5, 1.0]); 4_097 * 18];
     pixels[0] = packed([20.0, 20.0, 20.0, 0.0]);
     *pixels.last_mut().unwrap() = packed([4.0, 4.0, 4.0, 0.25]);
-    let (store, peak) = convert_pixels(pixels, 4_097, 18, false, &conversion).unwrap();
+    let (store, peak) = convert_pixels(pixels, 4_097, 18, false, &conversion, None).unwrap();
     assert_eq!(store.coarse_downsample(), 2);
     assert_eq!(measured_source_peak(peak).nits(), 812.0);
     assert!(store.coarse_pixels().iter().all(|v| *v < 4.0));
@@ -790,7 +794,7 @@ fn native_linear_peak_is_visible_full_resolution_straight_color_without_a_target
         .unwrap();
     assert!((unit.nits - 80.0).abs() < 0.001);
     associated.scale = unit.nits / HDR_REFERENCE_WHITE_NITS;
-    let (store, peak) = convert_pixels(pixels, 1, 1, false, &associated).unwrap();
+    let (store, peak) = convert_pixels(pixels, 1, 1, false, &associated, None).unwrap();
     assert!((measured_source_peak(peak).nits() - 1_000.0).abs() < 0.001);
     assert!((store.coarse_pixels()[0] - 1_000.0 / HDR_REFERENCE_WHITE_NITS).abs() < 0.001);
 }
@@ -807,6 +811,7 @@ fn ordinary_linear_white_snaps_to_sdr_but_the_next_f16_step_is_hdr() {
                 1,
                 false,
                 &conversion,
+                None,
             )
             .unwrap();
             assert_eq!(measured_source_peak(peak).nits(), 203.0);
@@ -817,6 +822,7 @@ fn ordinary_linear_white_snaps_to_sdr_but_the_next_f16_step_is_hdr() {
                 1,
                 false,
                 &conversion,
+                None,
             )
             .unwrap();
             assert!(measured_source_peak(peak).nits() > 203.0);
@@ -841,7 +847,8 @@ fn conversion_rejects_nonfinite_half_output_before_publication() {
                     1,
                     1,
                     true,
-                    &conversion
+                    &conversion,
+                    None
                 ),
                 Err(DecodeError::NonFiniteOutput)
             ));
@@ -853,7 +860,8 @@ fn conversion_rejects_nonfinite_half_output_before_publication() {
                 1,
                 1,
                 true,
-                &conversion
+                &conversion,
+                None
             ),
             Err(DecodeError::NonFiniteOutput)
         ));
@@ -904,5 +912,42 @@ fn color_encoding_labels_use_standard_names() {
         (JxlTransferFunction::Gamma(0.1), "Gamma 10"),
     ] {
         assert_eq!(transfer_label(&transfer), expected);
+    }
+}
+
+#[test]
+fn gain_map_budget_is_what_the_base_image_leaves_of_the_memory_ceiling() {
+    use crate::decode::{GainMapSkipReason, GainMapStatus};
+
+    let bytes = fs::read(fixture_path("test_pattern-gain-map.jxl")).unwrap();
+    let box_type = bytes.windows(4).position(|ty| ty == b"jhgm").unwrap();
+    let box_size = u32::from_be_bytes(bytes[box_type - 4..box_type].try_into().unwrap());
+    // The box payload, plus three 16-bit samples per gain map pixel.
+    let gain_map_bytes = u64::from(box_size - 8) + 1_024 * 1_024 * 3 * 2;
+    let base_bytes = estimated_memory_cost_bytes(1_024, 1_024).unwrap()
+        + estimated_render_scratch_bytes(1_024, 1_024).unwrap();
+    let decode = |gain_map_budget: u64| {
+        let limits = DecodeLimits {
+            memory_ceiling_bytes: usize::try_from(base_bytes + gain_map_budget).unwrap(),
+        };
+        decode_input(&mut bytes.as_slice(), limits, None, &|| Rendition::Hdr).unwrap()
+    };
+
+    let fits = decode(gain_map_bytes);
+    assert!(matches!(fits.gain_map, Some(GainMapStatus::Applied { .. })));
+    assert!(fits.hdr_source);
+
+    let over_budget = Some(GainMapStatus::NotApplied(GainMapSkipReason::TooLarge));
+    // The decoded samples no longer fit.
+    let short = decode(gain_map_bytes - 1);
+    assert_eq!(short.gain_map, over_budget);
+    // The box was read before the base image's size was known. It is
+    // discarded once the exact budget is.
+    let none = decode(0);
+    assert_eq!(none.gain_map, over_budget);
+    for fallback in [short, none] {
+        assert!(!fallback.hdr_source);
+        assert_eq!(fallback.source_peak, SourceIntensityTarget::REFERENCE_WHITE);
+        assert_eq!(fallback.memory_cost_bytes, fits.memory_cost_bytes);
     }
 }

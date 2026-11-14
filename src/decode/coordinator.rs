@@ -1,10 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::{DecodeError, DecodeLimits, DecodeResult, ImageKey};
+use super::{DecodeError, DecodeLimits, DecodeResult, ImageKey, Rendition};
 
 /// Identifies why an image was queued and carries the generation used by its
 /// consumer to reject stale completion events.
@@ -97,6 +98,10 @@ type DeliverFunction = dyn Fn(DecodeCompletion) + Send + Sync;
 pub struct DecodeCoordinator {
     state: Arc<(Mutex<CoordinatorState>, Condvar)>,
     thread: Option<JoinHandle<()>>,
+    /// Whether decodes apply gain maps. Off, which keeps the SDR base image,
+    /// until an HDR rendition is selected. Shared with the decode thread,
+    /// which reads it when a base image is ready for its gain map.
+    hdr_rendition: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for DecodeCoordinator {
@@ -118,10 +123,22 @@ impl DecodeCoordinator {
     where
         F: Fn(DecodeCompletion) + Send + Sync + 'static,
     {
-        let decode = Arc::new(move |key: &ImageKey, maximum_retained_bytes| {
-            super::jxl::decode_file_for_key(key, limits, maximum_retained_bytes)
-        });
-        Self::spawn_with_functions(decode, Arc::new(deliver))
+        let hdr_rendition = Arc::new(AtomicBool::new(false));
+        let decode = {
+            let hdr_rendition = Arc::clone(&hdr_rendition);
+            Arc::new(move |key: &ImageKey, maximum_retained_bytes| {
+                super::jxl::decode_file_for_key(key, limits, maximum_retained_bytes, &|| {
+                    if hdr_rendition.load(Ordering::Relaxed) {
+                        Rendition::Hdr
+                    } else {
+                        Rendition::Sdr
+                    }
+                })
+            })
+        };
+        let mut coordinator = Self::spawn_with_functions(decode, Arc::new(deliver))?;
+        coordinator.hdr_rendition = hdr_rendition;
+        Ok(coordinator)
     }
 
     fn spawn_with_functions(
@@ -136,7 +153,15 @@ impl DecodeCoordinator {
         Ok(Self {
             state,
             thread: Some(thread),
+            hdr_rendition: Arc::default(),
         })
+    }
+
+    /// Selects the rendition of gain map files for decodes that have not
+    /// reached their gain map yet, including ones already running.
+    pub fn set_rendition(&self, rendition: Rendition) {
+        self.hdr_rendition
+            .store(rendition == Rendition::Hdr, Ordering::Relaxed);
     }
 
     /// Queues user-requested work ahead of all prefetch work.
@@ -814,6 +839,39 @@ mod tests {
         }
         assert!(!coordinator.contains(&key("first")));
         assert!(!coordinator.contains(&key("second")));
+        coordinator.shutdown();
+    }
+
+    #[test]
+    fn the_selected_rendition_reaches_later_decodes() {
+        use crate::decode::GainMapStatus;
+
+        let path = crate::test_utils::fixture_path("test_pattern-gain-map.jxl");
+        let key = ImageKey::from_path(&path).unwrap();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        let mut coordinator = DecodeCoordinator::spawn(
+            DecodeLimits::from_memory_ceiling_mib(256),
+            move |completion| {
+                let _ = completion_sender.send(completion);
+            },
+        )
+        .unwrap();
+        let decode = |generation| {
+            coordinator.request_demand(path.clone(), key.clone(), generation);
+            completion_receiver
+                .recv_timeout(Duration::from_mins(1))
+                .unwrap()
+                .result
+                .unwrap()
+                .gain_map
+        };
+
+        // The SDR base image, until an HDR display is reported.
+        assert_eq!(decode(1), Some(GainMapStatus::Available));
+        coordinator.set_rendition(Rendition::Hdr);
+        assert!(matches!(decode(2), Some(GainMapStatus::Applied { .. })));
+        coordinator.set_rendition(Rendition::Sdr);
+        assert_eq!(decode(3), Some(GainMapStatus::Available));
         coordinator.shutdown();
     }
 }

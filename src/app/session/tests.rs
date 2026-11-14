@@ -20,6 +20,7 @@ struct FakeDecodeState {
     prefetches: Vec<(PathBuf, ImageKey, u64, u8, u64)>,
     cancellations: Vec<u64>,
     contained: HashSet<ImageKey>,
+    renditions: Vec<Rendition>,
     shutdown: bool,
 }
 
@@ -37,6 +38,7 @@ impl FakeDecodeQueue {
                 prefetches: Vec::new(),
                 cancellations: Vec::new(),
                 contained: HashSet::new(),
+                renditions: Vec::new(),
                 shutdown: false,
             })),
         }
@@ -94,6 +96,14 @@ impl DecodeQueue for FakeDecodeQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contained
             .contains(key)
+    }
+
+    fn set_rendition(&self, rendition: Rendition) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .renditions
+            .push(rendition);
     }
 
     fn shutdown(&mut self) {
@@ -269,6 +279,7 @@ fn stale_demand_completion_is_cached_without_replacing_the_current_selection() {
         path: path.clone(),
         started: Instant::now(),
         direction: None,
+        rendition_swap: false,
     });
     let stale_key = ImageKey {
         normalized_path: path.clone(),
@@ -719,4 +730,239 @@ fn prefetch_uses_navigation_direction_and_defaults_to_next() {
             Some(PathBuf::from("previous.jxl"))
         ]
     );
+}
+
+fn gain_map_fixture(rendition: Rendition) -> (PathBuf, ImageKey, Arc<DecodedImage>) {
+    let path = fixture_path("test_pattern-gain-map.jxl");
+    let key = ImageKey::from_path(&path).unwrap();
+    let image = xl_view::decode::decode_memory_with_rendition(
+        &std::fs::read(&path).unwrap(),
+        DecodeLimits::from_memory_ceiling_mib(256),
+        rendition,
+    )
+    .unwrap();
+    (path, key, image)
+}
+
+/// Completes the pending demand decode with `result`.
+fn complete_demand(
+    session: &mut ImageSession,
+    queue_state: &Mutex<FakeDecodeState>,
+    result: xl_view::decode::DecodeResult,
+) -> DecodeEffect {
+    let (path, key, selection_generation) = queue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .demands
+        .last()
+        .expect("a demand decode was queued")
+        .clone();
+    session.handle_decode_completion(DecodeCompletion {
+        decode_time: Duration::from_millis(10),
+        key,
+        path,
+        purpose: DecodePurpose::Demand {
+            selection_generation,
+        },
+        result,
+    })
+}
+
+/// Opens `path` and installs `image` as its decode result.
+fn show(
+    session: &mut ImageSession,
+    queue_state: &Mutex<FakeDecodeState>,
+    path: &Path,
+    image: &Arc<DecodedImage>,
+) {
+    assert!(matches!(
+        session.select_path(path.to_owned(), None),
+        SelectionEffect::Pending
+    ));
+    let DecodeEffect::Install(install) =
+        complete_demand(session, queue_state, Ok(Arc::clone(image)))
+    else {
+        panic!("the current demand should be ready to install");
+    };
+    assert!(!install.preserves_view());
+    session.commit_install(install, false);
+}
+
+fn demand_count(queue_state: &Mutex<FakeDecodeState>) -> usize {
+    queue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .demands
+        .len()
+}
+
+#[test]
+fn an_hdr_display_swaps_in_the_hdr_image_and_keeps_the_view_and_neighbors() {
+    let (path, key, sdr) = gain_map_fixture(Rendition::Sdr);
+    let (_, _, hdr) = gain_map_fixture(Rendition::Hdr);
+    let (_, neighbor_key, neighbor) = decoded_fixture();
+    let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
+    let queue_state = Arc::clone(&queue.state);
+    let mut session = ImageSession::with_decode_queue(256 * 1024 * 1024, queue);
+    show(&mut session, &queue_state, &path, &sdr);
+    assert!(session.decoded_cache.admit_inactive(
+        neighbor_key.clone(),
+        CachedDecodedImage::new(neighbor, Duration::from_millis(5)),
+        &[],
+    ));
+
+    // A session starts with the SDR base image, which suits an SDR display.
+    assert!(!session.sync_rendition(Rendition::Sdr));
+    assert_eq!(demand_count(&queue_state), 1);
+
+    assert!(session.sync_rendition(Rendition::Hdr));
+    {
+        let state = queue_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.renditions, [Rendition::Hdr]);
+        assert_eq!(state.demands.len(), 2);
+        assert_eq!(state.demands[1].1, key);
+    }
+    // The shown image stays in place, without a status, while it is decoded again.
+    assert!(session.status_message().is_none());
+    assert!(session.has_loaded_image());
+    // Repeated checks, as on every redraw, do not queue the swap again.
+    assert!(!session.sync_rendition(Rendition::Hdr));
+    assert_eq!(demand_count(&queue_state), 2);
+
+    let DecodeEffect::Install(install) = complete_demand(&mut session, &queue_state, Ok(hdr))
+    else {
+        panic!("the swap should be ready to install");
+    };
+    assert!(install.preserves_view());
+    session.commit_install(install, false);
+
+    assert!(matches!(
+        session.loaded_image().unwrap().gain_map,
+        Some(xl_view::decode::GainMapStatus::Applied { .. })
+    ));
+    // Opening a file clears the cache. A swap must not.
+    assert!(session.decoded_cache.contains(&neighbor_key));
+    assert!(!session.sync_rendition(Rendition::Hdr));
+
+    // Back on an SDR display, the HDR image is swapped for the base image.
+    assert!(session.sync_rendition(Rendition::Sdr));
+    assert_eq!(demand_count(&queue_state), 3);
+}
+
+#[test]
+fn images_without_a_gain_map_are_never_decoded_again() {
+    let (path, _, image) = decoded_fixture();
+    let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
+    let queue_state = Arc::clone(&queue.state);
+    let mut session = ImageSession::with_decode_queue(64 * 1024 * 1024, queue);
+    show(&mut session, &queue_state, &path, &image);
+
+    assert!(!session.sync_rendition(Rendition::Hdr));
+    assert!(!session.sync_rendition(Rendition::Sdr));
+
+    assert_eq!(demand_count(&queue_state), 1);
+}
+
+#[test]
+fn a_failed_swap_keeps_the_image_and_waits_for_the_next_display_change() {
+    let (path, _, sdr) = gain_map_fixture(Rendition::Sdr);
+    let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
+    let queue_state = Arc::clone(&queue.state);
+    let mut session = ImageSession::with_decode_queue(256 * 1024 * 1024, queue);
+    show(&mut session, &queue_state, &path, &sdr);
+    assert!(session.sync_rendition(Rendition::Hdr));
+
+    assert!(matches!(
+        complete_demand(&mut session, &queue_state, Err(DecodeError::Canceled)),
+        DecodeEffect::None
+    ));
+
+    assert!(session.has_loaded_image());
+    assert!(session.status_message().is_none());
+    assert!(session.pending_open.is_none());
+    // No retry on the following redraws.
+    assert!(!session.sync_rendition(Rendition::Hdr));
+    assert_eq!(demand_count(&queue_state), 2);
+    // The display changing again allows another attempt.
+    assert!(!session.sync_rendition(Rendition::Sdr));
+    assert!(session.sync_rendition(Rendition::Hdr));
+    assert_eq!(demand_count(&queue_state), 3);
+}
+
+#[test]
+fn a_pending_open_takes_precedence_over_a_swap() {
+    let (path, _, sdr) = gain_map_fixture(Rendition::Sdr);
+    let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
+    let queue_state = Arc::clone(&queue.state);
+    let mut session = ImageSession::with_decode_queue(256 * 1024 * 1024, queue);
+    show(&mut session, &queue_state, &path, &sdr);
+    assert!(matches!(
+        session.select_path(fixture_path("alpha.jxl"), None),
+        SelectionEffect::Pending
+    ));
+
+    assert!(!session.sync_rendition(Rendition::Hdr));
+
+    assert_eq!(demand_count(&queue_state), 2);
+    assert!(
+        session
+            .pending_open
+            .as_ref()
+            .is_some_and(|context| !context.rendition_swap)
+    );
+}
+
+#[test]
+fn cached_images_of_the_other_rendition_are_dropped_and_decoded_again() {
+    let (path, key, sdr) = gain_map_fixture(Rendition::Sdr);
+    let (_, ordinary_key, ordinary) = decoded_fixture();
+    let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
+    let queue_state = Arc::clone(&queue.state);
+    let mut session = ImageSession::with_decode_queue(256 * 1024 * 1024, queue);
+    let cached = || CachedDecodedImage::new(Arc::clone(&sdr), Duration::from_millis(5));
+    assert!(
+        session
+            .decoded_cache
+            .admit_inactive(key.clone(), cached(), &[])
+    );
+    assert!(session.decoded_cache.admit_inactive(
+        ordinary_key.clone(),
+        CachedDecodedImage::new(ordinary, Duration::from_millis(5)),
+        &[],
+    ));
+
+    // The display turns out to be HDR: the base image is not what it shows.
+    session.sync_rendition(Rendition::Hdr);
+    assert!(!session.decoded_cache.contains(&key));
+    assert!(session.decoded_cache.contains(&ordinary_key));
+
+    // One that is still cached, or arrives late, is not used either.
+    assert!(
+        session
+            .decoded_cache
+            .admit_inactive(key.clone(), cached(), &[])
+    );
+    assert!(matches!(
+        session.select_path(path.clone(), Some(FolderDirection::Next)),
+        SelectionEffect::Pending
+    ));
+    assert_eq!(demand_count(&queue_state), 1);
+
+    let mut session = ImageSession::with_decode_queue(
+        256 * 1024 * 1024,
+        FakeDecodeQueue::new(DecodeQueueDisposition::Queued),
+    );
+    session.sync_rendition(Rendition::Hdr);
+    session.handle_decode_completion(DecodeCompletion {
+        decode_time: Duration::from_millis(10),
+        key: key.clone(),
+        path,
+        purpose: DecodePurpose::Demand {
+            selection_generation: 99,
+        },
+        result: Ok(sdr),
+    });
+    assert!(!session.decoded_cache.contains(&key));
 }

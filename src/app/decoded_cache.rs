@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sysinfo::System;
-use xl_view::decode::{DecodedImage, ImageKey};
+use xl_view::decode::{DecodedImage, ImageKey, Rendition};
 
 use xl_view::units::u64_from_usize;
 
@@ -67,6 +67,20 @@ where
         self.entries.clear();
         self.resident_bytes = 0;
         self.current_key = None;
+    }
+
+    /// Drops every entry `stale` selects, except the pinned current one.
+    fn evict_inactive_where(&mut self, mut stale: impl FnMut(&V) -> bool) {
+        let current_key = self.current_key.as_ref();
+        let mut freed = 0_u64;
+        self.entries.retain(|key, entry| {
+            let keep = current_key == Some(key) || !stale(&entry.value);
+            if !keep {
+                freed = freed.saturating_add(entry.cost);
+            }
+            keep
+        });
+        self.resident_bytes = self.resident_bytes.saturating_sub(freed);
     }
 
     fn commit_current(&mut self, key: K, value: V, cost: u64) {
@@ -173,6 +187,13 @@ impl CachedDecodedImage {
     fn memory_cost_bytes(&self) -> u64 {
         u64_from_usize(self.image.memory_cost_bytes)
     }
+
+    /// Whether decoding the file for `rendition` would give another image.
+    pub(super) fn differs_for(&self, rendition: Rendition) -> bool {
+        self.image
+            .gain_map
+            .is_some_and(|status| status.differs_for(rendition))
+    }
 }
 
 impl DecodedImageCache {
@@ -192,6 +213,12 @@ impl DecodedImageCache {
 
     pub(super) fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Drops inactive images whose gain map rendition differs from `rendition`.
+    pub(super) fn evict_other_renditions(&mut self, rendition: Rendition) {
+        self.entries
+            .evict_inactive_where(|cached| cached.differs_for(rendition));
     }
 
     pub(super) fn commit_current(&mut self, key: ImageKey, image: CachedDecodedImage) {
@@ -270,6 +297,21 @@ mod tests {
         cache.commit_current("replacement", 3, 5);
         assert!(!cache.contains(&"current"));
         assert_eq!(cache.get(&"replacement"), Some(3));
+    }
+
+    #[test]
+    fn selective_eviction_spares_the_current_entry_and_updates_the_total() {
+        let mut cache = PinnedLru::new(10);
+        cache.commit_current("current", 1, 4);
+        assert!(cache.admit_inactive("stale", 1, 3, &[]));
+        assert!(cache.admit_inactive("kept", 2, 2, &[]));
+
+        cache.evict_inactive_where(|value| *value == 1);
+
+        assert!(cache.contains(&"current"));
+        assert!(!cache.contains(&"stale"));
+        assert!(cache.contains(&"kept"));
+        assert_eq!(cache.resident_bytes, 6);
     }
 
     #[test]

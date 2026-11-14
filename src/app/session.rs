@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use xl_view::decode::{
     DecodeCompletion, DecodeCoordinator, DecodeError, DecodePurpose, DecodeQueueDisposition,
-    DecodedImage, ImageKey,
+    DecodedImage, ImageKey, Rendition,
 };
 
 use super::decoded_cache::{CachedDecodedImage, DecodedImageCache};
@@ -38,6 +38,7 @@ trait DecodeQueue {
 
     fn cancel_queued_prefetches_except(&self, prefetch_generation: u64);
     fn contains(&self, key: &ImageKey) -> bool;
+    fn set_rendition(&self, rendition: Rendition);
     fn shutdown(&mut self);
 }
 
@@ -77,6 +78,10 @@ impl DecodeQueue for DecodeCoordinator {
         DecodeCoordinator::contains(self, key)
     }
 
+    fn set_rendition(&self, rendition: Rendition) {
+        DecodeCoordinator::set_rendition(self, rendition);
+    }
+
     fn shutdown(&mut self) {
         DecodeCoordinator::shutdown(self);
     }
@@ -90,6 +95,10 @@ impl DecodeQueue for DecodeCoordinator {
 /// authoritative in-flight selection. Selection, navigation, and prefetch
 /// generations independently invalidate their corresponding asynchronous
 /// results, while `current_image_presentation` belongs to the committed image.
+///
+/// Gain map files show their SDR base image until the display is known to be
+/// HDR. `rendition` follows the display, and a shown image of the other
+/// rendition is decoded again and swapped in place.
 pub(super) struct ImageSession {
     current_key: Option<ImageKey>,
     current_image_presentation: ImagePresentationState,
@@ -102,6 +111,9 @@ pub(super) struct ImageSession {
     pending_open: Option<ImageOpenContext>,
     prefetch_generation: u64,
     prefetch_plan: Option<PrefetchPlan>,
+    rendition: Rendition,
+    /// Stops retrying a swap of the shown image after it failed once.
+    rendition_swap_failed: bool,
     selection_generation: u64,
     status_message: Option<String>,
 }
@@ -118,6 +130,8 @@ struct ImageOpenContext {
     path: PathBuf,
     started: Instant,
     direction: Option<FolderDirection>,
+    /// Replaces the shown image with its other gain map rendition.
+    rendition_swap: bool,
 }
 
 #[derive(Debug)]
@@ -127,18 +141,20 @@ pub(super) struct PendingPresentation {
     pub(super) direction: Option<FolderDirection>,
     pub(super) generation: u64,
     pub(super) height: u32,
+    pub(super) rendition_swap: bool,
     pub(super) started: Instant,
     pub(super) width: u32,
 }
 
 impl PendingPresentation {
     pub(super) const fn request_kind(&self) -> &'static str {
-        request_kind(self.direction)
+        request_kind(self.direction, self.rendition_swap)
     }
 }
 
-const fn request_kind(direction: Option<FolderDirection>) -> &'static str {
+const fn request_kind(direction: Option<FolderDirection>, rendition_swap: bool) -> &'static str {
     match direction {
+        _ if rendition_swap => "rendition swap",
         Some(FolderDirection::Previous) => "previous-image navigation",
         Some(FolderDirection::Next) => "next-image navigation",
         None => "image open",
@@ -217,6 +233,11 @@ impl PendingImageInstall {
     pub(super) const fn generation(&self) -> u64 {
         self.context.generation
     }
+
+    /// A rendition swap shows the same picture, so zoom and pan carry over.
+    pub(super) const fn preserves_view(&self) -> bool {
+        self.context.rendition_swap
+    }
 }
 
 pub(super) enum SelectionEffect {
@@ -253,8 +274,15 @@ pub(super) struct NeighborLookupRequest {
 }
 
 impl ImageSession {
-    pub(super) fn new(maximum_cache_bytes: u64, decode_coordinator: DecodeCoordinator) -> Self {
-        Self::with_decode_queue(maximum_cache_bytes, decode_coordinator)
+    /// `rendition` applies until [`Self::sync_rendition`] reports the display's.
+    pub(super) fn new(
+        maximum_cache_bytes: u64,
+        decode_coordinator: DecodeCoordinator,
+        rendition: Rendition,
+    ) -> Self {
+        let mut session = Self::with_decode_queue(maximum_cache_bytes, decode_coordinator);
+        session.sync_rendition(rendition);
+        session
     }
 
     fn with_decode_queue(
@@ -273,9 +301,60 @@ impl ImageSession {
             pending_open: None,
             prefetch_generation: 0,
             prefetch_plan: None,
+            rendition: Rendition::Sdr,
+            rendition_swap_failed: false,
             selection_generation: 0,
             status_message: None,
         }
+    }
+
+    /// Follows the rendition the display needs. Returns whether the shown
+    /// image is now being decoded again to match it.
+    pub(super) fn sync_rendition(&mut self, rendition: Rendition) -> bool {
+        if rendition != self.rendition {
+            self.rendition = rendition;
+            self.rendition_swap_failed = false;
+            self.decode_queue.set_rendition(rendition);
+            self.decoded_cache.evict_other_renditions(rendition);
+        }
+        self.swap_current_rendition()
+    }
+
+    fn swap_current_rendition(&mut self) -> bool {
+        // Checked on every redraw, so the common case must stay cheap.
+        let differs = self.loaded_image.as_ref().is_some_and(|image| {
+            image
+                .gain_map
+                .is_some_and(|status| status.differs_for(self.rendition))
+        });
+        if !differs || self.pending_open.is_some() || self.rendition_swap_failed {
+            return false;
+        }
+        let (Some(key), Some(path)) = (self.current_key.clone(), self.current_path.clone()) else {
+            return false;
+        };
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        let generation = self.selection_generation;
+        let disposition = self
+            .decode_queue
+            .request_demand(path.clone(), key.clone(), generation);
+        tracing::debug!(
+            path = %path.display(),
+            purpose = "demand",
+            selection_generation = generation,
+            rendition = ?self.rendition,
+            ?disposition,
+            "queued rendition swap"
+        );
+        self.pending_open = Some(ImageOpenContext {
+            generation,
+            key,
+            path,
+            started: Instant::now(),
+            direction: None,
+            rendition_swap: true,
+        });
+        true
     }
 
     pub(super) fn select_path(
@@ -315,8 +394,14 @@ impl ImageSession {
             path: path.clone(),
             started,
             direction,
+            rendition_swap: false,
         };
-        if let Some(image) = self.decoded_cache.get(&key) {
+        // An image cached for another display's rendition is decoded again.
+        if let Some(image) = self
+            .decoded_cache
+            .get(&key)
+            .filter(|cached| !cached.differs_for(self.rendition))
+        {
             tracing::debug!(
                 path = %path.display(),
                 purpose = "demand",
@@ -373,6 +458,7 @@ impl ImageSession {
             path,
             started,
             direction,
+            rendition_swap,
         } = context;
         let decode_time = cached.decode_time;
         let dimensions = (cached.image.width, cached.image.height);
@@ -386,7 +472,7 @@ impl ImageSession {
         tracing::info!(
             path = %path.display(),
             purpose = "demand",
-            request = request_kind(direction),
+            request = request_kind(direction, rendition_swap),
             selection_generation = generation,
             cache_hit,
             width = dimensions.0,
@@ -396,13 +482,15 @@ impl ImageSession {
             ?direction,
             "image installation completed"
         );
-        if direction.is_none() {
+        // A swap replaces the shown image's own entry and keeps its neighbors.
+        if direction.is_none() && !rendition_swap {
             self.decoded_cache.clear();
         }
         self.decoded_cache.commit_current(key.clone(), cached);
         self.current_key = Some(key.clone());
         self.current_path = Some(path.clone());
         self.loaded_image = Some(summary);
+        self.rendition_swap_failed = false;
         self.status_message = None;
         self.current_image_presentation =
             ImagePresentationState::Pending(Some(PendingPresentation {
@@ -411,6 +499,7 @@ impl ImageSession {
                 direction,
                 generation,
                 height: dimensions.1,
+                rendition_swap,
                 started,
                 width: dimensions.0,
             }));
@@ -427,6 +516,7 @@ impl ImageSession {
             "Cannot display {}: {error}",
             file_name(install.path())
         ));
+        self.rendition_swap_failed |= install.context.rendition_swap;
         self.cancel_pending_presentation();
     }
 
@@ -689,6 +779,7 @@ impl ImageSession {
         });
         let is_current = current.is_some();
         let direction = current.and_then(|context| context.direction);
+        let rendition_swap = current.is_some_and(|context| context.rendition_swap);
         match completion.result {
             Ok(image) => {
                 let request_to_decode_complete =
@@ -703,6 +794,7 @@ impl ImageSession {
                         height = image.height,
                         bytes = image.memory_cost_bytes,
                         color_encoding = ?image.metadata.color_encoding,
+                        gain_map = ?image.gain_map,
                         decode_ms = milliseconds(completion.decode_time),
                         request_to_decode_complete_ms = milliseconds(request_to_decode_complete),
                         "image decode completed"
@@ -725,15 +817,30 @@ impl ImageSession {
                     self.prepare_current_install(cached, false)
                         .map_or(DecodeEffect::None, DecodeEffect::Install)
                 } else {
-                    let protected = self
-                        .prefetch_plan
-                        .as_ref()
-                        .map_or_else(Vec::new, |plan| plan.protected.clone());
-                    let _ = self
-                        .decoded_cache
-                        .admit_inactive(completion.key, cached, &protected);
+                    if !cached.differs_for(self.rendition) {
+                        let protected = self
+                            .prefetch_plan
+                            .as_ref()
+                            .map_or_else(Vec::new, |plan| plan.protected.clone());
+                        let _ =
+                            self.decoded_cache
+                                .admit_inactive(completion.key, cached, &protected);
+                    }
                     DecodeEffect::None
                 }
+            }
+            Err(error) if rendition_swap => {
+                tracing::warn!(
+                    path = %completion.path.display(),
+                    purpose = "demand",
+                    selection_generation,
+                    decode_ms = milliseconds(completion.decode_time),
+                    %error,
+                    "rendition swap failed. Keeping the shown image"
+                );
+                self.pending_open = None;
+                self.rendition_swap_failed = true;
+                DecodeEffect::None
             }
             Err(error) if is_current => {
                 self.handle_current_decode_failure(
@@ -780,9 +887,12 @@ impl ImageSession {
                 let protected = plan.protected.clone();
                 let key = completion.key;
                 let cached = CachedDecodedImage::new(image, completion.decode_time);
-                let admitted = self
-                    .decoded_cache
-                    .admit_inactive(key.clone(), cached, &protected);
+                // A decode that began before the display changed may hold
+                // the other rendition.
+                let admitted = !cached.differs_for(self.rendition)
+                    && self
+                        .decoded_cache
+                        .admit_inactive(key.clone(), cached, &protected);
                 if admitted && let Some(plan) = self.prefetch_plan.as_mut() {
                     plan.protected.push(key);
                 }

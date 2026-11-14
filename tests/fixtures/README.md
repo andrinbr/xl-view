@@ -17,10 +17,9 @@ scripts/generate-decode-fixtures.sh
 The script overwrites every generated fixture, then prints its JPEG XL metadata
 and SHA-256 checksum for review. The fixtures were last generated with:
 
-- libjxl command-line tools 0.12.0 (`cjxl`, `djxl`, and `jxlinfo`), with OpenEXR input
-  enabled in `cjxl`
-- ImageMagick 7 with HDRI and the OpenEXR delegate (`magick`). The linear
-  fixtures were generated with 7.1.2-32, earlier fixtures with 7.1.2-13
+- libjxl command-line tools 0.13.0 (`cjxl`, `djxl`, and `jxlinfo`), with OpenEXR input
+  enabled in `cjxl`.
+- ImageMagick 7 with HDRI and the OpenEXR delegate (`magick`). 
 - OpenEXR 3.5.1 (`exrstdattr`), which tags BT.2020 EXR sources. `cjxl` reads an
   EXR's color space only from its chromaticities and otherwise assumes BT.709.
 - libjpeg-turbo 3.2.0, build 20260630 (`cjpeg`)
@@ -37,6 +36,7 @@ Review the generated metadata and Git diff, then run `cargo test`.
 | --- | --- |
 | `test_pattern-{sRGB,HLG,PQ}.jxl` | Identical 16-bit test-pattern samples tagged as sRGB, HLG, and PQ. |
 | `test_pattern-scRGB.jxl`, `test_pattern-scRGB-xyb.jxl`, `test_pattern-linear.jxl` | HLG pattern decoded to linear light: non-XYB FP16 scRGB (T=1,000, white=12.5), XYB scRGB (T=80), and normalized BT.2020 FP16 (T=1,000). All describe the HLG pattern's absolute colors. |
+| `test_pattern-gain-map.jxl` | SDR BT.2020/BT.709 base image of the test pattern with an ISO 21496-1 gain map in a `jhgm` box (8-bit RGB, per-channel gamma, 1/64 offsets, gains in the base color space). The gain map reconstructs the 1,000-nit HLG pattern, 2.3 stops above the 203-nit white. |
 | `linear-highlights.jxl` | 7x2 default-target FP16 linear BT.2020 patches peaking at 4.0, so the measured 812-nit peak differs from the 255-nit metadata and the 1,000-nit fallback. |
 | `linear-xyb-sdr.jxl` | Lossy XYB linear sRGB stripes with the default target. VarDCT overshoot lifts the decoded peak above white although the source never exceeds 1.0. |
 | `ramp-hlg-*.jxl`, `ramp-pq-*.jxl` | Linear-in-luminance HDR ramps with explicit or default intensity targets. |

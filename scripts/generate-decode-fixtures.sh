@@ -95,6 +95,81 @@ cjxl "$work/test-pattern-linear.exr" "$fixtures/test_pattern-linear.jxl" \
     --distance=0 --modular=1 --effort=3 --num_threads=1 \
     --intensity_target=1000 --quiet
 
+# SDR BT.2020/BT.709 base image with an ISO 21496-1 gain map reconstructing
+# the 1,000-nit HLG test pattern (2.3 stops headroom at 203-nit white).
+cjxl "$work/test-pattern.ppm" "$work/test-pattern-gain-map-base.jxl" \
+    --container=1 --distance=0 --modular=1 --effort=3 --num_threads=1 \
+    -x color_space=RGB_D65_202_Per_709 --quiet
+djxl "$work/test-pattern-gain-map-base.jxl" "$work/test-pattern-709-linear-2020.pfm" \
+    --output_format=pfm --color_space=RGB_D65_202_Rel_Lin \
+    --num_threads=1 --quiet
+# Invert the ISO 21496-1 forward formula per channel:
+#   y = (g + base_offset) * 2^log_gain - alternate_offset
+#   u = (log_gain - gain_min) / (gain_max - gain_min)
+#   s = u ^ gamma
+# where:
+#   u               = first image (linear BT.2020 SDR base, 1.0 = 203 nits)
+#   v * (1000/203)  = second image (linear BT.2020 HLG scaled from 1,000-nit
+#                     unit to 203-nit reference-white units)
+#   1/64            = base_offset and alternate_offset
+#   -1.5 .. +2.5    = gain_min .. gain_max (4.0-stop span covering [-1.18, 2.28])
+#   1.25, 1.0, 0.75 = R, G, B gain map gamma
+magick "$work/test-pattern-709-linear-2020.pfm" "$work/test-pattern-HLG-linear-2020.pfm" \
+    -set colorspace RGB \
+    -channel RGB \
+    -fx '(log((v*(1000.0/203.0)+1.0/64.0)/(u+1.0/64.0))/log(2.0)+1.5)/4.0' \
+    -channel R -evaluate Pow 1.25 \
+    -channel B -evaluate Pow 0.75 \
+    +channel -depth 8 \
+    "$work/test-pattern-gain-map.ppm"
+cjxl "$work/test-pattern-gain-map.ppm" "$work/test-pattern-gain-map-codestream.jxl" \
+    --distance=0 --modular=1 --effort=3 --num_threads=1 \
+    -x color_space=sRGB --quiet
+
+# Emit signed/unsigned 32-bit big-endian integers as octal byte escapes.
+be32() {
+    for v do
+        printf '%b' "$(printf '\\0%03o\\0%03o\\0%03o\\0%03o' \
+            $(((v >> 24) & 255)) $(((v >> 16) & 255)) \
+            $(((v >> 8) & 255)) $((v & 255)))"
+    done
+}
+
+{
+    # ISOBMFF box header + jhgm bundle header + ISO 21496-1 header:
+    #   \0\0\0\0   box size 0 (extends to EOF, cjxl recalculates on repack)
+    #   jhgm       box type
+    #   \0         jhgm version 0
+    #   \0\215     gain_map_metadata_size = 141 bytes (0215 octal):
+    #              5-byte header + 16-byte headrooms + 3 * 40-byte channels
+    #   \0\0       ISO 21496-1 minimum_version = 0
+    #   \0\0       ISO 21496-1 writer_version = 0
+    #   \300       flags = 0xC0 (0300 octal):
+    #              0x80 (3-channel RGB parameters) | 0x40 (use base color space)
+    printf '\0\0\0\0jhgm\0\0\215\0\0\0\0\300'
+    # ISO 21496-1 numerator/denominator pairs (big-endian u32/i32):
+    #   base_hdr_headroom      =  0 / 1  (0.0 stops, SDR base)
+    #   alternate_hdr_headroom = 23 / 10 (2.3 stops, ~1,000 nits / 203 nits)
+    #   Per channel (R, G, B):
+    #     gain_min         = -3 / 2  (-1.5 stops)
+    #     gain_max         =  5 / 2  (+2.5 stops)
+    #     gamma            =  5 / 4  (1.25 R), 1 / 1 (1.0 G), 3 / 4 (0.75 B)
+    #     base_offset      =  1 / 64
+    #     alternate_offset =  1 / 64
+    be32 0 1 23 10 \
+        -3 2 5 2 5 4 1 64 1 64 \
+        -3 2 5 2 1 1 1 64 1 64 \
+        -3 2 5 2 3 4 1 64 1 64
+    # Empty jhgm alternate color profile fields before the gain map codestream:
+    #   \0         color_encoding_size = 0 bytes
+    #   \0\0\0\0   compressed_icc_size = 0 bytes
+    printf '\0\0\0\0\0'
+    cat "$work/test-pattern-gain-map-codestream.jxl"
+} >> "$work/test-pattern-gain-map-base.jxl"
+
+cjxl "$work/test-pattern-gain-map-base.jxl" "$fixtures/test_pattern-gain-map.jxl" \
+    --compress_boxes=0 --distance=0 --modular=1 --effort=3 --num_threads=1 --quiet
+
 # Default-target linear BT.2020 patches, sized like the 7x2 offscreen render
 # target: a neutral ramp peaking at 4.0 (812 nits) above chromatic patches.
 magick \
@@ -310,6 +385,7 @@ test_pattern-PQ.jxl
 test_pattern-scRGB.jxl
 test_pattern-scRGB-xyb.jxl
 test_pattern-linear.jxl
+test_pattern-gain-map.jxl
 linear-highlights.jxl
 linear-xyb-sdr.jxl
 ramp-hlg-1000.jxl

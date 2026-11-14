@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use xl_view::color::SourceIntensityTarget;
-use xl_view::decode::{DecodedImage, SourceDynamicRange};
+use xl_view::decode::{DecodedImage, GainMapStatus, SourceDynamicRange};
 use xl_view::metadata::{ExifMetadata, XmpMetadata};
 
 use super::files::file_name;
@@ -15,6 +15,7 @@ pub(super) struct LoadedImageSummary {
     pub(super) dimensions: (u32, u32),
     pub(super) exif: Option<ExifMetadata>,
     pub(super) file_name: String,
+    pub(super) gain_map: Option<GainMapStatus>,
     pub(super) hdr_source: bool,
     pub(super) memory_bytes: usize,
     pub(super) source_color_space: String,
@@ -36,6 +37,14 @@ impl LoadedImageSummary {
         &self,
         display_rows: Vec<(String, String)>,
     ) -> Vec<OverlaySection> {
+        let mut source_rows = vec![
+            ("Range".to_owned(), self.range_summary()),
+            ("Color space".to_owned(), self.source_color_space.clone()),
+            ("Source peak".to_owned(), self.source_peak_summary()),
+        ];
+        if let Some(status) = self.gain_map {
+            source_rows.push(("Gain map".to_owned(), gain_map_summary(status)));
+        }
         let mut sections = vec![
             OverlaySection {
                 title: "IMAGE",
@@ -53,14 +62,7 @@ impl LoadedImageSummary {
             },
             OverlaySection {
                 title: "SOURCE",
-                rows: vec![
-                    (
-                        "Range".to_owned(),
-                        source_range_summary(self.hdr_source, &self.source_transfer),
-                    ),
-                    ("Color space".to_owned(), self.source_color_space.clone()),
-                    ("Source peak".to_owned(), self.source_peak_summary()),
-                ],
+                rows: source_rows,
             },
             OverlaySection {
                 title: "DISPLAY & VIEWER",
@@ -84,6 +86,14 @@ impl LoadedImageSummary {
         sections
     }
 
+    fn range_summary(&self) -> String {
+        source_range_summary(
+            self.hdr_source,
+            &self.source_transfer,
+            matches!(self.gain_map, Some(GainMapStatus::Applied { .. })),
+        )
+    }
+
     fn source_peak_summary(&self) -> String {
         let peak = self.source_peak.nits();
         match &self.peak_reference {
@@ -104,6 +114,7 @@ impl LoadedImageSummary {
             dimensions: (image.width, image.height),
             file_name: file_name(path),
             exif: image.metadata.exif.clone(),
+            gain_map: image.gain_map,
             hdr_source: image.hdr_source,
             memory_bytes: image.memory_cost_bytes,
             source_color_space,
@@ -150,9 +161,23 @@ fn source_encoding_details(encoding: &xl_view::decode::SourceColorEncoding) -> (
     }
 }
 
-fn source_range_summary(hdr: bool, transfer_function: &str) -> String {
+/// Names the transfer function as such, because several share their name
+/// with a set of primaries in the color space row. An applied gain map is
+/// listed because it, not the transfer function, makes the image HDR.
+fn source_range_summary(hdr: bool, transfer_function: &str, gain_map_applied: bool) -> String {
     let range = if hdr { "HDR" } else { "SDR" };
-    format!("{range} ({transfer_function})")
+    let gain_map = if gain_map_applied { " + gain map" } else { "" };
+    format!("{range} ({transfer_function} transfer{gain_map})")
+}
+
+fn gain_map_summary(status: GainMapStatus) -> String {
+    match status {
+        GainMapStatus::Applied { headroom_stops } => {
+            format!("Applied (from SDR base, {headroom_stops:.1} stops headroom)")
+        }
+        GainMapStatus::Available => "Available (showing SDR base)".to_owned(),
+        GainMapStatus::NotApplied(reason) => format!("Not applied ({reason})"),
+    }
 }
 
 fn decode_summary(decode_timing: DecodeTiming, decoded_bytes: usize) -> String {
@@ -339,9 +364,19 @@ mod tests {
                 "ICC-defined".to_owned()
             )
         );
-        assert_eq!(source_range_summary(false, "sRGB"), "SDR (sRGB)");
-        assert_eq!(source_range_summary(true, "HLG"), "HDR (HLG)");
-        assert_eq!(source_range_summary(true, "PQ"), "HDR (PQ)");
+        assert_eq!(
+            source_range_summary(false, "sRGB", false),
+            "SDR (sRGB transfer)"
+        );
+        assert_eq!(
+            source_range_summary(true, "HLG", false),
+            "HDR (HLG transfer)"
+        );
+        assert_eq!(source_range_summary(true, "PQ", false), "HDR (PQ transfer)");
+        assert_eq!(
+            source_range_summary(true, "BT.709", true),
+            "HDR (BT.709 transfer + gain map)"
+        );
     }
 
     #[test]
@@ -471,33 +506,38 @@ mod tests {
         for (name, range, peak, hdr) in [
             (
                 "test_pattern-scRGB.jxl",
-                "HDR (Linear)",
+                "HDR (Linear transfer)",
                 "1000 nits (unit 80 nits)",
                 true,
             ),
             (
                 "linear-bt2020.jxl",
-                "SDR (Linear)",
+                "SDR (Linear transfer)",
                 "203 nits (unit 203 nits, assumed)",
                 false,
             ),
             (
                 "linear-highlights.jxl",
-                "HDR (Linear)",
+                "HDR (Linear transfer)",
                 "812 nits (unit 203 nits, assumed)",
                 true,
             ),
             // Tone mapping still uses the measured overshoot, without an HDR claim.
             (
                 "linear-xyb-sdr.jxl",
-                "SDR (Linear)",
+                "SDR (Linear transfer)",
                 "204 nits (unit 203 nits, assumed)",
                 false,
             ),
-            ("test_pattern-sRGB.jxl", "SDR (sRGB)", "203 nits", false),
+            (
+                "test_pattern-sRGB.jxl",
+                "SDR (sRGB transfer)",
+                "203 nits",
+                false,
+            ),
             (
                 "test_pattern-HLG.jxl",
-                "HDR (HLG)",
+                "HDR (HLG transfer)",
                 "1000 nits (target 1000 nits)",
                 true,
             ),
@@ -505,13 +545,13 @@ mod tests {
             // supports their HDR claim.
             (
                 "hdr-P3-PQ.jxl",
-                "HDR (PQ)",
+                "HDR (PQ transfer)",
                 "1531 nits (target 1000 nits)",
                 true,
             ),
             (
                 "hdr-sRGB-HLG.jxl",
-                "HDR (HLG)",
+                "HDR (HLG transfer)",
                 "211 nits (target 1000 nits)",
                 true,
             ),
@@ -523,13 +563,94 @@ mod tests {
                 &image,
                 DecodeTiming::Measured(Duration::ZERO),
             );
-            assert_eq!(
-                source_range_summary(summary.hdr_source, &summary.source_transfer),
-                range
-            );
+            assert_eq!(summary.range_summary(), range);
             assert_eq!(summary.source_peak_summary(), peak);
             // The title warning and range row share this same flag.
             assert_eq!(summary.hdr_source, hdr, "{name}");
         }
+    }
+
+    #[test]
+    fn gain_map_row_reports_what_was_done_with_the_gain_map() {
+        use xl_view::decode::{GainMapSkipReason, Rendition, decode_memory_with_rendition};
+
+        assert_eq!(
+            gain_map_summary(GainMapStatus::Applied {
+                headroom_stops: 2.299_987_8
+            }),
+            "Applied (from SDR base, 2.3 stops headroom)"
+        );
+        for (reason, expected) in [
+            (GainMapSkipReason::HdrBase, "Not applied (HDR base)"),
+            (
+                GainMapSkipReason::NoHeadroom,
+                "Not applied (no added headroom)",
+            ),
+            (GainMapSkipReason::TooLarge, "Not applied (over budget)"),
+            (GainMapSkipReason::Malformed, "Not applied (invalid data)"),
+            (GainMapSkipReason::Unsupported, "Not applied (unsupported)"),
+            (
+                GainMapSkipReason::UnsupportedProfile,
+                "Not applied (unsupported profile)",
+            ),
+            (
+                GainMapSkipReason::OutOfMemory,
+                "Not applied (out of memory)",
+            ),
+        ] {
+            assert_eq!(
+                gain_map_summary(GainMapStatus::NotApplied(reason)),
+                expected
+            );
+        }
+
+        let source_rows = |path: &Path, rendition| {
+            let image = decode_memory_with_rendition(
+                &std::fs::read(path).unwrap(),
+                DecodeLimits::from_memory_ceiling_mib(256),
+                rendition,
+            )
+            .unwrap();
+            let summary = LoadedImageSummary::from_decoded(
+                path,
+                &image,
+                DecodeTiming::Measured(Duration::ZERO),
+            );
+            // Only the reconstructed HDR rendition may raise the title warning.
+            assert_eq!(summary.hdr_source, rendition == Rendition::Hdr);
+            summary
+                .overlay_sections(Vec::new())
+                .into_iter()
+                .find(|section| section.title == "SOURCE")
+                .unwrap()
+                .rows
+        };
+        let row = |label: &str, value: &str| (label.to_owned(), value.to_owned());
+        let path = fixture_path("test_pattern-gain-map.jxl");
+        // The reconstructed image names the base image's transfer and the gain
+        // map, and reports its measured peak without an intensity target.
+        assert_eq!(
+            source_rows(&path, Rendition::Hdr),
+            [
+                row("Range", "HDR (BT.709 transfer + gain map)"),
+                row("Color space", "RGB, BT.2020 primaries, D65 white"),
+                row("Source peak", "1007 nits"),
+                row("Gain map", "Applied (from SDR base, 2.3 stops headroom)"),
+            ]
+        );
+        assert_eq!(
+            source_rows(&path, Rendition::Sdr),
+            [
+                row("Range", "SDR (BT.709 transfer)"),
+                row("Color space", "RGB, BT.2020 primaries, D65 white"),
+                row("Source peak", "203 nits"),
+                row("Gain map", "Available (showing SDR base)"),
+            ]
+        );
+        // Files without a gain map have no such row.
+        assert_eq!(
+            source_rows(&fixture_path("test_pattern-sRGB.jxl"), Rendition::Sdr).len(),
+            3
+        );
     }
 }

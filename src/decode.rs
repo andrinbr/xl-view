@@ -23,6 +23,10 @@
 //!
 //! Multi-frame animations stop after the first displayable frame. Complete
 //! EXIF/XMP collected by that point is retained, so later metadata may be absent.
+//!
+//! An ISO 21496-1 gain map in a `jhgm` box reconstructs the HDR alternate image
+//! from an SDR base image. A [`Rendition`] selects which of the two a decode
+//! produces.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,6 +37,7 @@ use half::prelude::{HalfBitsSliceExt, HalfFloatSliceExt};
 use sysinfo::System;
 
 mod coordinator;
+mod gain_map;
 mod jxl;
 
 use crate::metadata::{ExifMetadata, XmpMetadata};
@@ -40,7 +45,7 @@ use crate::units::{mib_to_bytes, usize_from_u32};
 
 pub use crate::color::SourceDynamicRange;
 pub use coordinator::{DecodeCompletion, DecodeCoordinator, DecodePurpose, DecodeQueueDisposition};
-pub use jxl::{decode_file, decode_memory};
+pub use jxl::{decode_file, decode_memory, decode_memory_with_rendition};
 
 pub const TILE_SIZE: u32 = 512;
 // Eight source pixels preserve one filtering texel through three tile mip
@@ -410,14 +415,81 @@ pub struct LinearUnit {
     pub assumed: bool,
 }
 
+/// Which image of a gain map file a decode produces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Rendition {
+    /// The HDR image, reconstructed through the gain map when the base is SDR.
+    Hdr,
+    /// The base image, without applying its gain map.
+    Sdr,
+}
+
+/// What a decode did with the file's gain map.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GainMapStatus {
+    /// The gain map reconstructed the HDR image from the SDR base image.
+    Applied {
+        /// Headroom of the reconstructed image above reference white.
+        headroom_stops: f32,
+    },
+    /// A usable gain map was left out because the SDR rendition was requested.
+    Available,
+    /// The gain map cannot be used, and the base image is shown for every rendition.
+    NotApplied(GainMapSkipReason),
+}
+
+impl GainMapStatus {
+    /// Whether decoding again for `rendition` would produce the other image.
+    #[must_use]
+    pub fn differs_for(self, rendition: Rendition) -> bool {
+        matches!(
+            (self, rendition),
+            (Self::Applied { .. }, Rendition::Sdr) | (Self::Available, Rendition::Hdr)
+        )
+    }
+}
+
+/// Why a gain map was not applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GainMapSkipReason {
+    /// The base image is the HDR one. Reconstructing an SDR image is unsupported.
+    HdrBase,
+    /// Both images have the same headroom.
+    NoHeadroom,
+    /// The gain map exceeds the memory left beside the base image.
+    TooLarge,
+    /// The box, its metadata or the gain map image cannot be decoded.
+    Malformed,
+    /// A valid feature that is not implemented, such as a rotated image.
+    Unsupported,
+    /// The base image or the gain map uses a color profile without known primaries.
+    UnsupportedProfile,
+    /// An allocation failed. A later decode may succeed.
+    OutOfMemory,
+}
+
+impl std::fmt::Display for GainMapSkipReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::HdrBase => "HDR base",
+            Self::NoHeadroom => "no added headroom",
+            Self::TooLarge => "over budget",
+            Self::Malformed => "invalid data",
+            Self::Unsupported => "unsupported",
+            Self::UnsupportedProfile => "unsupported profile",
+            Self::OutOfMemory => "out of memory",
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct DecodedImage {
     pub store: Arc<DecodedTileStore>,
     pub width: u32,
     pub height: u32,
     pub source_dynamic_range: SourceDynamicRange,
-    /// Peak used for presentation: measured from visible pixels for PQ, HLG and
-    /// linear sources, and HDR reference white for SDR.
+    /// Peak used for presentation: measured from visible pixels for PQ, HLG,
+    /// linear and gain map reconstructed sources, and HDR reference white for SDR.
     pub source_peak: crate::color::SourceIntensityTarget,
     /// Header intensity target after the invalid-value fallback. PQ and HLG
     /// decode relative to it, but it only bounds their content.
@@ -429,6 +501,8 @@ pub struct DecodedImage {
     /// not XYB with the default target, where codec overshoot alone can produce
     /// such a peak.
     pub hdr_source: bool,
+    /// `None` when the file has no gain map.
+    pub gain_map: Option<GainMapStatus>,
     pub metadata: ImageMetadata,
     pub memory_cost_bytes: usize,
 }
@@ -574,7 +648,12 @@ mod tests {
         bytes.push(0);
         std::fs::write(&path, bytes).unwrap();
         assert!(matches!(
-            jxl::decode_file_for_key(&original, DecodeLimits::from_memory_ceiling_mib(64), None,),
+            jxl::decode_file_for_key(
+                &original,
+                DecodeLimits::from_memory_ceiling_mib(64),
+                None,
+                &|| Rendition::Hdr,
+            ),
             Err(DecodeError::SourceChanged { .. })
         ));
     }

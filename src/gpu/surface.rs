@@ -523,6 +523,12 @@ fn create_ui_texture(
     )
 }
 
+/// Gain map images follow the surface. `--output pq` ends on an HDR surface
+/// or fails, so it need not wait for one.
+const fn prefers_hdr_rendition(output_mode: OutputMode, hdr_surface: bool) -> bool {
+    hdr_surface || matches!(output_mode, OutputMode::Pq)
+}
+
 const fn unloaded_source_peak_nits(diagnostics_pattern: bool) -> f32 {
     if diagnostics_pattern {
         HLG_PATTERN_SOURCE_PEAK_NITS
@@ -541,6 +547,11 @@ impl GpuState {
 
     pub fn is_hdr_surface(&self) -> bool {
         is_hdr_color_space(self.selection.candidate().color_space)
+    }
+
+    /// Whether gain map images should be shown as their HDR rendition.
+    pub fn prefers_hdr_rendition(&self) -> bool {
+        prefers_hdr_rendition(self.output_mode, self.is_hdr_surface())
     }
 
     pub fn image_gpu_budget_bytes(&self) -> u64 {
@@ -616,13 +627,23 @@ impl GpuState {
     fn prepare_image_install(
         &self,
         image: &DecodedImage,
+        preserve_view: bool,
     ) -> Result<PreparedImageInstall, GpuOperationError> {
         let width = image.width;
         let height = image.height;
-        let view_transform = ViewTransform::fit(
-            PhysicalSize::new(width, height),
-            PhysicalSize::new(self.config.width, self.config.height),
-        );
+        let view_transform = self
+            .image
+            .loaded()
+            .filter(|loaded| preserve_view && loaded.dimensions == (width, height))
+            .map_or_else(
+                || {
+                    ViewTransform::fit(
+                        PhysicalSize::new(width, height),
+                        PhysicalSize::new(self.config.width, self.config.height),
+                    )
+                },
+                |loaded| loaded.view_transform,
+            );
         let (image_state, resampling_reservation) = create_image_state(
             &self.workers,
             (self.config.width, self.config.height),
@@ -668,8 +689,14 @@ impl GpuState {
         }
     }
 
-    pub fn set_image(&mut self, image: &Arc<DecodedImage>) -> Result<(), GpuOperationError> {
-        let prepared = self.prepare_image_install(image)?;
+    /// Installs `image`. With `preserve_view`, an image of the same size as
+    /// the one shown keeps its zoom and pan instead of being fitted again.
+    pub fn set_image(
+        &mut self,
+        image: &Arc<DecodedImage>,
+        preserve_view: bool,
+    ) -> Result<(), GpuOperationError> {
+        let prepared = self.prepare_image_install(image, preserve_view)?;
         self.commit_image_install(prepared);
         self.window.request_redraw();
         Ok(())

@@ -163,7 +163,7 @@ otherwise. Use `--output pq` or `--output sdr` to require a mode,
 
 Currently JPEG XL (`.jxl`) only. 
 
-Supported source encodings include SDR, PQ, HLG, and linear RGB (including scRGB).
+Supported source encodings include SDR, PQ, HLG, gain maps, and linear RGB (including scRGB).
 All can be displayed in either HDR or SDR mode.
 
 ## Troubleshooting

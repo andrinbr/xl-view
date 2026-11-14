@@ -460,7 +460,7 @@ mod tests {
             },
             OverlaySection {
                 title: "SOURCE",
-                rows: vec![("Range".to_owned(), "HDR (PQ)".to_owned())],
+                rows: vec![("Range".to_owned(), "HDR (PQ transfer)".to_owned())],
             },
         ]
     }

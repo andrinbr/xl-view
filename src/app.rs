@@ -34,13 +34,12 @@ use crate::APPLICATION_ID;
 use crate::APPLICATION_NAME;
 use crate::app_icon;
 use crate::cli::Cli;
-#[cfg(target_os = "linux")]
 use crate::cli::OutputMode;
 use crate::diagnostics;
 use crate::error::{AppError, RuntimeError};
 use crate::gpu;
 use xl_view::color::HDR_REFERENCE_WHITE_NITS;
-use xl_view::decode::{DecodeCompletion, DecodeCoordinator, DecodeLimits, ImageKey};
+use xl_view::decode::{DecodeCompletion, DecodeCoordinator, DecodeLimits, ImageKey, Rendition};
 use xl_view::units::{BYTES_PER_MIB, mib_to_bytes, milliseconds};
 
 mod decoded_cache;
@@ -186,7 +185,7 @@ impl Application {
     fn install_image(&mut self, install: PendingImageInstall) {
         let previous_image_report = self.current_image_finished_report("replaced");
         if let Some(gpu) = self.gpu.as_mut() {
-            if let Err(error) = gpu.set_image(install.image()) {
+            if let Err(error) = gpu.set_image(install.image(), install.preserves_view()) {
                 tracing::warn!(
                     path = %install.path().display(),
                     purpose = "demand",
@@ -212,6 +211,22 @@ impl Application {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+        self.sync_image_rendition();
+    }
+
+    /// Gain map images follow the output surface: their SDR base image
+    /// unless it is HDR. When the surface changes, the session decodes the
+    /// shown image again and swaps it in.
+    fn sync_image_rendition(&mut self) {
+        let Some(gpu) = self.gpu.as_ref() else {
+            return;
+        };
+        let rendition = if gpu.prefers_hdr_rendition() {
+            Rendition::Hdr
+        } else {
+            Rendition::Sdr
+        };
+        self.session.sync_rendition(rendition);
     }
 
     fn start_neighbor_lookup(&mut self) {
@@ -402,10 +417,12 @@ impl Application {
         self.title_hdr_surface = self.gpu.as_ref().map(gpu::GpuState::is_hdr_surface);
     }
 
-    fn sync_window_title_to_surface(&mut self) {
+    /// Runs wherever the output surface may have changed.
+    fn sync_to_surface(&mut self) {
         if self.gpu.as_ref().map(gpu::GpuState::is_hdr_surface) != self.title_hdr_surface {
             self.update_window_title();
         }
+        self.sync_image_rendition();
     }
 
     fn metadata_sections(&self) -> Vec<gpu::OverlaySection> {
@@ -722,6 +739,7 @@ impl Application {
             self.fail(event_loop, RuntimeError::SurfaceResize(error));
             return;
         }
+        self.sync_to_surface();
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
@@ -734,6 +752,7 @@ impl Application {
             } else {
                 window.request_redraw();
                 self.refresh_metadata_overlay();
+                self.sync_to_surface();
             }
         }
     }
@@ -756,7 +775,7 @@ impl Application {
                 return None;
             }
         };
-        self.sync_window_title_to_surface();
+        self.sync_to_surface();
         if refresh.render_changed
             && let Some(window) = self.window.as_ref()
         {
@@ -1047,7 +1066,7 @@ impl Application {
         if let Some(refresh) = display_refresh {
             self.schedule_metadata_refresh(refresh);
         }
-        self.sync_window_title_to_surface();
+        self.sync_to_surface();
     }
 
     fn shutdown(&mut self) {
@@ -1175,7 +1194,7 @@ impl ApplicationHandler for Application {
         ) {
             Ok(mut gpu) => {
                 if let Some(image) = self.session.take_decoded_image()
-                    && let Err(error) = gpu.set_image(&image)
+                    && let Err(error) = gpu.set_image(&image, false)
                 {
                     self.session.cancel_pending_presentation();
                     self.fail(event_loop, RuntimeError::ImageInstall(error));
@@ -1190,6 +1209,7 @@ impl ApplicationHandler for Application {
                 if let Some(window) = self.window.as_ref() {
                     window.set_cursor_visible(self.cursor_visibility == CursorVisibility::Visible);
                 }
+                self.sync_image_rendition();
             }
             Err(error) => {
                 self.fail(event_loop, RuntimeError::GpuInitialization(error));
@@ -1380,7 +1400,17 @@ pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
         pending_drop: None,
         pinch_fit_block: None,
         primary_click: PrimaryClickTracker::default(),
-        session: ImageSession::new(decoded_cache_bytes, decode_coordinator),
+        // SDR first: gain map images decode as their SDR base until an HDR
+        // surface exists. Only `--output pq` is certain to get one.
+        session: ImageSession::new(
+            decoded_cache_bytes,
+            decode_coordinator,
+            if cli.output == OutputMode::Pq {
+                Rendition::Hdr
+            } else {
+                Rendition::Sdr
+            },
+        ),
         title_hdr_surface: None,
         window: None,
     };
