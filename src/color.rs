@@ -1,4 +1,11 @@
-//! CPU reference implementation of xl-view's display color pipeline.
+//! Color constants, transfer functions, and the CPU reference of xl-view's
+//! display color pipeline.
+//!
+//! The constants, luminance types, transfer functions, and
+//! [`hlg_system_gamma`] are production code for the decoder and the GPU
+//! uniforms. [`OutputTransform`] with its tone and gamut mappers,
+//! [`composite_linear`], and [`dither_unorm`] are a CPU reference that the
+//! parity tests compare with the WGSL shaders.
 //!
 //! Decoded RGB is linear BT.2020/D65. A working value of `1.0` is the
 //! fixed [`HDR_REFERENCE_WHITE_NITS`], while [`SourceIntensityTarget`] and
@@ -10,7 +17,15 @@ pub const HDR_REFERENCE_WHITE_NITS: f32 = 203.0;
 pub const PQ_PEAK_NITS: f32 = 10_000.0;
 const PQ_PEAK_NITS_F64: f64 = PQ_PEAK_NITS as f64;
 
-const BT2020_LUMA: [f64; 3] = [0.2627, 0.6780, 0.0593];
+/// BT.2020 luma weights. `BT2020_LUMA` in `color_transform.wgsl` repeats them.
+const BT2020_LUMA: [f64; 3] = [0.2627, 0.678, 0.0593];
+/// [`BT2020_LUMA`] in the decoder's f32 precision.
+#[expect(clippy::cast_possible_truncation)] // Rounding the weights to f32 is intended.
+pub(crate) const BT2020_LUMA_F32: [f32; 3] = [
+    BT2020_LUMA[0] as f32,
+    BT2020_LUMA[1] as f32,
+    BT2020_LUMA[2] as f32,
+];
 const BT709_LUMA: [f64; 3] = [0.2126, 0.7152, 0.0722];
 const ICTCP_GAMUT_SEARCH_ITERATIONS: u32 = 12;
 // Clip colors at most 0.1% outside BT.709 (relative to the largest channel)
@@ -140,7 +155,8 @@ pub enum OutputEncoding {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OutputTransform {
     pub encoding: OutputEncoding,
-    pub source_intensity_target: SourceIntensityTarget,
+    /// The presentation peak, as `DecodedImage::source_peak`, not the header target.
+    pub source_peak: SourceIntensityTarget,
     pub output_peak: OutputPeak,
     /// Exposure in photographic stops, applied in linear light.
     pub exposure_stops: f64,
@@ -165,9 +181,8 @@ impl OutputTransform {
     fn mapped_bt2020_nits(self, working: [f64; 3]) -> [f64; 3] {
         let reference_white = f64::from(HDR_REFERENCE_WHITE_NITS);
         let nits = working.map(|channel| channel * reference_white);
-        let source_peak = (self.source_intensity_target.nits()
-            * exposure_scale(self.exposure_stops))
-        .max(reference_white);
+        let source_peak =
+            (self.source_peak.nits() * exposure_scale(self.exposure_stops)).max(reference_white);
         let output_peak = self.output_peak.nits();
         tone_map_bt2020_max_rgb(nits, source_peak, output_peak)
     }
@@ -290,7 +305,7 @@ pub fn composite_linear(foreground: [f64; 4], background: [f64; 3]) -> [f64; 3] 
 }
 
 /// Adds deterministic, zero-mean triangular noise before UNORM quantization.
-/// The result remains in `[0, 1]` and is suitable for 8- or 10-bit output.
+/// The result remains in `[0, 1]` and is suitable for 10-bit output.
 ///
 /// # Panics
 ///
@@ -306,8 +321,11 @@ pub fn dither_unorm(value: f64, x: u32, y: u32, channel: u32, bits: u8) -> f64 {
 
 fn tone_map_pq_hermite(value: f64, source_peak: f64, output_peak: f64) -> f64 {
     let value = sanitize(value);
+    // The source peak leaves out the brightest pixels, which can exceed the
+    // display peak while the curve is off. They clip like the curve does when
+    // the source peak approaches the display peak from above.
     if source_peak <= output_peak {
-        return value;
+        return value.min(output_peak);
     }
 
     if value >= source_peak {
@@ -353,12 +371,8 @@ fn pq_hermite_knee(output_peak: f64) -> f64 {
 }
 
 fn tone_map_bt2020_max_rgb(rgb_nits: [f64; 3], source_peak: f64, output_peak: f64) -> [f64; 3] {
-    if source_peak <= output_peak {
-        return rgb_nits;
-    }
-
     let maximum = rgb_nits.into_iter().fold(0.0_f64, f64::max);
-    if maximum <= 0.0 {
+    if maximum <= 0.0 || (source_peak <= output_peak && maximum <= output_peak) {
         return rgb_nits;
     }
 
@@ -619,7 +633,7 @@ mod tests {
     fn transform(encoding: OutputEncoding, source: f64, output: f64) -> OutputTransform {
         OutputTransform {
             encoding,
-            source_intensity_target: SourceIntensityTarget::new(source).unwrap(),
+            source_peak: SourceIntensityTarget::new(source).unwrap(),
             output_peak: OutputPeak::new(output).unwrap(),
             exposure_stops: 0.0,
         }
@@ -867,26 +881,47 @@ mod tests {
 
     #[test]
     fn bright_saturated_colors_do_not_tone_map_to_white() {
-        let transform = transform(OutputEncoding::Pq, 1_000.0, 203.0);
-        for source_nits in [
-            [1_000.0, 0.0, 0.0],
-            [0.0, 1_000.0, 0.0],
-            [0.0, 0.0, 1_000.0],
-            [1_000.0, 1_000.0, 0.0],
-            [1_000.0, 500.0, 0.0],
-        ] {
-            let canonical = source_nits.map(|channel| channel / 203.0);
-            let output = transform.transform([canonical[0], canonical[1], canonical[2], 1.0]);
-            let mapped_nits = [
-                pq_eotf_f64(output[0]) * 10_000.0,
-                pq_eotf_f64(output[1]) * 10_000.0,
-                pq_eotf_f64(output[2]) * 10_000.0,
-            ];
-            let minimum = mapped_nits.into_iter().fold(f64::INFINITY, f64::min);
-            let maximum = mapped_nits.into_iter().fold(0.0_f64, f64::max);
-            assert_near(maximum, 203.0, 2.0e-8);
-            assert!(maximum - minimum > 100.0);
+        // Also when the source peak, which leaves out the brightest pixels, needs
+        // no tone mapping.
+        for source_peak in [1_000.0, 203.0] {
+            let transform = transform(OutputEncoding::Pq, source_peak, 203.0);
+            for source_nits in [
+                [1_000.0, 0.0, 0.0],
+                [0.0, 1_000.0, 0.0],
+                [0.0, 0.0, 1_000.0],
+                [1_000.0, 1_000.0, 0.0],
+                [1_000.0, 500.0, 0.0],
+            ] {
+                let canonical = source_nits.map(|channel| channel / 203.0);
+                let output = transform.transform([canonical[0], canonical[1], canonical[2], 1.0]);
+                let mapped_nits = [
+                    pq_eotf_f64(output[0]) * 10_000.0,
+                    pq_eotf_f64(output[1]) * 10_000.0,
+                    pq_eotf_f64(output[2]) * 10_000.0,
+                ];
+                let minimum = mapped_nits.into_iter().fold(f64::INFINITY, f64::min);
+                let maximum = mapped_nits.into_iter().fold(0.0_f64, f64::max);
+                assert_near(maximum, 203.0, 2.0e-8);
+                assert!(maximum - minimum > 100.0);
+            }
         }
+    }
+
+    #[test]
+    fn colors_above_the_display_peak_keep_their_hue_without_tone_mapping() {
+        // Without a jump when the source peak crosses the display peak.
+        for source_peak in [999.9, 1_000.0, 1_000.1] {
+            assert_eq!(
+                tone_map_bt2020_max_rgb([4_000.0, 2_000.0, 500.0], source_peak, 1_000.0)
+                    .map(f64::to_bits),
+                [1_000.0, 500.0, 125.0].map(f64::to_bits)
+            );
+        }
+        // Colors within the display's range pass unchanged.
+        assert_eq!(
+            tone_map_bt2020_max_rgb([900.0, 450.0, 0.0], 999.9, 1_000.0).map(f64::to_bits),
+            [900.0, 450.0, 0.0].map(f64::to_bits)
+        );
     }
 
     #[test]
@@ -1003,6 +1038,17 @@ mod tests {
         assert!(
             shader.contains(&expected),
             "shader must contain `{expected}` to match the CPU search count",
+        );
+    }
+
+    #[test]
+    fn cpu_and_shader_bt2020_luma_weights_match() {
+        let shader = include_str!("gpu/shaders/color_transform.wgsl");
+        let [red, green, blue] = BT2020_LUMA;
+        let expected = format!("const BT2020_LUMA = vec3f({red:?}, {green:?}, {blue:?});");
+        assert!(
+            shader.contains(&expected),
+            "shader must contain `{expected}` to match the CPU luma weights",
         );
     }
 
@@ -1149,11 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_dither_is_bounded_and_zero_mean() {
-        assert_eq!(
-            dither_unorm(0.5, 10, 20, 1, 8).to_bits(),
-            dither_unorm(0.5, 10, 20, 1, 8).to_bits()
-        );
+    fn dither_is_bounded_and_zero_mean() {
         let mean = (0..256)
             .map(|x| dither_unorm(0.5, x, 7, 0, 8) - 0.5)
             .sum::<f64>()

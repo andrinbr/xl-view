@@ -2,8 +2,10 @@ use std::io;
 
 use wgpu::TextureFormat;
 
+use xl_view::decode::CANONICAL_BYTES_PER_PIXEL;
+use xl_view::units::{BYTES_PER_MIB, u64_from_usize, usize_from_u32};
+
 use super::upload::TextureUploadLayout;
-use xl_view::units::{BYTES_PER_MIB, usize_from_u32};
 
 const GPU_TEXTURE_OVERHEAD_DIVISOR: u64 = 10;
 
@@ -68,7 +70,10 @@ pub(super) fn create_rgba16f_texture(
 }
 
 pub(super) fn encode_premultiplied_rgba16f_row(source: &[f32], destination: &mut [u8]) {
-    for (rgba, encoded) in source.chunks_exact(4).zip(destination.chunks_exact_mut(8)) {
+    for (rgba, encoded) in source
+        .chunks_exact(4)
+        .zip(destination.chunks_exact_mut(CANONICAL_BYTES_PER_PIXEL))
+    {
         let alpha = if rgba[3].is_finite() {
             rgba[3].clamp(0.0, 1.0)
         } else {
@@ -106,7 +111,7 @@ pub(super) fn rgba16f_texture_budget_bytes(
     let mut total = 0_u64;
     let (mut width, mut height) = (width, height);
     for _ in 0..mip_levels {
-        let row_bytes = u64::from(width).saturating_mul(8);
+        let row_bytes = u64::from(width).saturating_mul(u64_from_usize(CANONICAL_BYTES_PER_PIXEL));
         let padded_row_bytes = row_bytes
             .checked_next_multiple_of(alignment)
             .unwrap_or(u64::MAX);

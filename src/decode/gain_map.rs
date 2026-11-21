@@ -21,7 +21,9 @@ use jxl::api::{
 use moxcms::{ColorProfile, Layout, TransformOptions};
 
 use super::jxl::{RayonRunner, profile_intent, working_profile};
-use super::{DecodeLimits, GainMapSkipReason, GainMapStatus, Rendition, SourceDynamicRange};
+use super::{
+    DecodeLimits, GainMapSkipReason, GainMapStatus, MAX_FINITE_F16, Rendition, SourceDynamicRange,
+};
 use crate::units::usize_from_u32;
 
 const SIGNATURE_BOX_HEADER: [u8; 8] = *b"\0\0\0\x0cJXL ";
@@ -33,8 +35,6 @@ const FLAG_BASE_COLOR_SPACE: u8 = 0x40;
 
 /// Gain map samples are decoded as 16-bit codes.
 const MAX_CODE: f32 = 65_535.0;
-/// Largest finite f16, the range of the canonical pixel format.
-const MAX_OUTPUT: f32 = 65_504.0;
 /// 2^64 keeps both matrix products finite in f32 without clipping any value
 /// that fits the canonical format.
 const INTERMEDIATE_LIMIT: f32 = 18_446_744_073_709_551_616.0;
@@ -365,7 +365,7 @@ fn reconstruction(
     }
     let mut used = payload.data.len();
     let bundle = if payload.compressed {
-        let bundle = decompress(&payload.data, budget.saturating_sub(used))?;
+        let bundle = decompress_brotli(payload.data.as_slice(), budget.saturating_sub(used))?;
         used += bundle.len();
         bundle
     } else {
@@ -373,14 +373,14 @@ fn reconstruction(
     };
     let bundle = Bundle::parse(&bundle)?;
     let metadata = Metadata::parse(bundle.metadata)?;
+    // Unsigned ratios are never NaN or -0.0, so the total order is exact.
     match metadata
         .alternate_headroom
-        .partial_cmp(&metadata.base_headroom)
+        .total_cmp(&metadata.base_headroom)
     {
-        Some(Ordering::Greater) => {}
-        Some(Ordering::Equal) => return Err(Reason::NoHeadroom),
-        Some(Ordering::Less) => return Err(Reason::HdrBase),
-        None => return Err(Reason::Malformed),
+        Ordering::Greater => {}
+        Ordering::Equal => return Err(Reason::NoHeadroom),
+        Ordering::Less => return Err(Reason::HdrBase),
     }
     match base.dynamic_range {
         SourceDynamicRange::Sdr => {}
@@ -413,7 +413,11 @@ fn reconstruction(
     Ok(Some(GainMap::new(samples, &metadata, space, base)))
 }
 
-fn decompress(compressed: &[u8], limit: usize) -> Result<Vec<u8>, Reason> {
+/// Decompresses the Brotli stream of a `brob` box, failing once the output
+/// would exceed `limit`. Metadata boxes use it too: jxl's own
+/// `JxlAuxBox::data` has no limit, and a few hundred bytes can expand to
+/// gigabytes.
+pub(super) fn decompress_brotli(compressed: impl Read, limit: usize) -> Result<Vec<u8>, Reason> {
     let mut decoder = brotli_decompressor::Decompressor::new(compressed, 4096);
     let mut output = Vec::new();
     let mut buffer = [0_u8; 8192];
@@ -977,7 +981,7 @@ impl GainMap {
                 value = multiply(&space.from_gain, value);
             }
             for (output, value) in pixel.iter_mut().zip(value) {
-                *output = value.clamp(-MAX_OUTPUT, MAX_OUTPUT);
+                *output = value.clamp(-MAX_FINITE_F16, MAX_FINITE_F16);
             }
         }
     }

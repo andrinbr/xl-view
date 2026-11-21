@@ -11,7 +11,7 @@ publish = false
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ash = "0.38.0"
-wgpu = { version = "30.0.0", default-features = false, features = [
+wgpu = { version = "30.0.2", default-features = false, features = [
     "std",
     "vulkan",
 ] }

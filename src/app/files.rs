@@ -3,17 +3,29 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use rfd::FileDialog;
-#[cfg(not(target_os = "macos"))]
 use winit::data_transfer::TypedData;
 use winit::window::Window;
 
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "macos")]
-pub(super) use self::macos::dropped_file_paths;
-#[cfg(not(target_os = "macos"))]
 pub(super) fn dropped_file_paths(value: &dyn TypedData) -> std::io::Result<Vec<PathBuf>> {
-    value.try_as_file_paths()
+    // Preserve transfer errors so the caller can retry an unfinished drop.
+    let uris = value.try_as_uris()?;
+    Ok(uris
+        .into_iter()
+        .filter_map(|uri| dropped_file_path(&uri))
+        .collect())
+}
+
+/// Converts a `file:` URI to a path without consulting the file system.
+fn dropped_file_path(uri: &str) -> Option<PathBuf> {
+    let url = url::Url::parse(uri).ok()?;
+    if url.scheme() != "file" {
+        return None;
+    }
+    let path = url.to_file_path().ok()?;
+    if path.as_os_str().as_encoded_bytes().contains(&0) {
+        return None;
+    }
+    Some(path)
 }
 
 #[derive(Debug)]
@@ -25,7 +37,7 @@ pub(super) enum FilePickerResult {
 
 /// The folder holding the current image could not be listed.
 #[derive(Debug, thiserror::Error)]
-#[error("cannot read {}: {source}", .folder.display())]
+#[error("failed to read {}: {source}", .folder.display())]
 pub(super) struct FolderReadError {
     folder: PathBuf,
     source: io::Error,
@@ -80,7 +92,7 @@ fn is_hidden_path(path: &Path) -> bool {
         || has_hidden_file_attribute(path)
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn has_hidden_file_attribute(path: &Path) -> bool {
     use std::os::windows::fs::MetadataExt;
 
@@ -89,9 +101,19 @@ fn has_hidden_file_attribute(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(target_os = "windows"))]
 const fn has_hidden_file_attribute(_path: &Path) -> bool {
     false
+}
+
+/// Makes a path from the command line absolute. Symbolic links are kept, so
+/// the image stays in the folder it was opened from.
+///
+/// A bare file name has an empty parent, which can neither be listed for
+/// folder navigation nor given to the file picker.
+pub(super) fn absolute_path(path: &Path) -> PathBuf {
+    // A path that cannot be made absolute is left to fail when it is opened.
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub(super) fn first_image_path(paths: &[PathBuf]) -> Option<PathBuf> {
@@ -151,7 +173,12 @@ pub(super) fn neighboring_image_paths(
                 && (path.file_name() == current_name || !is_hidden_path(path))
         })
         .collect::<Vec<_>>();
-    paths.sort_by_cached_key(|path| file_name(path).to_lowercase());
+    // The exact name orders names that differ only in case, which the
+    // directory may list in any order.
+    paths.sort_by_cached_key(|path| {
+        let name = file_name(path);
+        (name.to_lowercase(), name)
+    });
     Ok(NeighborPaths {
         previous: choose_adjacent_path(&paths, current_path, FolderDirection::Previous),
         next: choose_adjacent_path(&paths, current_path, FolderDirection::Next),
@@ -182,6 +209,25 @@ mod tests {
     use crate::test_utils::TestTempDir;
 
     #[test]
+    fn dropped_file_urls_decode_names_and_reject_unusable_entries() {
+        #[cfg(target_os = "windows")]
+        let (uri, path) = (
+            "file:///C:/Pictures/space%20%E9%9B%AA%23%25+.jxl",
+            r"C:\Pictures\space 雪#%+.jxl",
+        );
+        #[cfg(not(target_os = "windows"))]
+        let (uri, path) = (
+            "file:///tmp/space%20%E9%9B%AA%23%25+.jxl",
+            "/tmp/space 雪#%+.jxl",
+        );
+        assert_eq!(dropped_file_path(uri), Some(PathBuf::from(path)));
+        for invalid in ["https://localhost/tmp/image.jxl", "not a URI"] {
+            assert_eq!(dropped_file_path(invalid), None);
+        }
+        assert_eq!(dropped_file_path(&format!("{uri}%00")), None);
+    }
+
+    #[test]
     fn dot_prefixed_names_are_hidden_on_every_platform() {
         assert!(is_hidden_path(Path::new(".image.jxl")));
         assert!(is_hidden_path(Path::new("folder/._image.jxl")));
@@ -207,7 +253,7 @@ mod tests {
         assert_eq!(hidden_neighbors.next, Some(first));
     }
 
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     #[test]
     fn windows_hidden_attribute_is_recognized() {
         use std::os::windows::fs::OpenOptionsExt;
@@ -230,6 +276,15 @@ mod tests {
             file_name(Path::new("/home/user/private/photo.jxl")),
             "photo.jxl"
         );
+    }
+
+    #[test]
+    fn bare_file_name_gets_a_folder_that_can_be_listed() {
+        let path = absolute_path(Path::new("image.jxl"));
+        assert!(path.is_absolute());
+        assert_eq!(path.file_name(), Some(OsStr::new("image.jxl")));
+        // The empty parent of the bare name cannot be read.
+        assert!(neighboring_image_paths(&path).is_ok());
     }
 
     #[test]

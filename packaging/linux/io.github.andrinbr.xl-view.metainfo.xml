@@ -50,12 +50,25 @@
   </branding>
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/andrinbr/xl-view/v0.4.0/docs/screenshots/xl-view-example-image.png</image>
+      <image>https://raw.githubusercontent.com/andrinbr/xl-view/v0.5.0/docs/screenshots/xl-view-example-image.png</image>
       <caption>A large HDR panorama with the metadata overlay open</caption>
     </screenshot>
   </screenshots>
   <content_rating type="oars-1.1" />
   <releases>
+    <release version="0.5.0" date="2026-11-21">
+      <url type="details">https://github.com/andrinbr/xl-view/releases/tag/v0.5.0</url>
+      <description>
+        <p>This release adds gain map support and a brightness histogram, improves HDR tone mapping, and enables automatic AppImage updates.</p>
+        <ul>
+          <li>Added support for JPEG XL gain maps: HDR displays show the HDR image reconstructed from the gain map, SDR displays show the SDR base image</li>
+          <li>Added a histogram to the metadata overlay</li>
+          <li>Improved HDR tone mapping by leaving out the brightest 0.01% of pixels when measuring the peak brightness of an image</li>
+          <li>Added support for automatic AppImage updates</li>
+          <li>Fixed minor bugs and updated dependencies</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-10-23">
       <url type="details">https://github.com/andrinbr/xl-view/releases/tag/v0.4.0</url>
       <description>

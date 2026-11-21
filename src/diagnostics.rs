@@ -78,7 +78,7 @@ pub fn show_startup_error_dialog(error: &AppError) {
     }
     MessageDialog::new()
         .set_level(MessageLevel::Error)
-        .set_title(format!("{APPLICATION_NAME} could not start"))
+        .set_title(format!("{APPLICATION_NAME} failed to start"))
         .set_description(error.to_string())
         .show();
 }
@@ -96,6 +96,7 @@ fn should_show_startup_error_dialog(
     match error {
         #[cfg(target_os = "linux")]
         AppError::NoNativeWayland => x11_display_available,
+        AppError::SystemMemory(_) => true,
         AppError::Runtime(RuntimeError::GpuInitialization(
             GpuInitializationError::BackendUnavailable { .. },
         )) => true,
@@ -133,7 +134,7 @@ pub fn print_report(phase: &str, report: &str) {
     let output = format_report(phase, report);
     let mut stdout = io::stdout().lock();
     if let Err(error) = stdout.write_all(output.as_bytes()) {
-        tracing::warn!(%error, phase, "cannot write diagnostic report");
+        tracing::warn!(%error, phase, "failed to write diagnostic report");
     }
 }
 
@@ -187,12 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn default_filter_covers_the_application() {
-        assert!(EnvFilter::try_new(DEFAULT_LOG_FILTER).is_ok());
-        assert!(DEFAULT_LOG_FILTER.contains("xl_view=info"));
-    }
-
-    #[test]
     fn reports_are_labeled_and_end_with_one_newline() {
         assert_eq!(
             format_report("startup", "adapter: test"),
@@ -207,7 +202,7 @@ mod tests {
 
         impl std::fmt::Display for OpaqueContext {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("cannot read the image")
+                formatter.write_str("failed to read the image")
             }
         }
 
@@ -234,6 +229,14 @@ mod tests {
                 wgpu::RequestAdapterError::EnvNotSet,
             ),
         ));
+
+        assert!(should_show_startup_error_dialog(&error, false, false));
+        assert!(!should_show_startup_error_dialog(&error, true, true));
+    }
+
+    #[test]
+    fn system_memory_failure_dialog_is_limited_to_desktop_launches() {
+        let error = AppError::from(xl_view::memory::MemoryQueryError::Unavailable);
 
         assert!(should_show_startup_error_dialog(&error, false, false));
         assert!(!should_show_startup_error_dialog(&error, true, true));

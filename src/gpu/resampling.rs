@@ -6,17 +6,15 @@ use std::time::{Duration, Instant};
 
 use wgpu::TextureFormat;
 use xl_view::decode::DecodedTileStore;
+use xl_view::units::{bytes_to_mib, milliseconds, u64_from_usize};
 
 mod convolution;
 
-use self::convolution::{
-    ResampleError, ResamplingScratch, prepare_reused_buffer, resample_lanczos2,
-};
+use self::convolution::{ResampleError, ResamplingScratch, allocate_zeroed, resample_lanczos2};
 use super::mip::rgba16f_texture_budget_bytes;
 use super::upload::TextureUploadLayout;
 use super::{WorkerContext, lock_unpoisoned};
 use crate::diagnostics::panic_payload_message;
-use xl_view::units::{bytes_to_mib, milliseconds, u64_from_usize};
 
 const RESAMPLING_DEBOUNCE: Duration = Duration::from_millis(50);
 
@@ -587,63 +585,40 @@ fn record_scratch_peak(shared: &Arc<(Mutex<ResamplingWorkerState>, Condvar)>, by
     state.scratch_peak_bytes = state.scratch_peak_bytes.max(bytes);
 }
 
-enum DebounceOutcome {
-    Ready(ResamplingJob),
-    Superseded,
-    Shutdown,
-}
-
-#[inline(never)] // Keep the debounce wait state machine distinct from the hot resampling path.
-fn wait_for_debounce(
-    mut state: std::sync::MutexGuard<'_, ResamplingWorkerState>,
-    wake: &Condvar,
-    mut job: ResamplingJob,
-) -> DebounceOutcome {
-    loop {
-        if state.shutdown {
-            return DebounceOutcome::Shutdown;
-        }
-        if state.generation != job.generation {
-            return DebounceOutcome::Superseded;
-        }
-        if let Some(replacement) = state.pending.take() {
-            job = replacement;
-            continue;
-        }
-        let now = Instant::now();
-        if now >= job.deadline {
-            return DebounceOutcome::Ready(job);
-        }
-        let timeout = job.deadline.saturating_duration_since(now);
-        let (next_state, _) = wake
-            .wait_timeout(state, timeout)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state = next_state;
-    }
-}
-
+/// Waits for a request and returns it once its debounce deadline passes
+/// without a newer one, or `None` on shutdown.
 #[inline(never)] // Keep blocking mutex/condvar state out of the worker's processing frame.
 fn next_debounced_job(
     shared: &Arc<(Mutex<ResamplingWorkerState>, Condvar)>,
 ) -> Option<ResamplingJob> {
     let (state, wake) = shared.as_ref();
-    'poll: loop {
-        let mut locked = lock_unpoisoned(state);
-        loop {
-            if locked.shutdown {
-                return None;
-            }
-            if let Some(job) = locked.pending.take() {
-                match wait_for_debounce(locked, wake, job) {
-                    DebounceOutcome::Ready(job) => return Some(job),
-                    DebounceOutcome::Superseded => continue 'poll,
-                    DebounceOutcome::Shutdown => return None,
-                }
-            }
-            locked = wake
-                .wait(locked)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = lock_unpoisoned(state);
+    let mut waiting: Option<ResamplingJob> = None;
+    loop {
+        if state.shutdown {
+            return None;
         }
+        // Every replacement carries a new generation. A newer request takes
+        // over the wait, and a cleared one ends it.
+        if let Some(job) = state.pending.take() {
+            waiting = Some(job);
+        } else if waiting.is_some_and(|job| job.generation != state.generation) {
+            waiting = None;
+        }
+        let Some(job) = waiting else {
+            state = wake
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            continue;
+        };
+        let now = Instant::now();
+        if now >= job.deadline {
+            return Some(job);
+        }
+        state = wake
+            .wait_timeout(state, job.deadline.saturating_duration_since(now))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
     }
 }
 
@@ -688,11 +663,7 @@ fn upload_resampled_texture(
         "resampling upload",
     )?;
     upload_layout.validate_source_len(pixels.len())?;
-    prepare_reused_buffer(
-        staging,
-        upload_layout.staging_bytes(),
-        "resampling upload staging",
-    )?;
+    *staging = allocate_zeroed(upload_layout.staging_bytes(), "resampling upload staging")?;
     for stripe in upload_layout.stripes() {
         if !resampling_job_is_current(state, job.generation) {
             return Err(ResampleError::Canceled);

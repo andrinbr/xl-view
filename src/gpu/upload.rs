@@ -1,10 +1,10 @@
 use std::io;
 use std::ops::Range;
 
-use xl_view::units::usize_from_u32;
+use xl_view::decode::CANONICAL_BYTES_PER_PIXEL;
+use xl_view::units::{mib_to_usize_bytes, usize_from_u32};
 
-pub(super) const MAX_STAGING_BYTES: usize = 16 * 1024 * 1024;
-const RGBA16F_BYTES_PER_PIXEL: u32 = 8;
+pub(super) const MAX_STAGING_BYTES: usize = mib_to_usize_bytes(16);
 
 /// Validated row geometry for one tightly packed CPU image uploaded to a GPU
 /// texture through a reusable, row-aligned staging allocation.
@@ -26,22 +26,14 @@ impl TextureUploadLayout {
         height: u32,
         context: &'static str,
     ) -> Result<Self, io::Error> {
-        Self::new(width, height, RGBA16F_BYTES_PER_PIXEL, context)
-    }
-
-    fn new(
-        width: u32,
-        height: u32,
-        bytes_per_pixel: u32,
-        context: &'static str,
-    ) -> Result<Self, io::Error> {
         if width == 0 || height == 0 {
             return Err(io::Error::other(format!(
                 "{context} dimensions must be non-zero"
             )));
         }
-        let row_bytes = width
-            .checked_mul(bytes_per_pixel)
+        let row_bytes = usize_from_u32(width)
+            .checked_mul(CANONICAL_BYTES_PER_PIXEL)
+            .and_then(|bytes| u32::try_from(bytes).ok())
             .ok_or_else(|| io::Error::other(format!("{context} row size overflowed")))?;
         let padded_row_bytes = row_bytes
             .checked_next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)

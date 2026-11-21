@@ -11,11 +11,11 @@ use xl_view::decode::{
     DecodeCompletion, DecodeCoordinator, DecodeError, DecodePurpose, DecodeQueueDisposition,
     DecodedImage, ImageKey, Rendition,
 };
+use xl_view::units::milliseconds;
 
 use super::decoded_cache::{CachedDecodedImage, DecodedImageCache};
 use super::files::{FolderDirection, FolderReadError, NeighborPaths, file_name};
 use super::overlay::{DecodeTiming, LoadedImageSummary};
-use xl_view::units::milliseconds;
 
 const PREFETCH_DELAY: Duration = Duration::from_millis(250);
 
@@ -281,7 +281,9 @@ impl ImageSession {
         rendition: Rendition,
     ) -> Self {
         let mut session = Self::with_decode_queue(maximum_cache_bytes, decode_coordinator);
-        session.sync_rendition(rendition);
+        // Set unconditionally, so the decoder's own default never matters.
+        session.rendition = rendition;
+        session.decode_queue.set_rendition(rendition);
         session
     }
 
@@ -308,19 +310,27 @@ impl ImageSession {
         }
     }
 
-    /// Follows the rendition the display needs. Returns whether the shown
-    /// image is now being decoded again to match it.
-    pub(super) fn sync_rendition(&mut self, rendition: Rendition) -> bool {
+    /// Follows the rendition the display needs, and decodes the shown image
+    /// again when it does not match.
+    pub(super) fn sync_rendition(&mut self, rendition: Rendition) {
         if rendition != self.rendition {
             self.rendition = rendition;
             self.rendition_swap_failed = false;
             self.decode_queue.set_rendition(rendition);
             self.decoded_cache.evict_other_renditions(rendition);
+            // Prefetch the evicted neighbors again. A pending open or swap
+            // starts its own plan when it is installed.
+            if self.pending_open.is_none()
+                && let (Some(key), Some(path)) =
+                    (self.current_key.clone(), self.current_path.clone())
+            {
+                self.schedule_neighbor_prefetch(key, path, None);
+            }
         }
-        self.swap_current_rendition()
+        self.swap_current_rendition();
     }
 
-    fn swap_current_rendition(&mut self) -> bool {
+    fn swap_current_rendition(&mut self) {
         // Checked on every redraw, so the common case must stay cheap.
         let differs = self.loaded_image.as_ref().is_some_and(|image| {
             image
@@ -328,10 +338,10 @@ impl ImageSession {
                 .is_some_and(|status| status.differs_for(self.rendition))
         });
         if !differs || self.pending_open.is_some() || self.rendition_swap_failed {
-            return false;
+            return;
         }
         let (Some(key), Some(path)) = (self.current_key.clone(), self.current_path.clone()) else {
-            return false;
+            return;
         };
         self.selection_generation = self.selection_generation.wrapping_add(1);
         let generation = self.selection_generation;
@@ -354,7 +364,6 @@ impl ImageSession {
             direction: None,
             rendition_swap: true,
         });
-        true
     }
 
     pub(super) fn select_path(
@@ -381,9 +390,9 @@ impl ImageSession {
                     selection_generation = generation,
                     direction = ?direction,
                     %error,
-                    "cannot identify image source"
+                    "failed to identify image source"
                 );
-                self.status_message = Some(format!("Cannot open {display_name}: {error}"));
+                self.status_message = Some(format!("Failed to open {display_name}: {error}"));
                 self.pending_open = None;
                 return SelectionEffect::StatusChanged;
             }
@@ -409,11 +418,12 @@ impl ImageSession {
                 direction = ?direction,
                 "decoded image cache hit"
             );
-            self.pending_open = Some(context);
-            SelectionEffect::Install(
-                self.prepare_current_install(image, true)
-                    .expect("pending_open was set immediately above"),
-            )
+            self.pending_open = None;
+            SelectionEffect::Install(PendingImageInstall {
+                cached: image,
+                context,
+                cache_hit: true,
+            })
         } else {
             let disposition = self.decode_queue.request_demand(path, key, generation);
             tracing::debug!(
@@ -430,15 +440,15 @@ impl ImageSession {
         }
     }
 
+    /// Pairs a decoded image with the pending open it completes.
     fn prepare_current_install(
         &mut self,
         cached: CachedDecodedImage,
-        cache_hit: bool,
     ) -> Option<PendingImageInstall> {
         Some(PendingImageInstall {
             cached,
             context: self.pending_open.take()?,
-            cache_hit,
+            cache_hit: false,
         })
     }
 
@@ -513,19 +523,27 @@ impl ImageSession {
         error: &impl std::fmt::Display,
     ) {
         self.status_message = Some(format!(
-            "Cannot display {}: {error}",
+            "Failed to display {}: {error}",
             file_name(install.path())
         ));
         self.rendition_swap_failed |= install.context.rendition_swap;
         self.cancel_pending_presentation();
     }
 
+    /// Starts a plan for the image just installed. Every plan gets its own
+    /// generation, even for the same image after a rendition swap, so the
+    /// replaced plan's prefetches can never advance or end this one. Its
+    /// queued prefetches are canceled and a running one's result is
+    /// discarded, as after navigation.
     fn schedule_neighbor_prefetch(
         &mut self,
         anchor_key: ImageKey,
         anchor_path: PathBuf,
         direction: Option<FolderDirection>,
     ) {
+        self.prefetch_generation = self.prefetch_generation.wrapping_add(1);
+        self.decode_queue
+            .cancel_queued_prefetches_except(self.prefetch_generation);
         if self.decoded_cache.available_for_prefetch(&[]) == 0 {
             self.prefetch_plan = None;
             return;
@@ -542,13 +560,20 @@ impl ImageSession {
         });
     }
 
+    /// When the plan looks up its neighbors. A pending open or swap starts
+    /// its own plan when it is installed, so a lookup before that would only
+    /// queue prefetches that are then canceled or discarded.
     pub(super) fn prefetch_deadline(&self) -> Option<Instant> {
+        if self.pending_open.is_some() {
+            return None;
+        }
         self.prefetch_plan.as_ref().and_then(|plan| plan.deadline)
     }
 
     pub(super) fn begin_neighbor_lookup(&mut self) -> Option<NeighborLookupRequest> {
+        self.prefetch_deadline()?;
         let plan = self.prefetch_plan.as_mut()?;
-        plan.deadline.take()?;
+        plan.deadline = None;
         Some(NeighborLookupRequest {
             generation: plan.generation,
             anchor_key: plan.anchor_key.clone(),
@@ -566,7 +591,7 @@ impl ImageSession {
             purpose = "prefetch",
             prefetch_generation = request.generation,
             %error,
-            "cannot start neighboring-image lookup"
+            "failed to start neighboring-image lookup"
         );
         if self.prefetch_plan.as_ref().is_some_and(|plan| {
             plan.generation == request.generation && plan.anchor_key == request.anchor_key
@@ -598,7 +623,7 @@ impl ImageSession {
                     purpose = "prefetch",
                     prefetch_generation = generation,
                     %error,
-                    "cannot inspect neighboring images"
+                    "failed to inspect neighboring images"
                 );
                 self.prefetch_plan = None;
                 return;
@@ -637,7 +662,7 @@ impl ImageSession {
         let key = match ImageKey::from_path(&path) {
             Ok(key) => key,
             Err(error) => {
-                tracing::debug!(path = %path.display(), %error, "cannot identify prefetch source");
+                tracing::debug!(path = %path.display(), %error, "failed to identify prefetch source");
                 return PrefetchStep::Continue;
             }
         };
@@ -708,10 +733,10 @@ impl ImageSession {
             path = %request.source_path.display(),
             direction = ?request.direction,
             %error,
-            "cannot start folder navigation"
+            "failed to start folder navigation"
         );
         if request.generation == self.navigation_generation {
-            self.status_message = Some(format!("Cannot inspect the image folder: {error}"));
+            self.status_message = Some(format!("Failed to inspect the image folder: {error}"));
         }
     }
 
@@ -737,9 +762,9 @@ impl ImageSession {
                     path = %source_path.display(),
                     ?direction,
                     %error,
-                    "cannot inspect the image folder"
+                    "failed to inspect the image folder"
                 );
-                self.status_message = Some(format!("Cannot inspect the image folder: {error}"));
+                self.status_message = Some(format!("Failed to inspect the image folder: {error}"));
                 NavigationEffect::StatusChanged
             }
         }
@@ -814,7 +839,7 @@ impl ImageSession {
                 }
                 let cached = CachedDecodedImage::new(image, completion.decode_time);
                 if is_current {
-                    self.prepare_current_install(cached, false)
+                    self.prepare_current_install(cached)
                         .map_or(DecodeEffect::None, DecodeEffect::Install)
                 } else {
                     if !cached.differs_for(self.rendition) {
@@ -942,7 +967,7 @@ impl ImageSession {
             "image decode failed"
         );
         self.pending_open = None;
-        self.status_message = Some(format!("Cannot open {name}: {error}"));
+        self.status_message = Some(format!("Failed to open {name}: {error}"));
         self.cancel_pending_presentation();
     }
 

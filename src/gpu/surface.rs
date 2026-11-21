@@ -37,7 +37,7 @@ use super::{
 };
 use crate::cli::{BackgroundMode, OutputMode};
 use xl_view::color::{HDR_REFERENCE_WHITE_NITS, PQ_PEAK_NITS, pq_oetf};
-use xl_view::decode::{DecodedImage, DecodedTileStore, TILE_GUTTER, TILE_SIZE};
+use xl_view::decode::{DecodedImage, DecodedTileStore, Rendition, TILE_GUTTER, TILE_SIZE};
 use xl_view::units::{BYTES_PER_MIB, bytes_to_mib};
 
 const HLG_PATTERN_SOURCE_PEAK_NITS: f32 = 1_000.0;
@@ -328,7 +328,7 @@ pub(super) fn initialize(
     let monitor_name = current_monitor_name(window.as_ref());
     #[cfg(target_os = "linux")]
     let display_target = display_target_provider.target(monitor_name.as_deref());
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[cfg(not(target_os = "linux"))]
     let display_target = display_target_provider.target(&surface.display_hdr_info(&adapter));
     let capabilities = surface.get_capabilities(&adapter);
     let selection = select_surface_with_wayland_bootstrap(
@@ -523,10 +523,15 @@ fn create_ui_texture(
     )
 }
 
-/// Gain map images follow the surface. `--output pq` ends on an HDR surface
-/// or fails, so it need not wait for one.
-const fn prefers_hdr_rendition(output_mode: OutputMode, hdr_surface: bool) -> bool {
-    hdr_surface || matches!(output_mode, OutputMode::Pq)
+/// The rendition gain map images are shown in: their SDR base image unless
+/// the surface is HDR. `--output pq` ends on an HDR surface or fails, so it
+/// need not wait for one, not even before the surface exists.
+pub(crate) const fn gain_map_rendition(output_mode: OutputMode, hdr_surface: bool) -> Rendition {
+    if hdr_surface || matches!(output_mode, OutputMode::Pq) {
+        Rendition::Hdr
+    } else {
+        Rendition::Sdr
+    }
 }
 
 const fn unloaded_source_peak_nits(diagnostics_pattern: bool) -> f32 {
@@ -549,9 +554,9 @@ impl GpuState {
         is_hdr_color_space(self.selection.candidate().color_space)
     }
 
-    /// Whether gain map images should be shown as their HDR rendition.
-    pub fn prefers_hdr_rendition(&self) -> bool {
-        prefers_hdr_rendition(self.output_mode, self.is_hdr_surface())
+    /// The rendition gain map images are shown in on the current surface.
+    pub fn gain_map_rendition(&self) -> Rendition {
+        gain_map_rendition(self.output_mode, self.is_hdr_surface())
     }
 
     pub fn image_gpu_budget_bytes(&self) -> u64 {
@@ -676,10 +681,12 @@ impl GpuState {
                 .tile_cache
                 .request_view(&self.queue, image.view_transform);
         }
+        // The bind group must point at the new image's textures, which covers
+        // any resampled texture too, so the "binding changed" result is not
+        // needed. A format change below rebuilds it once more with the new
+        // pipeline, which is cheap.
         let _ = self.request_resampling();
-        if surface_selection.candidate().format == self.selection.candidate().format {
-            self.rebuild_image_bind_group();
-        }
+        self.rebuild_image_bind_group();
         // The new image needs fresh uniforms even when the output is unchanged.
         if !self.apply_surface_selection(
             surface_selection,
@@ -943,7 +950,7 @@ impl GpuState {
         ) {
             Ok(cache) => cache,
             Err(error) => {
-                tracing::warn!(%error, "cannot resize the GPU tile cache. Using the coarse preview");
+                tracing::warn!(%error, "failed to resize the GPU tile cache. Using the coarse preview");
                 TileCache::fallback(&self.device)
             }
         };
@@ -1122,7 +1129,7 @@ impl GpuState {
             self.display_target_provider
                 .target(self.monitor_name.as_deref())
         }
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        #[cfg(not(target_os = "linux"))]
         {
             let hdr_info = self.surface.display_hdr_info(&self.adapter);
             self.display_target_provider.target(&hdr_info)

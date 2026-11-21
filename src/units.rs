@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 pub const BYTES_PER_MIB: u64 = 1024 * 1024;
+pub const BYTES_PER_GIB: u64 = 1024 * BYTES_PER_MIB;
 
 /// Converts geometry known to fit, without a fallible-looking error path.
 ///
@@ -33,6 +34,13 @@ pub fn milliseconds(duration: Duration) -> f64 {
 #[must_use]
 pub const fn mib_to_bytes(mib: u64) -> u64 {
     mib.saturating_mul(BYTES_PER_MIB)
+}
+
+/// [`mib_to_bytes`] for constant limits held as `usize`. Overflow is a
+/// compile-time error in a constant.
+#[must_use]
+pub const fn mib_to_usize_bytes(mib: usize) -> usize {
+    mib * 1024 * 1024
 }
 
 // A u32 KiB count converts to f64 losslessly without a cast. Values

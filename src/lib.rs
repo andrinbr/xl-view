@@ -2,6 +2,7 @@
 
 pub mod color;
 pub mod decode;
+pub mod memory;
 pub mod metadata;
 #[cfg(test)]
 mod test_utils;

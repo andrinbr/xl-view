@@ -26,7 +26,7 @@ impl TestTempDir {
                 Ok(()) => return Self { path },
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => panic!(
-                    "cannot create temporary test directory {}: {error}",
+                    "failed to create temporary test directory {}: {error}",
                     path.display()
                 ),
             }

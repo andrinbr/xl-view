@@ -6,11 +6,11 @@ use crate::gpu::{GpuFailure, GpuInitializationError, GpuOperationError};
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
-    #[error("cannot start decode coordinator: {0}")]
+    #[error("failed to start decode coordinator: {0}")]
     DecodeCoordinator(#[source] io::Error),
 
     #[error("failed to create the application window: {0}")]
-    WindowCreation(#[source] winit::error::RequestError),
+    WindowCreation(#[source] winit::error::CreateWindowError),
 
     #[error(transparent)]
     Gpu(#[from] GpuFailure),
@@ -70,6 +70,9 @@ pub enum AppError {
     )]
     NoNativeWayland,
 
+    #[error("failed to determine the automatic memory budget: {0}")]
+    SystemMemory(#[from] xl_view::memory::MemoryQueryError),
+
     #[error("failed to create the application event loop: {0}")]
     EventLoop(#[from] winit::error::EventLoopError),
 
@@ -82,6 +85,7 @@ impl AppError {
         match self {
             #[cfg(target_os = "linux")]
             Self::NoNativeWayland => "no_native_wayland",
+            Self::SystemMemory(_) => "system_memory",
             Self::EventLoop(_) => "event_loop",
             Self::Runtime(error) => error.category(),
         }

@@ -209,7 +209,7 @@ fn current_demand_failure_clears_pending_state_and_reports_the_error() {
     assert!(
         session
             .status_message()
-            .is_some_and(|message| message.contains("Cannot open"))
+            .is_some_and(|message| message.contains("Failed to open"))
     );
 }
 
@@ -379,6 +379,230 @@ fn neighbor_lookup_failure_is_silent_and_clears_the_current_plan() {
             .prefetches
             .is_empty()
     );
+}
+
+type QueuedPrefetch = (PathBuf, ImageKey, u64, u8, u64);
+
+fn swap_neighbors() -> NeighborPaths {
+    NeighborPaths {
+        previous: Some(fixture_path("grayscale.jxl")),
+        next: Some(fixture_path("alpha.jxl")),
+    }
+}
+
+/// Shows an SDR gain map image whose plan has queued its first neighbor,
+/// then swaps in the HDR rendition. Returns that first prefetch.
+fn swap_after_first_prefetch(
+    session: &mut ImageSession,
+    queue_state: &Mutex<FakeDecodeState>,
+) -> QueuedPrefetch {
+    let (path, _, sdr) = gain_map_fixture(Rendition::Sdr);
+    let (_, _, hdr) = gain_map_fixture(Rendition::Hdr);
+    show(session, queue_state, &path, &sdr);
+    let request = session.begin_neighbor_lookup().unwrap();
+    session.handle_neighbor_paths(
+        request.generation,
+        &request.anchor_key,
+        Ok(swap_neighbors()),
+    );
+    let first = queue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .prefetches[0]
+        .clone();
+    assert!(sync_queues_swap(session, queue_state, Rendition::Hdr));
+    let DecodeEffect::Install(install) = complete_demand(session, queue_state, Ok(hdr)) else {
+        panic!("the swap should be ready to install");
+    };
+    session.commit_install(install, false);
+    first
+}
+
+fn complete_prefetch(
+    session: &mut ImageSession,
+    prefetch: &QueuedPrefetch,
+    result: xl_view::decode::DecodeResult,
+) {
+    session.handle_decode_completion(DecodeCompletion {
+        decode_time: Duration::from_millis(10),
+        key: prefetch.1.clone(),
+        path: prefetch.0.clone(),
+        purpose: DecodePurpose::Prefetch {
+            prefetch_generation: prefetch.2,
+            neighbor_index: prefetch.3,
+            maximum_retained_bytes: prefetch.4,
+        },
+        result,
+    });
+}
+
+#[test]
+fn a_replaced_plans_prefetch_before_the_new_lookup_is_discarded() {
+    let (_, _, neighbor) = decoded_fixture();
+    let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
+    let queue_state = Arc::clone(&queue.state);
+    let mut session = ImageSession::with_decode_queue(256 * 1024 * 1024, queue);
+    let first = swap_after_first_prefetch(&mut session, &queue_state);
+
+    complete_prefetch(&mut session, &first, Ok(neighbor));
+
+    // The result belongs to the replaced plan: it neither ends the new plan
+    // nor enters the cache.
+    let request = session
+        .begin_neighbor_lookup()
+        .expect("the swap's plan should still look up its neighbors");
+    assert!(!session.decoded_cache.contains(&first.1));
+    session.handle_neighbor_paths(
+        request.generation,
+        &request.anchor_key,
+        Ok(swap_neighbors()),
+    );
+    let state = queue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(state.cancellations.contains(&session.prefetch_generation));
+    assert_eq!(state.prefetches.len(), 2);
+    assert_eq!(state.prefetches[1].0, first.0);
+    assert_eq!(state.prefetches[1].2, session.prefetch_generation);
+}
+
+#[test]
+fn a_replaced_plans_running_prefetch_cannot_end_the_new_plan() {
+    let (_, _, neighbor) = decoded_fixture();
+    let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
+    let queue_state = Arc::clone(&queue.state);
+    let mut session = ImageSession::with_decode_queue(256 * 1024 * 1024, queue);
+    let first = swap_after_first_prefetch(&mut session, &queue_state);
+    // The first prefetch is still running when the new lookup returns.
+    queue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contained
+        .insert(first.1.clone());
+    let request = session.begin_neighbor_lookup().unwrap();
+    session.handle_neighbor_paths(
+        request.generation,
+        &request.anchor_key,
+        Ok(swap_neighbors()),
+    );
+    let second = queue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .prefetches[1]
+        .clone();
+    assert_ne!(second.0, first.0);
+
+    complete_prefetch(&mut session, &first, Ok(Arc::clone(&neighbor)));
+    complete_prefetch(&mut session, &second, Ok(neighbor));
+
+    assert!(
+        session.decoded_cache.contains(&second.1),
+        "the new plan's own prefetch should be cached"
+    );
+    // Only the replaced plan's result is lost.
+    assert!(!session.decoded_cache.contains(&first.1));
+}
+
+#[test]
+fn a_rendition_change_prefetches_evicted_neighbors_again() {
+    let (path, _, image) = decoded_fixture();
+    let (neighbor_path, neighbor_key, sdr_neighbor) = gain_map_fixture(Rendition::Sdr);
+    let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
+    let queue_state = Arc::clone(&queue.state);
+    let mut session = ImageSession::with_decode_queue(256 * 1024 * 1024, queue);
+    show(&mut session, &queue_state, &path, &image);
+    assert!(session.decoded_cache.admit_inactive(
+        neighbor_key.clone(),
+        CachedDecodedImage::new(sdr_neighbor, Duration::from_millis(5)),
+        &[],
+    ));
+    // Prefetching for the shown image has finished.
+    session.prefetch_plan = None;
+
+    // The shown image has no gain map, so nothing is swapped.
+    assert!(!sync_queues_swap(
+        &mut session,
+        &queue_state,
+        Rendition::Hdr
+    ));
+
+    assert!(!session.decoded_cache.contains(&neighbor_key));
+    let request = session
+        .begin_neighbor_lookup()
+        .expect("the rendition change should start a new plan");
+    session.handle_neighbor_paths(
+        request.generation,
+        &request.anchor_key,
+        Ok(NeighborPaths {
+            previous: None,
+            next: Some(neighbor_path),
+        }),
+    );
+    let state = queue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(state.prefetches.len(), 1);
+    assert_eq!(state.prefetches[0].1, neighbor_key);
+}
+
+#[test]
+fn a_pending_swap_holds_back_the_neighbor_lookup() {
+    let (path, _, sdr) = gain_map_fixture(Rendition::Sdr);
+    let (_, _, hdr) = gain_map_fixture(Rendition::Hdr);
+    let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
+    let queue_state = Arc::clone(&queue.state);
+    let mut session = ImageSession::with_decode_queue(256 * 1024 * 1024, queue);
+    show(&mut session, &queue_state, &path, &sdr);
+    // Prefetching for the shown image has finished.
+    session.prefetch_plan = None;
+
+    // The display change starts a plan and queues the swap. A lookup now
+    // would queue a prefetch that the decode thread starts as soon as the
+    // swap is decoded, and whose result the swap's own plan discards.
+    assert!(sync_queues_swap(&mut session, &queue_state, Rendition::Hdr));
+    assert!(session.prefetch_plan.is_some());
+    assert!(session.prefetch_deadline().is_none());
+    assert!(session.begin_neighbor_lookup().is_none());
+
+    let DecodeEffect::Install(install) = complete_demand(&mut session, &queue_state, Ok(hdr))
+    else {
+        panic!("the swap should be ready to install");
+    };
+    session.commit_install(install, false);
+    let request = session
+        .begin_neighbor_lookup()
+        .expect("the installed swap should look up its neighbors");
+    session.handle_neighbor_paths(
+        request.generation,
+        &request.anchor_key,
+        Ok(swap_neighbors()),
+    );
+    let state = queue_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(state.prefetches.len(), 1);
+    assert_eq!(state.prefetches[0].0, swap_neighbors().next.unwrap());
+    assert_eq!(state.prefetches[0].2, session.prefetch_generation);
+}
+
+#[test]
+fn a_failed_swap_lets_the_waiting_plan_look_up_its_neighbors() {
+    let (path, _, sdr) = gain_map_fixture(Rendition::Sdr);
+    let queue = FakeDecodeQueue::new(DecodeQueueDisposition::Queued);
+    let queue_state = Arc::clone(&queue.state);
+    let mut session = ImageSession::with_decode_queue(256 * 1024 * 1024, queue);
+    show(&mut session, &queue_state, &path, &sdr);
+    session.prefetch_plan = None;
+    assert!(sync_queues_swap(&mut session, &queue_state, Rendition::Hdr));
+    assert!(session.begin_neighbor_lookup().is_none());
+
+    assert!(matches!(
+        complete_demand(&mut session, &queue_state, Err(DecodeError::Canceled)),
+        DecodeEffect::None
+    ));
+
+    assert!(session.prefetch_deadline().is_some());
+    assert!(session.begin_neighbor_lookup().is_some());
 }
 
 #[test]
@@ -627,7 +851,7 @@ fn navigation_results_ignore_stale_work_and_report_end_or_failure() {
     ));
     assert_eq!(
         session.status_message(),
-        Some("Cannot inspect the image folder: cannot read /photos: permission denied")
+        Some("Failed to inspect the image folder: failed to read /photos: permission denied")
     );
 }
 
@@ -647,7 +871,7 @@ fn navigation_start_failure_only_updates_the_matching_request() {
     session.navigation_start_failed(&current, &"thread unavailable");
     assert_eq!(
         session.status_message(),
-        Some("Cannot inspect the image folder: thread unavailable")
+        Some("Failed to inspect the image folder: thread unavailable")
     );
 }
 
@@ -796,6 +1020,17 @@ fn demand_count(queue_state: &Mutex<FakeDecodeState>) -> usize {
         .len()
 }
 
+/// Calls `sync_rendition` and reports whether it queued a swap decode.
+fn sync_queues_swap(
+    session: &mut ImageSession,
+    queue_state: &Mutex<FakeDecodeState>,
+    rendition: Rendition,
+) -> bool {
+    let before = demand_count(queue_state);
+    session.sync_rendition(rendition);
+    demand_count(queue_state) > before
+}
+
 #[test]
 fn an_hdr_display_swaps_in_the_hdr_image_and_keeps_the_view_and_neighbors() {
     let (path, key, sdr) = gain_map_fixture(Rendition::Sdr);
@@ -812,10 +1047,14 @@ fn an_hdr_display_swaps_in_the_hdr_image_and_keeps_the_view_and_neighbors() {
     ));
 
     // A session starts with the SDR base image, which suits an SDR display.
-    assert!(!session.sync_rendition(Rendition::Sdr));
+    assert!(!sync_queues_swap(
+        &mut session,
+        &queue_state,
+        Rendition::Sdr
+    ));
     assert_eq!(demand_count(&queue_state), 1);
 
-    assert!(session.sync_rendition(Rendition::Hdr));
+    assert!(sync_queues_swap(&mut session, &queue_state, Rendition::Hdr));
     {
         let state = queue_state
             .lock()
@@ -828,7 +1067,11 @@ fn an_hdr_display_swaps_in_the_hdr_image_and_keeps_the_view_and_neighbors() {
     assert!(session.status_message().is_none());
     assert!(session.has_loaded_image());
     // Repeated checks, as on every redraw, do not queue the swap again.
-    assert!(!session.sync_rendition(Rendition::Hdr));
+    assert!(!sync_queues_swap(
+        &mut session,
+        &queue_state,
+        Rendition::Hdr
+    ));
     assert_eq!(demand_count(&queue_state), 2);
 
     let DecodeEffect::Install(install) = complete_demand(&mut session, &queue_state, Ok(hdr))
@@ -844,10 +1087,14 @@ fn an_hdr_display_swaps_in_the_hdr_image_and_keeps_the_view_and_neighbors() {
     ));
     // Opening a file clears the cache. A swap must not.
     assert!(session.decoded_cache.contains(&neighbor_key));
-    assert!(!session.sync_rendition(Rendition::Hdr));
+    assert!(!sync_queues_swap(
+        &mut session,
+        &queue_state,
+        Rendition::Hdr
+    ));
 
     // Back on an SDR display, the HDR image is swapped for the base image.
-    assert!(session.sync_rendition(Rendition::Sdr));
+    assert!(sync_queues_swap(&mut session, &queue_state, Rendition::Sdr));
     assert_eq!(demand_count(&queue_state), 3);
 }
 
@@ -859,8 +1106,16 @@ fn images_without_a_gain_map_are_never_decoded_again() {
     let mut session = ImageSession::with_decode_queue(64 * 1024 * 1024, queue);
     show(&mut session, &queue_state, &path, &image);
 
-    assert!(!session.sync_rendition(Rendition::Hdr));
-    assert!(!session.sync_rendition(Rendition::Sdr));
+    assert!(!sync_queues_swap(
+        &mut session,
+        &queue_state,
+        Rendition::Hdr
+    ));
+    assert!(!sync_queues_swap(
+        &mut session,
+        &queue_state,
+        Rendition::Sdr
+    ));
 
     assert_eq!(demand_count(&queue_state), 1);
 }
@@ -872,7 +1127,7 @@ fn a_failed_swap_keeps_the_image_and_waits_for_the_next_display_change() {
     let queue_state = Arc::clone(&queue.state);
     let mut session = ImageSession::with_decode_queue(256 * 1024 * 1024, queue);
     show(&mut session, &queue_state, &path, &sdr);
-    assert!(session.sync_rendition(Rendition::Hdr));
+    assert!(sync_queues_swap(&mut session, &queue_state, Rendition::Hdr));
 
     assert!(matches!(
         complete_demand(&mut session, &queue_state, Err(DecodeError::Canceled)),
@@ -883,11 +1138,19 @@ fn a_failed_swap_keeps_the_image_and_waits_for_the_next_display_change() {
     assert!(session.status_message().is_none());
     assert!(session.pending_open.is_none());
     // No retry on the following redraws.
-    assert!(!session.sync_rendition(Rendition::Hdr));
+    assert!(!sync_queues_swap(
+        &mut session,
+        &queue_state,
+        Rendition::Hdr
+    ));
     assert_eq!(demand_count(&queue_state), 2);
     // The display changing again allows another attempt.
-    assert!(!session.sync_rendition(Rendition::Sdr));
-    assert!(session.sync_rendition(Rendition::Hdr));
+    assert!(!sync_queues_swap(
+        &mut session,
+        &queue_state,
+        Rendition::Sdr
+    ));
+    assert!(sync_queues_swap(&mut session, &queue_state, Rendition::Hdr));
     assert_eq!(demand_count(&queue_state), 3);
 }
 
@@ -903,7 +1166,11 @@ fn a_pending_open_takes_precedence_over_a_swap() {
         SelectionEffect::Pending
     ));
 
-    assert!(!session.sync_rendition(Rendition::Hdr));
+    assert!(!sync_queues_swap(
+        &mut session,
+        &queue_state,
+        Rendition::Hdr
+    ));
 
     assert_eq!(demand_count(&queue_state), 2);
     assert!(

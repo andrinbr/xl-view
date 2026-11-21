@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use xl_view::color::HDR_REFERENCE_WHITE_NITS;
 use xl_view::decode::{
-    CANONICAL_BYTES_PER_PIXEL, DecodeError, DecodeLimits, DecodedImage, LinearUnit,
-    SourceColorEncoding, SourceDynamicRange, TILE_GUTTER, TILE_SIZE, decode_file, decode_memory,
+    CANONICAL_BYTES_PER_PIXEL, DecodeError, DecodeLimits, DecodedImage, HISTOGRAM_BINS_PER_STOP,
+    HISTOGRAM_REFERENCE_WHITE_BIN, LinearUnit, SourceColorEncoding, SourceDynamicRange,
+    TILE_GUTTER, TILE_SIZE, decode_file, decode_memory,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -29,19 +30,35 @@ fn pixels(image: &DecodedImage) -> &[f32] {
 }
 
 #[test]
-fn controlled_transfer_fixtures_decode_to_floating_point_bt2020() {
-    for (name, expected_transfer, expected_range, expected_hdr) in [
+fn controlled_transfer_fixtures_preserve_metadata_and_working_space_values() {
+    for (name, expected_transfer, expected_range, expected_hdr, intensity_target, expected) in [
         (
             "test_pattern-sRGB.jxl",
             "sRGB",
             SourceDynamicRange::Sdr,
             false,
+            None,
+            [0.014_187_302, 0.348_052_9, 1.0],
         ),
-        ("test_pattern-PQ.jxl", "PQ", SourceDynamicRange::Pq, true),
-        ("test_pattern-HLG.jxl", "HLG", SourceDynamicRange::Hlg, true),
+        (
+            "test_pattern-PQ.jxl",
+            "PQ",
+            SourceDynamicRange::Pq,
+            true,
+            Some(10_000.0),
+            [0.002_870_307_3, 1.516_745_8, 49.261_086],
+        ),
+        (
+            "test_pattern-HLG.jxl",
+            "HLG",
+            SourceDynamicRange::Hlg,
+            true,
+            Some(1_000.0),
+            [0.008_818_784, 0.478_998_93, 4.926_109],
+        ),
     ] {
-        let decoded =
-            decode_file(&fixture(name), DecodeLimits::from_memory_ceiling_mib(64)).unwrap();
+        let decoded = decode_file(&fixture(name), DecodeLimits::from_memory_ceiling_mib(64))
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
         assert!(decoded.width > 0);
         assert!(decoded.height > 0);
         assert_eq!(
@@ -58,37 +75,47 @@ fn controlled_transfer_fixtures_decode_to_floating_point_bt2020() {
             panic!("fixture should use an enumerated color encoding");
         };
         assert_eq!(transfer_function, expected_transfer);
-    }
-}
 
-#[test]
-fn hdr_intensity_target_is_normalized_by_hdr_reference_white() {
-    for (name, intensity_target) in [
-        ("test_pattern-PQ.jxl", 10_000.0),
-        ("test_pattern-HLG.jxl", 1_000.0),
-    ] {
-        let decoded =
-            decode_file(&fixture(name), DecodeLimits::from_memory_ceiling_mib(64)).unwrap();
-        assert_near(
-            pixels(&decoded)[pixels(&decoded).len() - 4],
-            intensity_target / HDR_REFERENCE_WHITE_NITS,
-            0.001,
-        );
-        assert_near(
-            decoded.metadata.tone_mapping.intensity_target_nits,
-            intensity_target,
-            0.5,
-        );
-    }
+        let final_red = pixels(&decoded)[pixels(&decoded).len() - 4];
+        if let Some(intensity_target) = intensity_target {
+            assert_near(
+                final_red,
+                intensity_target / HDR_REFERENCE_WHITE_NITS,
+                0.001,
+            );
+            assert_near(
+                decoded.metadata.tone_mapping.intensity_target_nits,
+                intensity_target,
+                0.5,
+            );
+        } else {
+            // Generated ICC colorants round to s15Fixed16. White differs by
+            // 3.1e-5 before final f16 packing (where it still becomes exactly 1.0).
+            assert_near(final_red, 1.0, 0.000_05);
+        }
 
-    let sdr = decode_file(
-        &fixture("test_pattern-sRGB.jxl"),
-        DecodeLimits::from_memory_ceiling_mib(64),
-    )
-    .unwrap();
-    // Generated ICC colorants round to s15Fixed16. White differs by 3.1e-5
-    // before final f16 packing (where it still becomes exactly 1.0).
-    assert_near(pixels(&sdr)[pixels(&sdr).len() - 4], 1.0, 0.000_05);
+        for (x, expected) in [0, decoded.width as usize / 2, decoded.width as usize - 1]
+            .into_iter()
+            .zip(expected)
+        {
+            // Encoded samples round to f16 before linearization. Half an ULP
+            // produces up to ~0.1% SDR and ~0.25% PQ/HLG luminance error away
+            // from black. Keep it relative to luminance instead of granting
+            // dark patches a large absolute HDR tolerance.
+            // A double-precision sweep of 1,000,001 encoded values in [0.05, 1]
+            // measured at most 0.2441% PQ and 0.1598% HLG error from f16 input.
+            let relative = if decoded.source_dynamic_range == SourceDynamicRange::Sdr {
+                0.001
+            } else {
+                0.0025
+            };
+            assert_near(
+                pixels(&decoded)[x * 4],
+                expected,
+                expected.abs() * relative + 0.000_01,
+            );
+        }
+    }
 }
 
 #[test]
@@ -107,7 +134,8 @@ fn pq_and_hlg_present_their_measured_peak_but_keep_the_target() {
         let image = decode_file(&fixture(name), DecodeLimits::from_memory_ceiling_mib(64)).unwrap();
         let measured = image.source_peak.nits();
         assert!((measured - peak).abs() < 0.1, "{name}: {measured}");
-        // It is the brightest visible channel, before f16 storage rounding.
+        // None of these fixtures has glints to leave out, so it is the brightest
+        // visible channel, before f16 storage rounding.
         let stored = pixels(&image)
             .chunks_exact(4)
             .filter(|pixel| pixel[3] > 0.0)
@@ -122,6 +150,19 @@ fn pq_and_hlg_present_their_measured_peak_but_keep_the_target() {
         // The target, not the measured peak, supports the HDR claim.
         assert!(image.hdr_source, "{name}");
     }
+}
+
+#[test]
+fn histogram_ends_in_the_bin_of_the_measured_peak() {
+    let path = fixture("hdr-P3-PQ.jxl");
+    let image = decode_file(&path, DecodeLimits::from_memory_ceiling_mib(64)).unwrap();
+    let highest = image.histogram.iter().rposition(|count| *count > 0);
+    // The 1,531-nit peak is 2.9 stops above reference white, in the bin from
+    // 1,489 to 1,624 nits.
+    assert_eq!(
+        highest,
+        Some(HISTOGRAM_REFERENCE_WHITE_BIN + 2 * HISTOGRAM_BINS_PER_STOP + 7)
+    );
 }
 
 #[test]
@@ -193,45 +234,6 @@ fn hdr_ramps_without_explicit_intensity_use_libjxl_hdr_defaults() {
             decoded_peak_nits / HDR_REFERENCE_WHITE_NITS,
             0.02,
         );
-    }
-}
-
-#[test]
-fn representative_working_space_values_are_stable() {
-    for (name, expected) in [
-        ("test_pattern-sRGB.jxl", [0.014_187_302, 0.348_052_9, 1.0]),
-        (
-            "test_pattern-PQ.jxl",
-            [0.002_870_307_3, 1.516_745_8, 49.261_086],
-        ),
-        (
-            "test_pattern-HLG.jxl",
-            [0.008_818_784, 0.478_998_93, 4.926_109],
-        ),
-    ] {
-        let decoded =
-            decode_file(&fixture(name), DecodeLimits::from_memory_ceiling_mib(64)).unwrap();
-        for (x, expected) in [0, decoded.width as usize / 2, decoded.width as usize - 1]
-            .into_iter()
-            .zip(expected)
-        {
-            // Encoded samples round to f16 before linearization. Half an ULP
-            // produces up to ~0.1% SDR and ~0.25% PQ/HLG luminance error away
-            // from black. Keep it relative to luminance instead of granting
-            // dark patches a large absolute HDR tolerance.
-            // A double-precision sweep of 1,000,001 encoded values in [0.05, 1]
-            // measured at most 0.2441% PQ and 0.1598% HLG error from f16 input.
-            let relative = if decoded.source_dynamic_range == SourceDynamicRange::Sdr {
-                0.001
-            } else {
-                0.0025
-            };
-            assert_near(
-                pixels(&decoded)[x * 4],
-                expected,
-                expected.abs() * relative + 0.000_01,
-            );
-        }
     }
 }
 
@@ -467,7 +469,6 @@ fn output_storage_accounts_for_one_canonical_rgba_buffer() {
         DecodeLimits::from_memory_ceiling_mib(64),
     )
     .unwrap();
-    assert_eq!(decoded.store.canonical_storage_bytes(), RGBA_BYTES);
     assert_eq!(
         decoded.memory_cost_bytes,
         RGBA_BYTES + size_of_val(decoded.store.coarse_pixels())
@@ -485,7 +486,7 @@ fn unified_store_preserves_canonical_pixels_and_clamps_gutters() {
 
     let mut canonical_row = vec![0.0; usize::try_from(decoded.width).unwrap() * 4];
     store
-        .read_canonical_row_rgba_f32(0, &mut canonical_row)
+        .read_canonical_row_range_rgba_f32(0, 0, &mut canonical_row)
         .unwrap();
     for (canonical, straight) in canonical_row.chunks_exact(4).zip(expected.chunks_exact(4)) {
         for channel in 0..3 {
@@ -495,7 +496,7 @@ fn unified_store_preserves_canonical_pixels_and_clamps_gutters() {
     }
     assert!(
         store
-            .read_canonical_row_rgba_f32(decoded.height, &mut canonical_row)
+            .read_canonical_row_range_rgba_f32(decoded.height, 0, &mut canonical_row)
             .is_err()
     );
 

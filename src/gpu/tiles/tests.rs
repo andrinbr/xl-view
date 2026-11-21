@@ -8,6 +8,14 @@ use crate::gpu::test_utils::request_native_test_gpu;
 use crate::test_utils::fixture_path;
 
 #[test]
+fn every_tile_mip_level_is_an_exact_halving_with_a_whole_gutter_texel() {
+    let last_level = TILE_MIP_LEVEL_COUNT - 1;
+    assert_eq!(tile_texture_extent() % (1 << last_level), 0);
+    // One more level would leave half a gutter texel to filter across.
+    assert_eq!(TILE_GUTTER >> last_level, 1);
+}
+
+#[test]
 fn tile_working_set_covers_a_one_to_one_viewport_with_a_border() {
     assert_eq!(interactive_working_set_tiles((3840, 1600)), 77);
     assert_eq!(interactive_working_set_tiles((1024, 682)), 25);

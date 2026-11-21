@@ -7,7 +7,7 @@ use std::thread::JoinHandle;
 use wgpu::TextureFormat;
 use wgpu::util::DeviceExt;
 
-use super::mip::{LinearMipGenerator, mip_level_count, rgba16f_texture_budget_bytes};
+use super::mip::{LinearMipGenerator, rgba16f_texture_budget_bytes};
 use super::upload::TextureUploadLayout;
 use super::view::{ImageBounds, ViewTransform};
 use super::{WorkerContext, lock_unpoisoned};
@@ -290,8 +290,12 @@ impl TileCache {
         let tile_columns = source.tile_columns();
         let tile_rows = source.tile_rows();
         let coarse_downsample = source.coarse_downsample();
-        let mip_level_count = mip_level_count(tile_texture_extent(), tile_texture_extent());
-        let worker = TileWorker::spawn(source, context.clone(), texture.clone(), mip_level_count)?;
+        let worker = TileWorker::spawn(
+            source,
+            context.clone(),
+            texture.clone(),
+            TILE_MIP_LEVEL_COUNT,
+        )?;
         let mapping = vec![MISSING_TILE_SLOT; usize_from_u32(logical_tiles)];
         let mapping_buffer = create_tile_mapping_buffer(device, &mapping);
         Ok(Self {
@@ -350,7 +354,7 @@ impl TileCache {
             rgba16f_texture_budget_bytes(
                 tile_texture_extent(),
                 tile_texture_extent(),
-                mip_level_count(tile_texture_extent(), tile_texture_extent()),
+                TILE_MIP_LEVEL_COUNT,
                 self.capacity(),
             )
         } else {
@@ -562,7 +566,7 @@ pub(super) fn maximum_capacity(
         let required = rgba16f_texture_budget_bytes(
             tile_texture_extent(),
             tile_texture_extent(),
-            mip_level_count(tile_texture_extent(), tile_texture_extent()),
+            TILE_MIP_LEVEL_COUNT,
             candidate,
         );
         if required <= maximum_tile_bytes {
@@ -714,6 +718,11 @@ pub(super) fn tile_texture_extent() -> u32 {
     TILE_SIZE + TILE_GUTTER * 2
 }
 
+/// [`TileCache::should_sample`] keeps tile minification below `TILE_GUTTER`,
+/// so the sampled level of detail stays below `log2(TILE_GUTTER)`. Deeper
+/// levels would never be read, and their gutter would be under one texel.
+pub(super) const TILE_MIP_LEVEL_COUNT: u32 = TILE_GUTTER.ilog2() + 1;
+
 fn create_tile_array_texture(device: &wgpu::Device, layers: u32) -> wgpu::Texture {
     let extent = tile_texture_extent();
     device.create_texture(&wgpu::TextureDescriptor {
@@ -723,7 +732,7 @@ fn create_tile_array_texture(device: &wgpu::Device, layers: u32) -> wgpu::Textur
             height: extent,
             depth_or_array_layers: layers,
         },
-        mip_level_count: mip_level_count(extent, extent),
+        mip_level_count: TILE_MIP_LEVEL_COUNT,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: TextureFormat::Rgba16Float,
@@ -847,7 +856,7 @@ impl TileCache {
             device,
             &mut mip_encoder,
             &cache.texture,
-            mip_level_count(tile_texture_extent(), tile_texture_extent()),
+            TILE_MIP_LEVEL_COUNT,
             &mapping,
         );
         queue.submit([mip_encoder.finish()]);

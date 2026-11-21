@@ -14,7 +14,7 @@ staging_root=$(mktemp -d)
 audit_mount=
 cleanup() {
     if [[ -n "$audit_mount" ]]; then
-        hdiutil detach "$audit_mount" >/dev/null 2>&1 || true
+        diskutil eject "$audit_mount" >/dev/null 2>&1 || true
     fi
     rm -rf "$staging_root"
 }
@@ -75,7 +75,8 @@ hdiutil verify "$dmg" >/dev/null
 
 # Mount the finished DMG so the shipped app can be audited directly.
 audit_mount="$staging_root/mounted-dmg"
-hdiutil attach -readonly -nobrowse -mountpoint "$audit_mount" "$dmg" >/dev/null
+mkdir "$audit_mount"
+diskutil image attach -readOnly -nobrowse -mountPoint "$audit_mount" "$dmg" >/dev/null
 
 # Locate the packaged files used by the audit.
 app_bundle="$audit_mount/XL-View.app"
@@ -106,7 +107,7 @@ assert_equal "$(lipo -archs "$packaged_binary")" "arm64" "packaged binary archit
 assert_equal "$("$packaged_binary" --version)" "xl-view $version" "packaged binary version"
 
 # Detach the audited image before copying its backing file.
-hdiutil detach "$audit_mount" >/dev/null
+diskutil eject "$audit_mount" >/dev/null
 audit_mount=
 
 # Publish only the verified and audited DMG.

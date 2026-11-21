@@ -661,7 +661,7 @@ fn extreme_parameters_and_pixels_stay_finite() {
     let map = gain_map(samples(1, 1, 1, &[65_535]), [huge; 3], p3, (1, 1));
     let mut rgb = [32.0_f32; 3];
     map.apply(&mut rgb, 0);
-    assert_eq!(rgb, [MAX_OUTPUT; 3]);
+    assert_eq!(rgb, [MAX_FINITE_F16; 3]);
 
     // The largest f32 multiplier on a zero sample is zero, not NaN.
     let wide = channel(-10.0, 127.999_99, 1.0, (0.0, 0.0));
@@ -684,7 +684,7 @@ fn extreme_parameters_and_pixels_stay_finite() {
     let map = gain_map(samples(1, 1, 1, &[0]), [unit; 3], None, (1, 1));
     let mut rgb = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
     map.apply(&mut rgb, 0);
-    assert_eq!(rgb[..2], [MAX_OUTPUT, -MAX_OUTPUT]);
+    assert_eq!(rgb[..2], [MAX_FINITE_F16, -MAX_FINITE_F16]);
     assert!(rgb[2].is_nan());
 }
 
@@ -697,11 +697,20 @@ fn decompression_is_bounded_and_reports_corruption() {
     stream.extend_from_slice(data);
     stream.push(3);
 
-    assert_eq!(decompress(&stream, data.len()).unwrap(), data);
-    assert_eq!(decompress(&stream, data.len() - 1), Err(Reason::TooLarge));
-    assert_eq!(decompress(b"not brotli", LIMIT), Err(Reason::Malformed));
     assert_eq!(
-        decompress(&stream[..stream.len() - 4], LIMIT),
+        decompress_brotli(stream.as_slice(), data.len()).unwrap(),
+        data
+    );
+    assert_eq!(
+        decompress_brotli(stream.as_slice(), data.len() - 1),
+        Err(Reason::TooLarge)
+    );
+    assert_eq!(
+        decompress_brotli(&b"not brotli"[..], LIMIT),
+        Err(Reason::Malformed)
+    );
+    assert_eq!(
+        decompress_brotli(&stream[..stream.len() - 4], LIMIT),
         Err(Reason::Malformed)
     );
 }

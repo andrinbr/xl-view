@@ -23,7 +23,8 @@ impl OpenFiles {
     /// Installs a callback for paths opened through Finder.
     ///
     /// This must be called on the main thread, after creating winit's event loop.
-    /// Returns `None` if either requirement is not met.
+    /// Returns `None` off the main thread or when an application delegate is
+    /// already installed. A call before the event loop exists is not detected.
     pub fn install<F>(handler: F) -> Option<Self>
     where
         F: Fn(Vec<PathBuf>) + 'static,

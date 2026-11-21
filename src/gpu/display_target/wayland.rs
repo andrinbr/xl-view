@@ -14,6 +14,12 @@ use wayland_protocols::wp::color_management::v1::client::{
 use super::{HdrTarget, HdrUnavailableReason, wayland_target};
 use crate::gpu::{DisplayChangeNotifier, lock_unpoisoned};
 
+/// The `wp_color_manager_v1` version that wayland-protocols implements.
+const COLOR_MANAGER_VERSION: u32 = 3;
+/// Version 4 is the first `wl_output` with the `name` event, which matches
+/// an output to the window's monitor.
+const WL_OUTPUT_VERSION: u32 = 4;
+
 // Retain the raw protocol input so diagnostics and target selection share one
 // source of truth without re-querying the compositor.
 #[derive(Clone, Debug, PartialEq)]
@@ -69,8 +75,10 @@ impl Snapshot {
         {
             return target_from_luminances(output.luminances);
         }
-        if self.outputs.len() == 1 {
-            return target_from_luminances(self.outputs.values().next().unwrap().luminances);
+        if self.outputs.len() == 1
+            && let Some(output) = self.outputs.values().next()
+        {
+            return target_from_luminances(output.luminances);
         }
         Err(HdrUnavailableReason::OutputUnmatched)
     }
@@ -95,7 +103,7 @@ impl DisplayTargetProvider {
                 // Winit consumes an inherited WAYLAND_SOCKET while creating its
                 // event loop, so HDR discovery requires a separately connectable
                 // WAYLAND_DISPLAY endpoint.
-                tracing::warn!(%error, "cannot connect to Wayland for color-management queries");
+                tracing::warn!(%error, "failed to connect to Wayland for color-management queries");
                 return provider;
             }
         };
@@ -115,7 +123,7 @@ impl DisplayTargetProvider {
         // changed notification.
         for _ in 0..4 {
             if let Err(error) = event_queue.roundtrip(&mut state) {
-                tracing::warn!(%error, "cannot query Wayland color-management output information");
+                tracing::warn!(%error, "failed to query Wayland color-management output information");
                 return provider;
             }
         }
@@ -127,7 +135,7 @@ impl DisplayTargetProvider {
                 },
             )
         {
-            tracing::warn!(%error, "cannot monitor Wayland color-management output changes");
+            tracing::warn!(%error, "failed to monitor Wayland color-management output changes");
         }
         provider
     }
@@ -282,7 +290,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 interface,
                 version,
             } if interface == wp_color_manager_v1::WpColorManagerV1::interface().name => {
-                state.manager = Some(registry.bind(name, version.min(3), queue, ()));
+                state.manager =
+                    Some(registry.bind(name, version.min(COLOR_MANAGER_VERSION), queue, ()));
                 let outputs = state.outputs.keys().copied().collect::<Vec<_>>();
                 for output in outputs {
                     state.add_color_output(output, queue);
@@ -294,7 +303,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 interface,
                 version,
             } if interface == wl_output::WlOutput::interface().name => {
-                let output = registry.bind(name, version.min(4), queue, OutputKey(name));
+                let output =
+                    registry.bind(name, version.min(WL_OUTPUT_VERSION), queue, OutputKey(name));
                 state.outputs.insert(
                     name,
                     OutputState {
@@ -310,7 +320,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 state.publish();
             }
             wl_registry::Event::GlobalRemove { name } => {
-                state.outputs.remove(&name);
+                // Dropping a proxy sends no destructor request, so the
+                // compositor would keep both objects until the connection closes.
+                if let Some(removed) = state.outputs.remove(&name) {
+                    if let Some(color_output) = removed.color_output {
+                        color_output.destroy();
+                    }
+                    if removed.output.version() >= wl_output::REQ_RELEASE_SINCE {
+                        removed.output.release();
+                    }
+                }
                 state.publish();
             }
             _ => {}

@@ -20,9 +20,10 @@ mod view;
 use std::sync::{Arc, Mutex, MutexGuard};
 pub(crate) use surface::{
     DisplayRefresh, GpuInitializationError, GpuOperationError, SurfaceCapabilities,
+    gain_map_rendition,
 };
 pub use surface::{GpuFailure, GpuState};
-pub(super) use ui::OverlaySection;
+pub(super) use ui::{OverlayRow, OverlaySection};
 use winit::window::Window;
 
 use crate::cli::{BackgroundMode, OutputMode};

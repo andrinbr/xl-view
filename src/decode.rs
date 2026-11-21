@@ -34,7 +34,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use half::prelude::{HalfBitsSliceExt, HalfFloatSliceExt};
-use sysinfo::System;
 
 mod coordinator;
 mod gain_map;
@@ -51,22 +50,25 @@ pub const TILE_SIZE: u32 = 512;
 // Eight source pixels preserve one filtering texel through three tile mip
 // levels. More deeply minified views continue sampling the coarse preview.
 pub const TILE_GUTTER: u32 = 8;
-pub const CANONICAL_BYTES_PER_PIXEL: usize = 8;
+/// Size of one canonical premultiplied RGBA16F pixel.
+pub const CANONICAL_BYTES_PER_PIXEL: usize = size_of::<CanonicalPixel>();
+/// Largest finite f16, the range of the canonical pixel format.
+pub const MAX_FINITE_F16: f32 = half::f16::MAX.to_f32_const();
 pub const HALF_CONVERSION_CHUNK_SAMPLES: usize = 1024;
+pub const HISTOGRAM_BINS: usize = 125;
+pub const HISTOGRAM_BINS_PER_STOP: usize = 8;
+/// The first bin above HDR reference white, ten stops above the start of the
+/// axis.
+pub const HISTOGRAM_REFERENCE_WHITE_BIN: usize = 10 * HISTOGRAM_BINS_PER_STOP;
+/// Counts an image's visible pixels by their largest color channel, the value
+/// that the source peak is measured from. The bins lie on a log2 axis from 0.2
+/// nits to the bin of PQ's 10,000 nits. A bin includes its upper edge, so SDR
+/// white counts below reference white. The first and the last bin also count
+/// the pixels beyond the axis.
+pub type Histogram = [u64; HISTOGRAM_BINS];
 // u16 gives the decoder's f16 output its required alignment without unsafe code.
 type CanonicalPixel = [u16; 4];
 type CoarsePixel = [f32; 4];
-
-fn automatic_memory_ceiling_bytes() -> usize {
-    let mut system = System::new();
-    system.refresh_memory();
-    automatic_memory_ceiling_bytes_from_total(system.total_memory())
-}
-
-fn automatic_memory_ceiling_bytes_from_total(total_memory: u64) -> usize {
-    let bytes = total_memory / 4 * 3;
-    usize::try_from(bytes).unwrap_or(usize::MAX)
-}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ImageKey {
@@ -121,12 +123,21 @@ pub struct DecodeLimits {
 }
 
 impl DecodeLimits {
+    /// Computes a ceiling using three quarters of the supplied total RAM.
+    #[must_use]
+    pub fn from_total_memory_bytes(total_memory_bytes: u64) -> Self {
+        let bytes = total_memory_bytes / 4 * 3;
+        Self {
+            memory_ceiling_bytes: usize::try_from(bytes).unwrap_or(usize::MAX),
+        }
+    }
+
     /// Constructs decode limits with a custom per-category memory ceiling.
     ///
     /// The ceiling bounds decoded storage and raw trailing metadata, and
     /// determines the decoder sample limit. It is not an exact decoder allocation
-    /// budget. The viewer uses [`Default`]. This constructor remains useful for
-    /// tests that need a small deterministic ceiling.
+    /// budget. The viewer uses [`Self::from_total_memory_bytes`]. This constructor
+    /// remains useful for tests that need a small deterministic ceiling.
     #[must_use]
     pub fn from_memory_ceiling_mib(memory_ceiling_mib: u64) -> Self {
         let bytes_u64 = mib_to_bytes(memory_ceiling_mib);
@@ -137,18 +148,9 @@ impl DecodeLimits {
     }
 }
 
-impl Default for DecodeLimits {
-    fn default() -> Self {
-        Self {
-            memory_ceiling_bytes: automatic_memory_ceiling_bytes(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToneMappingMetadata {
     pub intensity_target_nits: f32,
-    pub min_nits: f32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -202,41 +204,8 @@ impl DecodedTileStore {
     }
 
     #[must_use]
-    pub fn canonical_storage_bytes(&self) -> usize {
-        self.pixels
-            .len()
-            .saturating_mul(size_of::<CanonicalPixel>())
-    }
-
-    #[must_use]
     pub fn dimensions(&self) -> (u32, u32) {
         (self.width, self.height)
-    }
-
-    /// Decodes one canonical premultiplied RGBA16F row into `f32` working values.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the row is outside the image or the destination
-    /// does not contain exactly four samples per source pixel.
-    pub fn read_canonical_row_rgba_f32(
-        &self,
-        row: u32,
-        destination: &mut [f32],
-    ) -> Result<(), io::Error> {
-        let expected_samples = usize_from_u32(self.width)
-            .checked_mul(4)
-            .ok_or_else(|| io::Error::other("canonical row sample count overflowed"))?;
-        if destination.len() != expected_samples {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "canonical row expected {expected_samples} destination samples, got {}",
-                    destination.len()
-                ),
-            ));
-        }
-        self.read_canonical_row_range_rgba_f32(row, 0, destination)
     }
 
     /// Decodes part of one canonical premultiplied RGBA16F row into `f32`
@@ -490,7 +459,13 @@ pub struct DecodedImage {
     pub source_dynamic_range: SourceDynamicRange,
     /// Peak used for presentation: measured from visible pixels for PQ, HLG,
     /// linear and gain map reconstructed sources, and HDR reference white for SDR.
+    /// The measurement leaves out the brightest histogram bins while they hold
+    /// no more than 0.01% of the visible pixels, so it is the exact maximum
+    /// when no bin is left out. Pixels left out and brighter than the display
+    /// clip. The peak is never below HDR reference white or above 10,000 nits.
     pub source_peak: crate::color::SourceIntensityTarget,
+    /// Measured for every source, also for SDR ones.
+    pub histogram: Histogram,
     /// Header intensity target after the invalid-value fallback. PQ and HLG
     /// decode relative to it, but it only bounds their content.
     pub intensity_target: crate::color::SourceIntensityTarget,
@@ -499,7 +474,9 @@ pub struct DecodedImage {
     /// Whether the source supports an HDR claim. PQ and HLG need a target above
     /// HDR reference white. Linear sources need a measured peak above it, and
     /// not XYB with the default target, where codec overshoot alone can produce
-    /// such a peak.
+    /// such a peak. An SDR base needs an applied gain map whose reconstructed
+    /// peak is above it. Both peaks are the source peak, so the brightest 0.01%
+    /// of the pixels alone do not make an HDR claim.
     pub hdr_source: bool,
     /// `None` when the file has no gain map.
     pub gain_map: Option<GainMapStatus>,
@@ -509,13 +486,13 @@ pub struct DecodedImage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
-    #[error("cannot inspect JPEG XL source {path}: {source}")]
+    #[error("failed to inspect JPEG XL source {path}: {source}")]
     SourceMetadata {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("cannot read JPEG XL source {path}: {source}")]
+    #[error("failed to read JPEG XL source {path}: {source}")]
     Read {
         path: PathBuf,
         #[source]
@@ -527,25 +504,23 @@ pub enum DecodeError {
     Decoder(#[from] Box<dyn std::error::Error + Send + Sync + 'static>),
     #[error("JPEG XL decoder sample or allocation limit exceeded ({limit} byte budget)")]
     DecoderMemoryLimit { limit: usize },
-    #[error("JPEG XL metadata needs {required} bytes. The limit is {limit} bytes")]
-    MetadataMemoryLimit { required: usize, limit: usize },
     #[error("invalid image dimensions {width}x{height}")]
     InvalidDimensions { width: u32, height: u32 },
     #[error(
-        "decoded image and render scratch need {required} bytes. The memory limit is {limit} bytes"
+        "decoded image and conversion scratch need {required} bytes. The memory limit is {limit} bytes"
     )]
     OutputMemoryLimit { required: u64, limit: u64 },
     #[error(
         "decoded prefetch needs {required} bytes but only {available} cache bytes are available"
     )]
     PrefetchTooLarge { required: u64, available: u64 },
-    #[error("cannot reserve {required} bytes for the decoded RGBA16F image: {source}")]
+    #[error("failed to reserve {required} bytes for the decoded RGBA16F image: {source}")]
     OutputAllocation {
         required: usize,
         #[source]
         source: std::collections::TryReserveError,
     },
-    #[error("cannot reserve {required} bytes for decode scratch: {source}")]
+    #[error("failed to reserve {required} bytes for decode scratch: {source}")]
     ScratchAllocation {
         required: usize,
         #[source]
@@ -580,13 +555,16 @@ mod tests {
 
     #[test]
     fn automatic_memory_ceiling_is_three_quarters_of_system_memory() {
-        const GIB: u64 = 1024 * 1024 * 1024;
+        use crate::units::BYTES_PER_GIB;
 
         assert_eq!(
-            automatic_memory_ceiling_bytes_from_total(8 * GIB),
-            usize::try_from(6 * GIB).unwrap()
+            DecodeLimits::from_total_memory_bytes(8 * BYTES_PER_GIB).memory_ceiling_bytes,
+            usize::try_from(6 * BYTES_PER_GIB).unwrap()
         );
-        assert_eq!(automatic_memory_ceiling_bytes_from_total(0), 0);
+        assert_eq!(
+            DecodeLimits::from_total_memory_bytes(0).memory_ceiling_bytes,
+            0
+        );
     }
 
     #[test]
@@ -626,7 +604,9 @@ mod tests {
         let store = DecodedTileStore::new(width, 1, 1, 1, 1, vec![[0.0; 4]], pixels);
         let mut actual = vec![0.0; sample_count];
 
-        store.read_canonical_row_rgba_f32(0, &mut actual).unwrap();
+        store
+            .read_canonical_row_range_rgba_f32(0, 0, &mut actual)
+            .unwrap();
 
         for (bits, actual) in half_bits.into_iter().zip(actual) {
             assert_eq!(

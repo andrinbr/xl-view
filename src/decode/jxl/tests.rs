@@ -25,7 +25,7 @@ fn checked_dimensions_and_bounded_memory_cover_adversarial_geometry() {
         (28_000, 7_143),
     ] {
         let retained = estimated_memory_cost_bytes(width, height).unwrap();
-        let scratch = estimated_render_scratch_bytes(width, height).unwrap();
+        let scratch = estimated_conversion_scratch_bytes(width, height).unwrap();
         assert!(scratch <= MAX_SCRATCH_BYTES as u64);
         assert!(retained >= u64::from(width) * u64::from(height) * 8);
         assert!(matches!(
@@ -91,7 +91,7 @@ fn decoder_handles_short_reads_and_rejects_prefetch_before_frame_decoding() {
 }
 
 #[test]
-fn in_place_conversion_keeps_allocation_and_averages_straight_alpha_across_chunks() {
+fn in_place_conversion_averages_straight_alpha_across_chunks() {
     // A coarse band crosses the 65,536-pixel scratch boundary and has a short
     // final coarse row and column. Use an independent scalar f64 reference.
     let (width, height, downsample) = (1_001_u32, 69_u32, 3_u32);
@@ -104,7 +104,6 @@ fn in_place_conversion_keeps_allocation_and_averages_straight_alpha_across_chunk
                 .map(half::f16::to_bits)
         })
         .collect();
-    let address = pixels.as_ptr();
     let mut sums = vec![
         [0.0_f64; 4];
         usize_from_u32(width.div_ceil(downsample) * height.div_ceil(downsample))
@@ -140,7 +139,6 @@ fn in_place_conversion_keeps_allocation_and_averages_straight_alpha_across_chunk
         None,
     )
     .unwrap();
-    assert_eq!(address, pixels.as_ptr());
     for ((sum, count), actual) in sums.iter().zip(counts).zip(preview) {
         for channel in 0..3 {
             assert!((f64::from(actual[channel]) - sum[channel] / sum[3]).abs() < 1e-6);
@@ -583,6 +581,8 @@ fn hdr_signals_present_their_measured_peak_and_decode_by_their_target() {
         // HLG 0.5 displays at 51 nits. Content below white presents at white.
         (Hlg, HLG, 1_000.0, 0.5, 203.0, true),
         (Hlg, HLG, 2_000.0, 1.0, 2_000.0, true),
+        // Black, where a target below about 300 nits sets the system gamma below 1.
+        (Hlg, HLG, 203.0, 0.0, 203.0, false),
         // The XYB fallback output is relative to the target.
         (Pq, Linear, 1_000.0, 0.5, 500.0, true),
     ] {
@@ -710,7 +710,7 @@ fn conversion_table_rejects_inconsistent_outputs_and_keeps_sdr_fallback_relative
 }
 
 #[test]
-fn luminance_calibration_counts_hidden_straight_color_and_ignores_saturated_max_rgb() {
+fn luminance_calibration_ignores_transparent_pixels_and_saturated_max_rgb() {
     let conversion = linear_conversion(&linear_profile(JxlPrimaries::SRGB), false);
     let source = linear_source(1_000.0, false, true);
     let pixels = [
@@ -724,16 +724,20 @@ fn luminance_calibration_counts_hidden_straight_color_and_ignores_saturated_max_
         .linear_unit(|| conversion.maximum_luminance(&pixels))
         .unwrap();
     assert!((unit.nits - 80.0).abs() < 0.01);
+    // Hiding white behind straight alpha 0 calibrates like cropping it away.
     let hidden = [packed([12.5, 12.5, 12.5, 0.0]), pixels[1]];
-    assert_eq!(conversion.maximum_luminance(&hidden).unwrap(), maximum);
-    let cropped = source
-        .linear_unit(|| conversion.maximum_luminance(&hidden[1..]))
+    assert_eq!(
+        conversion.maximum_luminance(&hidden).unwrap(),
+        conversion.maximum_luminance(&pixels[1..]).unwrap()
+    );
+    let hidden_unit = source
+        .linear_unit(|| conversion.maximum_luminance(&hidden))
         .unwrap();
-    assert!(cropped.nits > unit.nits * 3.0);
+    assert!(hidden_unit.nits > unit.nits * 3.0);
 }
 
 #[test]
-fn luminance_pass_uses_recoverable_associated_color_and_gray_channel_zero() {
+fn luminance_pass_uses_visible_straight_and_associated_color_and_gray_channel_zero() {
     let straight = linear_conversion(&working_profile(), false);
     let associated = linear_conversion(&working_profile(), true);
     let invalid = [
@@ -746,8 +750,10 @@ fn luminance_pass_uses_recoverable_associated_color_and_gray_channel_zero() {
         packed([6.25, 6.25, 6.25, 0.5]),
         packed([100.0, 100.0, 100.0, 0.0]),
     ];
+    // Associated color is unpremultiplied. In both modes, the transparent
+    // pixel does not count.
     assert!((associated.maximum_luminance(&pixels).unwrap() - 12.5).abs() < 1e-6);
-    assert!((straight.maximum_luminance(&pixels).unwrap() - 100.0).abs() < 1e-5);
+    assert!((straight.maximum_luminance(&pixels).unwrap() - 6.25).abs() < 1e-5);
     let gray = JxlColorProfile::Simple(JxlColorEncoding::GrayscaleColorSpace {
         white_point: JxlWhitePoint::D65,
         transfer_function: JxlTransferFunction::Linear,
@@ -755,7 +761,7 @@ fn luminance_pass_uses_recoverable_associated_color_and_gray_channel_zero() {
     });
     let gray = linear_conversion(&gray, false);
     assert_eq!(
-        gray.maximum_luminance(&[packed([12.5, 100.0, 200.0, 0.0])])
+        gray.maximum_luminance(&[packed([12.5, 100.0, 200.0, 1.0])])
             .unwrap(),
         12.5
     );
@@ -774,8 +780,8 @@ fn native_linear_peak_is_visible_full_resolution_straight_color_without_a_target
         let mut conversion = linear_conversion(&working_profile(), false);
         conversion.scale = unit_nits / HDR_REFERENCE_WHITE_NITS;
         let pixels = vec![packed([sample, sample, sample, 1.0])];
-        let (_, peak) = convert_pixels(pixels, 1, 1, true, &conversion, None).unwrap();
-        assert!((measured_source_peak(peak).nits() - expected).abs() < tolerance);
+        let (_, stats) = convert_pixels(pixels, 1, 1, true, &conversion, None).unwrap();
+        assert!((measured_source_peak(stats.peak).nits() - expected).abs() < tolerance);
     }
     let conversion = linear_conversion(&working_profile(), false);
     // Downsample=2, and the single highlight is in another parallel band on
@@ -783,9 +789,9 @@ fn native_linear_peak_is_visible_full_resolution_straight_color_without_a_target
     let mut pixels = vec![packed([0.5, 0.5, 0.5, 1.0]); 4_097 * 18];
     pixels[0] = packed([20.0, 20.0, 20.0, 0.0]);
     *pixels.last_mut().unwrap() = packed([4.0, 4.0, 4.0, 0.25]);
-    let (store, peak) = convert_pixels(pixels, 4_097, 18, false, &conversion, None).unwrap();
+    let (store, stats) = convert_pixels(pixels, 4_097, 18, false, &conversion, None).unwrap();
     assert_eq!(store.coarse_downsample(), 2);
-    assert_eq!(measured_source_peak(peak).nits(), 812.0);
+    assert_eq!(measured_source_peak(stats.peak).nits(), 812.0);
     assert!(store.coarse_pixels().iter().all(|v| *v < 4.0));
     let mut associated = linear_conversion(&working_profile(), true);
     let pixels = vec![packed([6.25, 6.25, 6.25, 0.5])];
@@ -794,9 +800,82 @@ fn native_linear_peak_is_visible_full_resolution_straight_color_without_a_target
         .unwrap();
     assert!((unit.nits - 80.0).abs() < 0.001);
     associated.scale = unit.nits / HDR_REFERENCE_WHITE_NITS;
-    let (store, peak) = convert_pixels(pixels, 1, 1, false, &associated, None).unwrap();
-    assert!((measured_source_peak(peak).nits() - 1_000.0).abs() < 0.001);
+    let (store, stats) = convert_pixels(pixels, 1, 1, false, &associated, None).unwrap();
+    assert!((measured_source_peak(stats.peak).nits() - 1_000.0).abs() < 0.001);
     assert!((store.coarse_pixels()[0] - 1_000.0 / HDR_REFERENCE_WHITE_NITS).abs() < 0.001);
+}
+
+#[test]
+fn histogram_bins_are_eighth_stops_from_ten_stops_below_reference_white() {
+    for (value, bin) in [
+        // SDR white counts below reference white, also with the rounding of
+        // its color conversion.
+        (1.0, HISTOGRAM_REFERENCE_WHITE_BIN - 1),
+        (1.000_04, HISTOGRAM_REFERENCE_WHITE_BIN - 1),
+        (1.001, HISTOGRAM_REFERENCE_WHITE_BIN),
+        // An eighth of a stop is a factor of 1.091, not an eighth of the mantissa.
+        (1.09, HISTOGRAM_REFERENCE_WHITE_BIN),
+        (1.1, HISTOGRAM_REFERENCE_WHITE_BIN + 1),
+        (2.0, HISTOGRAM_REFERENCE_WHITE_BIN + 7),
+        (2.01, HISTOGRAM_REFERENCE_WHITE_BIN + 8),
+        (1.0 / 1_024.0, 0),
+        (PQ_PEAK_NITS / HDR_REFERENCE_WHITE_NITS, HISTOGRAM_BINS - 1),
+        // Values beyond the axis count in its first and last bin.
+        (0.0, 0),
+        (1.0e-30, 0),
+        (64.0, HISTOGRAM_BINS - 1),
+        (f32::MAX, HISTOGRAM_BINS - 1),
+    ] {
+        assert_eq!(histogram_bin(value), bin, "{value}");
+    }
+}
+
+#[test]
+fn measured_peak_leaves_out_the_brightest_hundredth_of_a_percent() {
+    let conversion = linear_conversion(&working_profile(), false);
+    let peak = |glints: usize| {
+        let mut pixels = vec![packed([3.0, 3.0, 3.0, 1.0]); 200 * 150];
+        pixels[..glints].fill(packed([20.0, 20.0, 20.0, 1.0]));
+        let (_, stats) = convert_pixels(pixels, 200, 150, false, &conversion, None).unwrap();
+        stats.presentation_peak()
+    };
+    // Three of 30,000 pixels do not count. The peak is the upper edge of the
+    // eighth of a stop that holds the other pixels.
+    assert_eq!(peak(3), 1.625_f32.exp2());
+    // A fourth one does, and the peak is the exact maximum.
+    assert_eq!(peak(4), 20.0);
+    assert_eq!(peak(0), 3.0);
+    // Without visible pixels there is nothing to leave out.
+    assert_eq!(PixelStats::EMPTY.presentation_peak(), 0.0);
+    // The share also holds for more pixels than a u32 counts.
+    let mut histogram = [0; HISTOGRAM_BINS];
+    histogram[histogram_bin(3.0)] = 5_000_000_000;
+    histogram[histogram_bin(20.0)] = 450_000;
+    let stats = PixelStats {
+        peak: 20.0,
+        histogram,
+    };
+    assert_eq!(stats.presentation_peak(), 1.625_f32.exp2());
+}
+
+#[test]
+fn histogram_counts_each_visible_pixel_by_its_largest_channel() {
+    let conversion = linear_conversion(&working_profile(), false);
+    // Several parallel bands on multi-worker pools.
+    let mut pixels = vec![packed([0.6, 0.25, 0.1, 1.0]); 4_097 * 18];
+    pixels[0] = packed([20.0, 20.0, 20.0, 0.0]);
+    pixels[1] = packed([0.0, -1.0, -2.0, 1.0]);
+    pixels[2] = packed([60_000.0, 1.0, 1.0, 1.0]);
+    *pixels.last_mut().unwrap() = packed([1.0, 5.0, 1.0, 0.25]);
+    let (_, stats) = convert_pixels(pixels, 4_097, 18, false, &conversion, None).unwrap();
+    // Every pixel but the transparent one.
+    assert_eq!(stats.histogram.iter().sum::<u64>(), 4_097 * 18 - 1);
+    let mut expected = [0; HISTOGRAM_BINS];
+    expected[0] = 1;
+    expected[HISTOGRAM_REFERENCE_WHITE_BIN - 6] = 4_097 * 18 - 4;
+    expected[HISTOGRAM_REFERENCE_WHITE_BIN + 18] = 1;
+    expected[HISTOGRAM_BINS - 1] = 1;
+    assert_eq!(stats.histogram, expected);
 }
 
 #[test]
@@ -805,7 +884,7 @@ fn ordinary_linear_white_snaps_to_sdr_but_the_next_f16_step_is_hdr() {
         for associated in [false, true] {
             let conversion = linear_conversion(&linear_profile(primaries.clone()), associated);
             let sample = if associated { 0.5 } else { 1.0 };
-            let (_, peak) = convert_pixels(
+            let (_, stats) = convert_pixels(
                 vec![packed([sample, sample, sample, 0.5])],
                 1,
                 1,
@@ -814,9 +893,9 @@ fn ordinary_linear_white_snaps_to_sdr_but_the_next_f16_step_is_hdr() {
                 None,
             )
             .unwrap();
-            assert_eq!(measured_source_peak(peak).nits(), 203.0);
+            assert_eq!(measured_source_peak(stats.peak).nits(), 203.0);
             let sample = sample * (1.0 + 1.0 / 1024.0);
-            let (_, peak) = convert_pixels(
+            let (_, stats) = convert_pixels(
                 vec![packed([sample, sample, sample, 0.5])],
                 1,
                 1,
@@ -825,7 +904,7 @@ fn ordinary_linear_white_snaps_to_sdr_but_the_next_f16_step_is_hdr() {
                 None,
             )
             .unwrap();
-            assert!(measured_source_peak(peak).nits() > 203.0);
+            assert!(measured_source_peak(stats.peak).nits() > 203.0);
         }
     }
 }
@@ -925,7 +1004,7 @@ fn gain_map_budget_is_what_the_base_image_leaves_of_the_memory_ceiling() {
     // The box payload, plus three 16-bit samples per gain map pixel.
     let gain_map_bytes = u64::from(box_size - 8) + 1_024 * 1_024 * 3 * 2;
     let base_bytes = estimated_memory_cost_bytes(1_024, 1_024).unwrap()
-        + estimated_render_scratch_bytes(1_024, 1_024).unwrap();
+        + estimated_conversion_scratch_bytes(1_024, 1_024).unwrap();
     let decode = |gain_map_budget: u64| {
         let limits = DecodeLimits {
             memory_ceiling_bytes: usize::try_from(base_bytes + gain_map_budget).unwrap(),

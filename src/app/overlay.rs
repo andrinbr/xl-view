@@ -1,13 +1,15 @@
 use std::path::Path;
 use std::time::Duration;
 
-use xl_view::color::SourceIntensityTarget;
-use xl_view::decode::{DecodedImage, GainMapStatus, SourceDynamicRange};
+use xl_view::color::{HDR_REFERENCE_WHITE_NITS, SourceIntensityTarget};
+use xl_view::decode::{
+    DecodedImage, GainMapStatus, Histogram, SourceColorEncoding, SourceDynamicRange,
+};
 use xl_view::metadata::{ExifMetadata, XmpMetadata};
+use xl_view::units::{format_mib, milliseconds, u64_from_usize};
 
 use super::files::file_name;
-use crate::gpu::OverlaySection;
-use xl_view::units::{format_mib, milliseconds, u64_from_usize};
+use crate::gpu::{OverlayRow, OverlaySection};
 
 #[derive(Debug)]
 pub(super) struct LoadedImageSummary {
@@ -17,6 +19,10 @@ pub(super) struct LoadedImageSummary {
     pub(super) file_name: String,
     pub(super) gain_map: Option<GainMapStatus>,
     pub(super) hdr_source: bool,
+    pub(super) histogram: Histogram,
+    /// Of a PQ or HLG source, or the headroom of an applied gain map. The
+    /// histogram marks it.
+    pub(super) intensity_target: Option<SourceIntensityTarget>,
     pub(super) memory_bytes: usize,
     pub(super) source_color_space: String,
     pub(super) source_peak: SourceIntensityTarget,
@@ -40,15 +46,21 @@ impl LoadedImageSummary {
         let mut source_rows = vec![
             ("Range".to_owned(), self.range_summary()),
             ("Color space".to_owned(), self.source_color_space.clone()),
-            ("Source peak".to_owned(), self.source_peak_summary()),
         ];
         if let Some(status) = self.gain_map {
             source_rows.push(("Gain map".to_owned(), gain_map_summary(status)));
         }
+        source_rows.push(("Source peak".to_owned(), self.source_peak_summary()));
+        let mut source_rows = text_rows(source_rows);
+        source_rows.push(OverlayRow::Histogram {
+            label: "Histogram".to_owned(),
+            bins: self.histogram,
+            intensity_target: self.intensity_target,
+        });
         let mut sections = vec![
             OverlaySection {
                 title: "IMAGE",
-                rows: vec![
+                rows: text_rows(vec![
                     ("File".to_owned(), self.file_name.clone()),
                     (
                         "Dimensions".to_owned(),
@@ -58,7 +70,7 @@ impl LoadedImageSummary {
                         "Decode".to_owned(),
                         decode_summary(self.decode_timing, self.memory_bytes),
                     ),
-                ],
+                ]),
             },
             OverlaySection {
                 title: "SOURCE",
@@ -66,21 +78,21 @@ impl LoadedImageSummary {
             },
             OverlaySection {
                 title: "DISPLAY & VIEWER",
-                rows: display_rows,
+                rows: text_rows(display_rows),
             },
         ];
         let capture_rows = capture_metadata_rows(self.exif.as_ref());
         if !capture_rows.is_empty() {
             sections.push(OverlaySection {
                 title: "CAPTURE",
-                rows: capture_rows,
+                rows: text_rows(capture_rows),
             });
         }
         let attribution_rows = attribution_metadata_rows(self.exif.as_ref(), self.xmp.as_ref());
         if !attribution_rows.is_empty() {
             sections.push(OverlaySection {
                 title: "ATTRIBUTION",
-                rows: attribution_rows,
+                rows: text_rows(attribution_rows),
             });
         }
         sections
@@ -116,6 +128,17 @@ impl LoadedImageSummary {
             exif: image.metadata.exif.clone(),
             gain_map: image.gain_map,
             hdr_source: image.hdr_source,
+            histogram: image.histogram,
+            intensity_target: match image.gain_map {
+                Some(GainMapStatus::Applied { headroom_stops }) => SourceIntensityTarget::new(
+                    f64::from(HDR_REFERENCE_WHITE_NITS) * f64::from(headroom_stops).exp2(),
+                ),
+                _ => matches!(
+                    image.source_dynamic_range,
+                    SourceDynamicRange::Pq | SourceDynamicRange::Hlg
+                )
+                .then_some(image.intensity_target),
+            },
             memory_bytes: image.memory_cost_bytes,
             source_color_space,
             source_transfer,
@@ -135,9 +158,15 @@ impl LoadedImageSummary {
     }
 }
 
-fn source_encoding_details(encoding: &xl_view::decode::SourceColorEncoding) -> (String, String) {
+fn text_rows(rows: Vec<(String, String)>) -> Vec<OverlayRow> {
+    rows.into_iter()
+        .map(|(label, value)| OverlayRow::Text(label, value))
+        .collect()
+}
+
+fn source_encoding_details(encoding: &SourceColorEncoding) -> (String, String) {
     match encoding {
-        xl_view::decode::SourceColorEncoding::Enumerated {
+        SourceColorEncoding::Enumerated {
             color_space,
             white_point,
             primaries,
@@ -151,7 +180,7 @@ fn source_encoding_details(encoding: &xl_view::decode::SourceColorEncoding) -> (
                 transfer_function.clone(),
             )
         }
-        xl_view::decode::SourceColorEncoding::Icc {
+        SourceColorEncoding::Icc {
             color_space,
             profile_bytes,
         } => (
@@ -163,7 +192,9 @@ fn source_encoding_details(encoding: &xl_view::decode::SourceColorEncoding) -> (
 
 /// Names the transfer function as such, because several share their name
 /// with a set of primaries in the color space row. An applied gain map is
-/// listed because it, not the transfer function, makes the image HDR.
+/// listed because it, not the transfer function, can make the image HDR.
+/// Whether it does depends on the reconstructed peak, so a dark image can
+/// read "SDR (… + gain map)".
 fn source_range_summary(hdr: bool, transfer_function: &str, gain_map_applied: bool) -> String {
     let range = if hdr { "HDR" } else { "SDR" };
     let gain_map = if gain_map_applied { " + gain map" } else { "" };
@@ -204,12 +235,6 @@ fn capture_metadata_rows(exif: Option<&ExifMetadata>) -> Vec<(String, String)> {
     let Some(exif) = exif else {
         return Vec::new();
     };
-    if let Some(error) = &exif.parse_error {
-        return vec![(
-            "Status".to_owned(),
-            format!("Embedded EXIF cannot be parsed ({error})"),
-        )];
-    }
 
     let mut rows = Vec::new();
     if let Some(camera) =
@@ -245,6 +270,14 @@ fn capture_metadata_rows(exif: Option<&ExifMetadata>) -> Vec<(String, String)> {
     if let Some(bias) = exif.exposure_bias_ev.filter(|value| value.is_finite()) {
         rows.push(("Exposure bias".to_owned(), format!("{bias:+.1} EV")));
     }
+    // Partly parsed EXIF keeps the fields that could be read, so the error
+    // follows them instead of replacing them.
+    if let Some(error) = &exif.parse_error {
+        rows.push((
+            "Status".to_owned(),
+            format!("Failed to parse embedded EXIF ({error})"),
+        ));
+    }
 
     rows
 }
@@ -257,7 +290,7 @@ fn attribution_metadata_rows(
     if let Some(rating) = xmp_rating_row(xmp) {
         rows.push(rating);
     }
-    if let Some(exif) = exif.filter(|metadata| metadata.parse_error.is_none()) {
+    if let Some(exif) = exif {
         if let Some(artist) = &exif.artist {
             rows.push(("Artist".to_owned(), artist.clone()));
         }
@@ -306,7 +339,9 @@ fn format_exposure_time(seconds: f64) -> String {
     if seconds < 1.0 {
         let reciprocal = 1.0 / seconds;
         let rounded = reciprocal.round();
-        if (reciprocal - rounded).abs() < 0.05 {
+        // Short exposures always read as a fraction, as in exiftool. Two
+        // decimals would show 32/10000 s as "0 s".
+        if seconds <= 0.25 || (reciprocal - rounded).abs() < 0.05 {
             return format!("1/{rounded:.0} s");
         }
     }
@@ -324,13 +359,14 @@ fn format_decimal(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use xl_view::decode::{DecodeLimits, decode_file};
+    use xl_view::units::mib_to_bytes;
 
     use super::*;
     use crate::test_utils::fixture_path;
 
     #[test]
     fn source_encoding_details_are_concise() {
-        let sdr = xl_view::decode::SourceColorEncoding::Enumerated {
+        let sdr = SourceColorEncoding::Enumerated {
             color_space: "RGB".to_owned(),
             white_point: "D65".to_owned(),
             primaries: Some("sRGB".to_owned()),
@@ -343,7 +379,7 @@ mod tests {
                 "sRGB".to_owned()
             )
         );
-        let gray = xl_view::decode::SourceColorEncoding::Enumerated {
+        let gray = SourceColorEncoding::Enumerated {
             color_space: "Grayscale".to_owned(),
             white_point: "D50".to_owned(),
             primaries: None,
@@ -353,7 +389,7 @@ mod tests {
             source_encoding_details(&gray).0,
             "Grayscale, D50 white".to_owned()
         );
-        let icc = xl_view::decode::SourceColorEncoding::Icc {
+        let icc = SourceColorEncoding::Icc {
             color_space: "RGB".to_owned(),
             profile_bytes: 21_012,
         };
@@ -381,11 +417,10 @@ mod tests {
 
     #[test]
     fn decode_summary_combines_time_and_memory() {
-        const MIB: u64 = 1024 * 1024;
         assert_eq!(
             decode_summary(
                 DecodeTiming::Measured(Duration::from_millis(611)),
-                usize::try_from(16 * MIB).unwrap(),
+                usize::try_from(mib_to_bytes(16)).unwrap(),
             ),
             "611.0 ms, 16 MiB"
         );
@@ -460,6 +495,45 @@ mod tests {
         assert!(attribution_metadata_rows(Some(&empty), None).is_empty());
 
         assert_eq!(format_exif_datetime("not a date"), "not a date".to_owned());
+        assert_eq!(format_exposure_time(32.0 / 10_000.0), "1/313 s");
+        assert_eq!(format_exposure_time(0.22), "1/5 s");
+    }
+
+    #[test]
+    fn partly_parsed_exif_keeps_its_fields_and_reports_the_error() {
+        let status = |error: &str| {
+            (
+                "Status".to_owned(),
+                format!("Failed to parse embedded EXIF ({error})"),
+            )
+        };
+        let partial = ExifMetadata {
+            artist: Some("Ada Example".to_owned()),
+            camera_make: Some("ACME".to_owned()),
+            parse_error: Some("partially parsed EXIF: Truncated field value".to_owned()),
+            ..ExifMetadata::default()
+        };
+        assert_eq!(
+            capture_metadata_rows(Some(&partial)),
+            [
+                ("Camera".to_owned(), "ACME".to_owned()),
+                status("partially parsed EXIF: Truncated field value"),
+            ]
+        );
+        assert_eq!(
+            attribution_metadata_rows(Some(&partial), None),
+            [("Artist".to_owned(), "Ada Example".to_owned())]
+        );
+
+        let unreadable = ExifMetadata {
+            parse_error: Some("Invalid format".to_owned()),
+            ..ExifMetadata::default()
+        };
+        assert_eq!(
+            capture_metadata_rows(Some(&unreadable)),
+            [status("Invalid format")]
+        );
+        assert!(attribution_metadata_rows(Some(&unreadable), None).is_empty());
     }
 
     #[test]
@@ -565,6 +639,8 @@ mod tests {
             );
             assert_eq!(summary.range_summary(), range);
             assert_eq!(summary.source_peak_summary(), peak);
+            // The histogram marks the target that the peak row names.
+            assert_eq!(summary.intensity_target.is_some(), peak.contains("target"));
             // The title warning and range row share this same flag.
             assert_eq!(summary.hdr_source, hdr, "{name}");
         }
@@ -604,7 +680,7 @@ mod tests {
             );
         }
 
-        let source_rows = |path: &Path, rendition| {
+        let source_rows = |path: &Path, rendition, intensity_target| {
             let image = decode_memory_with_rendition(
                 &std::fs::read(path).unwrap(),
                 DecodeLimits::from_memory_ceiling_mib(256),
@@ -618,39 +694,51 @@ mod tests {
             );
             // Only the reconstructed HDR rendition may raise the title warning.
             assert_eq!(summary.hdr_source, rendition == Rendition::Hdr);
-            summary
+            let rows = summary
                 .overlay_sections(Vec::new())
                 .into_iter()
                 .find(|section| section.title == "SOURCE")
                 .unwrap()
-                .rows
+                .rows;
+            let histogram = OverlayRow::Histogram {
+                label: "Histogram".to_owned(),
+                bins: image.histogram,
+                intensity_target,
+            };
+            (rows, histogram)
         };
-        let row = |label: &str, value: &str| (label.to_owned(), value.to_owned());
+        let row = |label: &str, value: &str| OverlayRow::Text(label.to_owned(), value.to_owned());
         let path = fixture_path("test_pattern-gain-map.jxl");
         // The reconstructed image names the base image's transfer and the gain
-        // map, and reports its measured peak without an intensity target.
+        // map, and reports its measured peak without an intensity target. The
+        // histogram of the decoded rendition follows the peak and marks the
+        // headroom, 2.3 stops above reference white.
+        let headroom = f64::from(HDR_REFERENCE_WHITE_NITS) * f64::from(2.3_f32).exp2();
+        let (rows, histogram) =
+            source_rows(&path, Rendition::Hdr, SourceIntensityTarget::new(headroom));
         assert_eq!(
-            source_rows(&path, Rendition::Hdr),
+            rows,
             [
                 row("Range", "HDR (BT.709 transfer + gain map)"),
                 row("Color space", "RGB, BT.2020 primaries, D65 white"),
-                row("Source peak", "1007 nits"),
                 row("Gain map", "Applied (from SDR base, 2.3 stops headroom)"),
+                row("Source peak", "1007 nits"),
+                histogram,
             ]
         );
+        let (rows, histogram) = source_rows(&path, Rendition::Sdr, None);
         assert_eq!(
-            source_rows(&path, Rendition::Sdr),
+            rows,
             [
                 row("Range", "SDR (BT.709 transfer)"),
                 row("Color space", "RGB, BT.2020 primaries, D65 white"),
-                row("Source peak", "203 nits"),
                 row("Gain map", "Available (showing SDR base)"),
+                row("Source peak", "203 nits"),
+                histogram,
             ]
         );
         // Files without a gain map have no such row.
-        assert_eq!(
-            source_rows(&fixture_path("test_pattern-sRGB.jxl"), Rendition::Sdr).len(),
-            3
-        );
+        let (rows, _) = source_rows(&fixture_path("test_pattern-sRGB.jxl"), Rendition::Sdr, None);
+        assert_eq!(rows.len(), 4);
     }
 }

@@ -17,17 +17,18 @@ use std::io;
 
 use half::prelude::{HalfBitsSliceExt, HalfFloatSliceExt};
 use rayon::prelude::*;
-use xl_view::decode::{CANONICAL_BYTES_PER_PIXEL, DecodedTileStore, HALF_CONVERSION_CHUNK_SAMPLES};
+use xl_view::decode::{
+    CANONICAL_BYTES_PER_PIXEL, DecodedTileStore, HALF_CONVERSION_CHUNK_SAMPLES, MAX_FINITE_F16,
+};
+use xl_view::units::{mib_to_usize_bytes, usize_from_u32};
 
 use super::ViewportRequest;
-use xl_view::units::usize_from_u32;
 
 // Small batches expose row-independent work without delaying cancellation.
 // The byte cap prevents unusually wide images from multiplying scratch use.
 const RESAMPLING_ROWS_PER_WORKER: usize = 2;
-const MAX_RESAMPLING_ROW_BATCH_BYTES: usize = 32 * 1024 * 1024;
-const MAX_COEFFICIENT_BYTES: usize = 64 * 1024 * 1024;
-const MAX_FINITE_F16: f32 = half::f16::MAX.to_f32_const();
+const MAX_RESAMPLING_ROW_BATCH_BYTES: usize = mib_to_usize_bytes(32);
+const MAX_COEFFICIENT_BYTES: usize = mib_to_usize_bytes(64);
 
 #[derive(Debug)]
 pub(super) enum ResampleError {
@@ -55,11 +56,6 @@ struct AxisContributions {
 }
 
 impl AxisContributions {
-    fn clear(&mut self) {
-        self.bounds.clear();
-        self.weights.clear();
-    }
-
     fn allocated_bytes(&self) -> usize {
         allocation_bytes::<AxisBound>(self.bounds.capacity())
             .saturating_add(allocation_bytes::<f32>(self.weights.capacity()))
@@ -97,7 +93,8 @@ fn build_axis_contributions(
     contributions: &mut AxisContributions,
     is_canceled: &mut impl FnMut() -> bool,
 ) -> Result<(), ResampleError> {
-    contributions.clear();
+    // Scratch is job-scoped and each axis is built once per job.
+    debug_assert!(contributions.bounds.is_empty() && contributions.weights.is_empty());
     if axis_inputs_are_invalid(source_size, target_size, view_center, view_scale) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -128,11 +125,15 @@ fn build_axis_contributions(
     contributions
         .bounds
         .try_reserve_exact(usize_from_u32(target_size))
-        .map_err(|error| io::Error::other(format!("cannot allocate Lanczos2 bounds: {error}")))?;
+        .map_err(|error| {
+            io::Error::other(format!("failed to allocate Lanczos2 bounds: {error}"))
+        })?;
     contributions
         .weights
         .try_reserve_exact(maximum_weights)
-        .map_err(|error| io::Error::other(format!("cannot allocate Lanczos2 weights: {error}")))?;
+        .map_err(|error| {
+            io::Error::other(format!("failed to allocate Lanczos2 weights: {error}"))
+        })?;
 
     for target in 0..target_size {
         if target % 32 == 0 && is_canceled() {
@@ -140,7 +141,9 @@ fn build_axis_contributions(
         }
         let source_center = view_center
             + (f64::from(target) + 0.5 - f64::from(target_size) * 0.5) * source_per_target;
-        if source_center < 0.0 || source_center > f64::from(source_size) {
+        // Half-open, like the presentation shader: a center exactly on the
+        // far edge is outside the image.
+        if source_center < 0.0 || source_center >= f64::from(source_size) {
             contributions.bounds.push(AxisBound {
                 start: 0,
                 length: 0,
@@ -284,8 +287,14 @@ fn activate_output_rows(
         if bound.start > source_y {
             break;
         }
-        let mut samples = free_row_buffers.pop().unwrap_or_default();
-        prepare_zeroed_buffer(&mut samples, target_row_pixels, "active output row")?;
+        let samples = if let Some(mut samples) = free_row_buffers.pop() {
+            // Recycled from a completed row of this job, so the length matches.
+            debug_assert_eq!(samples.len(), target_row_pixels);
+            samples.fill(RgbaF32::default());
+            samples
+        } else {
+            allocate_zeroed(target_row_pixels, "active output row")?
+        };
         active.push_back(ActiveOutputRow {
             target_y: *next_target_y,
             end_source_y: bound.start + bound.length,
@@ -416,17 +425,9 @@ fn resample_lanczos2_rows(
         .checked_mul(batch_capacity)
         .ok_or_else(|| io::Error::other("horizontal row batch size overflowed"))?;
 
-    prepare_reused_buffer(
-        &mut scratch.source_rows,
-        source_batch_pixels,
-        "source row batch",
-    )?;
-    prepare_reused_buffer(
-        &mut scratch.horizontal_rows,
-        horizontal_batch_pixels,
-        "horizontal row batch",
-    )?;
-    prepare_zeroed_buffer(&mut scratch.output, output_bytes, "resampled output")?;
+    scratch.source_rows = allocate_zeroed(source_batch_pixels, "source row batch")?;
+    scratch.horizontal_rows = allocate_zeroed(horizontal_batch_pixels, "horizontal row batch")?;
+    scratch.output = allocate_zeroed(output_bytes, "resampled output")?;
 
     let mut next_target_y = 0_u32;
     let mut source_rows_read = 0_usize;
@@ -528,27 +529,18 @@ fn ensure_output_rows_complete(
     Ok(())
 }
 
-pub(super) fn prepare_reused_buffer<T: Clone + Default>(
-    values: &mut Vec<T>,
+/// Allocates a zero-filled buffer for one job, reporting allocation failure
+/// as an error instead of aborting.
+pub(super) fn allocate_zeroed<T: Clone + Default>(
     length: usize,
     label: &str,
-) -> Result<(), ResampleError> {
-    let additional = length.saturating_sub(values.len());
+) -> Result<Vec<T>, ResampleError> {
+    let mut values = Vec::new();
     values
-        .try_reserve_exact(additional)
-        .map_err(|error| io::Error::other(format!("cannot allocate {label}: {error}")))?;
+        .try_reserve_exact(length)
+        .map_err(|error| io::Error::other(format!("failed to allocate {label}: {error}")))?;
     values.resize(length, T::default());
-    Ok(())
-}
-
-fn prepare_zeroed_buffer<T: Clone + Default>(
-    values: &mut Vec<T>,
-    length: usize,
-    label: &str,
-) -> Result<(), ResampleError> {
-    prepare_reused_buffer(values, length, label)?;
-    values.fill(T::default());
-    Ok(())
+    Ok(values)
 }
 
 #[inline(never)] // Avoid duplicating this sizeable inner convolution loop into its streaming caller.
@@ -598,9 +590,14 @@ fn encode_resampled_row(samples: &mut [RgbaF32], output: &mut [u8], width: u32, 
             } else {
                 0.0
             };
-            rgba[0] = sanitize_resampled_color(rgba[0], alpha);
-            rgba[1] = sanitize_resampled_color(rgba[1], alpha);
-            rgba[2] = sanitize_resampled_color(rgba[2], alpha);
+            // Premultiplied color overshoots together with alpha. Clamping
+            // alpha alone would brighten the edge of a translucent foreground
+            // by the overshoot times the background. Dividing by the
+            // overshoot keeps the straight color.
+            let overshoot = rgba[3].max(1.0);
+            rgba[0] = sanitize_resampled_color(rgba[0] / overshoot, alpha);
+            rgba[1] = sanitize_resampled_color(rgba[1] / overshoot, alpha);
+            rgba[2] = sanitize_resampled_color(rgba[2] / overshoot, alpha);
             rgba[3] = alpha;
         }
 
@@ -685,10 +682,11 @@ mod tests {
             } else {
                 0.0
             };
+            let overshoot = rgba[3].max(1.0);
             for value in [
-                sanitize_resampled_color(rgba[0], alpha),
-                sanitize_resampled_color(rgba[1], alpha),
-                sanitize_resampled_color(rgba[2], alpha),
+                sanitize_resampled_color(rgba[0] / overshoot, alpha),
+                sanitize_resampled_color(rgba[1] / overshoot, alpha),
+                sanitize_resampled_color(rgba[2] / overshoot, alpha),
                 alpha,
             ] {
                 encoded.extend_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
@@ -730,6 +728,21 @@ mod tests {
             let sum: f32 = axis.weights[start..end].iter().sum();
             assert!((sum - 1.0).abs() < 1e-5, "{sum}");
         }
+    }
+
+    #[test]
+    fn a_target_center_on_the_far_source_edge_is_outside_the_image() {
+        // At scale 1, target x is centered on source position x, so the five
+        // targets span source positions 0 to 4 of a four-pixel row.
+        let mut axis = AxisContributions::default();
+        build_axis_contributions(4, 5, 2.0, 1.0, &mut axis, &mut || false).unwrap();
+        let lengths = axis
+            .bounds
+            .iter()
+            .map(|bound| bound.length)
+            .collect::<Vec<_>>();
+        assert!(lengths[..4].iter().all(|&length| length > 0), "{lengths:?}");
+        assert_eq!(lengths[4], 0);
     }
 
     #[test]
@@ -814,10 +827,10 @@ mod tests {
     fn scratch_byte_accounting_includes_direct_allocations() {
         let mut scratch = ResamplingScratch::default();
         assert_eq!(scratch.allocated_bytes(), 0);
-        prepare_reused_buffer(&mut scratch.output, 128, "test output").unwrap();
-        prepare_reused_buffer(&mut scratch.upload_staging, 64, "test staging").unwrap();
-        prepare_reused_buffer(&mut scratch.source_rows, 32, "test source rows").unwrap();
-        prepare_reused_buffer(&mut scratch.horizontal_rows, 16, "test horizontal rows").unwrap();
+        scratch.output = allocate_zeroed(128, "test output").unwrap();
+        scratch.upload_staging = allocate_zeroed(64, "test staging").unwrap();
+        scratch.source_rows = allocate_zeroed(32, "test source rows").unwrap();
+        scratch.horizontal_rows = allocate_zeroed(16, "test horizontal rows").unwrap();
         assert!(scratch.allocated_bytes() >= 192 + 48 * std::mem::size_of::<RgbaF32>());
     }
 
@@ -1015,13 +1028,15 @@ mod tests {
     fn output_policy_clamps_alpha_and_keeps_rgba16f_finite() {
         let mut samples = [
             [1.0, 2.0, 3.0, -1.0],
-            [f32::INFINITY, -70_000.0, 70_000.0, 2.0],
+            [f32::INFINITY, -140_000.0, 140_000.0, 2.0],
             [f32::NAN, -0.0, f32::MIN_POSITIVE, 0.5],
             [0.333_251_95, -MAX_FINITE_F16, MAX_FINITE_F16, f32::NAN],
+            // An alpha overshoot also divides the premultiplied color.
+            [0.5625, 0.0, 0.0, 1.125],
         ];
         let scalar_reference = scalar_resampled_row_encoding(&samples);
         let mut encoded = vec![0_u8; samples.len() * CANONICAL_BYTES_PER_PIXEL];
-        encode_resampled_row(&mut samples, &mut encoded, 4, 0);
+        encode_resampled_row(&mut samples, &mut encoded, 5, 0);
         assert_eq!(encoded, scalar_reference);
         let output: Vec<f32> = encoded
             .chunks_exact(2)
@@ -1029,6 +1044,7 @@ mod tests {
             .collect();
         assert_eq!(&output[..4], &[0.0, 0.0, 0.0, 0.0]);
         assert_eq!(&output[4..8], &[0.0, -MAX_FINITE_F16, MAX_FINITE_F16, 1.0]);
+        assert_eq!(&output[16..20], &[0.5, 0.0, 0.0, 1.0]);
         assert!(output.iter().all(|value| value.is_finite()));
     }
 

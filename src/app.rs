@@ -34,12 +34,14 @@ use crate::APPLICATION_ID;
 use crate::APPLICATION_NAME;
 use crate::app_icon;
 use crate::cli::Cli;
+#[cfg(target_os = "linux")]
 use crate::cli::OutputMode;
 use crate::diagnostics;
 use crate::error::{AppError, RuntimeError};
 use crate::gpu;
 use xl_view::color::HDR_REFERENCE_WHITE_NITS;
-use xl_view::decode::{DecodeCompletion, DecodeCoordinator, DecodeLimits, ImageKey, Rendition};
+use xl_view::decode::{DecodeCompletion, DecodeCoordinator, DecodeLimits, ImageKey};
+use xl_view::memory::total_system_memory_bytes;
 use xl_view::units::{BYTES_PER_MIB, mib_to_bytes, milliseconds};
 
 mod decoded_cache;
@@ -50,8 +52,9 @@ mod session;
 
 use self::decoded_cache::automatic_decoded_cache_bytes;
 use self::files::{
-    FilePickerResult, FolderDirection, FolderReadError, NeighborPaths, adjacent_image_path,
-    dropped_file_paths, first_image_path, neighboring_image_paths, select_image_file,
+    FilePickerResult, FolderDirection, FolderReadError, NeighborPaths, absolute_path,
+    adjacent_image_path, dropped_file_paths, first_image_path, neighboring_image_paths,
+    select_image_file,
 };
 use self::input::{
     FullscreenState, KeyboardAction, PrimaryClickTracker, image_cursor, keyboard_action,
@@ -192,7 +195,7 @@ impl Application {
                     selection_generation = install.generation(),
                     direction = ?install.direction(),
                     %error,
-                    "decoded image cannot be installed on the GPU"
+                    "failed to install the decoded image on the GPU"
                 );
                 self.session.reject_install(&install, &error);
                 self.update_window_title();
@@ -221,12 +224,7 @@ impl Application {
         let Some(gpu) = self.gpu.as_ref() else {
             return;
         };
-        let rendition = if gpu.prefers_hdr_rendition() {
-            Rendition::Hdr
-        } else {
-            Rendition::Sdr
-        };
-        self.session.sync_rendition(rendition);
+        self.session.sync_rendition(gpu.gain_map_rendition());
     }
 
     fn start_neighbor_lookup(&mut self) {
@@ -290,7 +288,6 @@ impl Application {
             .session
             .current_path()
             .and_then(Path::parent)
-            .filter(|path| !path.as_os_str().is_empty())
             .map(Path::to_path_buf);
         let event_sender = self.event_sender.clone();
         let spawn = std::thread::Builder::new()
@@ -302,9 +299,9 @@ impl Application {
         match spawn {
             Ok(_) => self.file_picker_state = FilePickerState::Open,
             Err(error) => {
-                tracing::warn!(%error, "cannot start the file picker");
+                tracing::warn!(%error, "failed to start the file picker");
                 self.session.set_status_message(format!(
-                    "Cannot open the file picker: {error}. Drop an image or open one from the command line"
+                    "Failed to open the file picker: {error}. Drop an image or open one from the command line"
                 ));
                 self.update_window_title();
             }
@@ -319,7 +316,7 @@ impl Application {
             FilePickerResult::Unsupported(path) => {
                 tracing::warn!(path = %path.display(), "selected file is not a supported image");
                 self.session.set_status_message(
-                    "Cannot open the selected file: the selected file is not a supported image. Choose an image",
+                    "Failed to open the selected file: the selected file is not a supported image. Choose an image",
                 );
                 self.update_window_title();
             }
@@ -442,9 +439,9 @@ impl Application {
             if let Some(gpu) = self.gpu.as_mut()
                 && let Err(error) = gpu.set_empty_state()
             {
-                tracing::warn!(%error, "cannot render the welcome screen");
+                tracing::warn!(%error, "failed to render the welcome screen");
                 self.session
-                    .set_status_message(format!("Cannot show the welcome screen: {error}"));
+                    .set_status_message(format!("Failed to show the welcome screen: {error}"));
                 self.update_window_title();
             }
             return;
@@ -457,15 +454,19 @@ impl Application {
         if let Some(gpu) = self.gpu.as_mut()
             && let Err(error) = gpu.set_metadata_overlay(&sections)
         {
-            tracing::warn!(%error, "cannot render the metadata overlay");
+            tracing::warn!(%error, "failed to render the metadata overlay");
             self.session
-                .set_status_message(format!("Cannot update metadata overlay: {error}"));
+                .set_status_message(format!("Failed to update metadata overlay: {error}"));
             self.update_window_title();
         }
     }
 
+    /// Refreshes the visible metadata once the display stops changing. EDR
+    /// headroom can change at display cadence and a dragged window reports
+    /// every step, so the overlay is not rasterized for each event.
     fn schedule_metadata_refresh(&mut self, refresh: gpu::DisplayRefresh) {
-        if refresh.target_changed && self.metadata_visible {
+        // A new surface format can come without a new display target.
+        if self.metadata_visible && (refresh.target_changed || refresh.render_changed) {
             self.metadata_refresh_deadline = Some(Instant::now() + DISPLAY_METADATA_REFRESH_DELAY);
         }
     }
@@ -476,7 +477,7 @@ impl Application {
         let transfer = match event_loop.data_transfer(id) {
             Ok(transfer) => transfer,
             Err(error) => {
-                tracing::warn!(%error, "cannot inspect dragged data");
+                tracing::warn!(%error, "failed to inspect dragged data");
                 return;
             }
         };
@@ -485,7 +486,7 @@ impl Application {
             return;
         }
         if let Err(error) = event_loop.set_valid_dnd_actions(id, &[DndAction::Copy]) {
-            tracing::warn!(%error, "cannot accept dragged file paths");
+            tracing::warn!(%error, "failed to accept dragged file paths");
             return;
         }
 
@@ -500,7 +501,7 @@ impl Application {
             }
             Err(error) => {
                 let _ = event_loop.set_valid_dnd_actions(id, &[]);
-                tracing::warn!(%error, "cannot read dragged file paths");
+                tracing::warn!(%error, "failed to read dragged file paths");
             }
         }
     }
@@ -785,18 +786,23 @@ impl Application {
     }
 
     fn handle_window_moved(&mut self, event_loop: &dyn ActiveEventLoop) {
-        if self
-            .try_refresh_display_state(
-                event_loop,
-                "window moved to another output",
-                gpu::SurfaceCapabilities::MayHaveChanged,
-                RuntimeError::DisplayMove,
-            )
-            .is_none()
-        {
+        let Some(refresh) = self.try_refresh_display_state(
+            event_loop,
+            "window moved to another output",
+            gpu::SurfaceCapabilities::MayHaveChanged,
+            RuntimeError::DisplayMove,
+        ) else {
             return;
+        };
+        self.schedule_metadata_refresh(refresh);
+        // The startup report waits until Wayland has identified the window's
+        // output and is printed by a redraw. When an idle window notices the
+        // output here, nothing else may request one.
+        if self.startup_diagnostics == StartupDiagnosticsState::Pending
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
         }
-        self.refresh_metadata_overlay();
     }
 
     fn handle_focus_changed(&mut self, event_loop: &dyn ActiveEventLoop, focused: bool) {
@@ -804,18 +810,15 @@ impl Application {
             self.handle_pointer_departure();
             return;
         }
-        if self
-            .try_refresh_display_state(
-                event_loop,
-                "window regained focus",
-                gpu::SurfaceCapabilities::MayHaveChanged,
-                RuntimeError::DisplayFocus,
-            )
-            .is_none()
-        {
+        let Some(refresh) = self.try_refresh_display_state(
+            event_loop,
+            "window regained focus",
+            gpu::SurfaceCapabilities::MayHaveChanged,
+            RuntimeError::DisplayFocus,
+        ) else {
             return;
-        }
-        self.refresh_metadata_overlay();
+        };
+        self.schedule_metadata_refresh(refresh);
         self.note_pointer_activity(Instant::now());
     }
 
@@ -861,7 +864,7 @@ impl Application {
                     return;
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "cannot decode dropped file paths");
+                    tracing::warn!(%error, "failed to decode dropped file paths");
                     PendingDropData::Unsupported
                 }
             };
@@ -1338,9 +1341,12 @@ impl ApplicationHandler for Application {
 pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
     #[cfg(target_os = "linux")]
     require_native_wayland()?;
-    let decoded_cache_bytes = cli
-        .cache
-        .map_or_else(automatic_decoded_cache_bytes, mib_to_bytes);
+    let total_memory_bytes = total_system_memory_bytes()?;
+    let decode_limits = DecodeLimits::from_total_memory_bytes(total_memory_bytes);
+    let decoded_cache_bytes = cli.cache.map_or_else(
+        || automatic_decoded_cache_bytes(total_memory_bytes),
+        mib_to_bytes,
+    );
     log_startup_options(cli, decoded_cache_bytes);
 
     let mut event_loop_builder = EventLoop::builder();
@@ -1364,7 +1370,6 @@ pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
         }
         open_files
     };
-    let decode_limits = DecodeLimits::default();
     let decode_event_sender = event_sender.clone();
     let decode_coordinator = DecodeCoordinator::spawn(decode_limits, move |completion| {
         decode_event_sender.send(UserEvent::DecodeComplete(Box::new(completion)));
@@ -1400,23 +1405,21 @@ pub(super) fn run(cli: &Cli) -> Result<(), AppError> {
         pending_drop: None,
         pinch_fit_block: None,
         primary_click: PrimaryClickTracker::default(),
-        // SDR first: gain map images decode as their SDR base until an HDR
-        // surface exists. Only `--output pq` is certain to get one.
+        // No surface exists yet, so gain map images start as their SDR base
+        // unless the output is forced to PQ.
         session: ImageSession::new(
             decoded_cache_bytes,
             decode_coordinator,
-            if cli.output == OutputMode::Pq {
-                Rendition::Hdr
-            } else {
-                Rendition::Sdr
-            },
+            gpu::gain_map_rendition(cli.output, false),
         ),
         title_hdr_surface: None,
         window: None,
     };
 
-    if let Some(path) = cli.image.clone() {
-        application.select_path(path, None);
+    // Only the command line can supply a relative path. The file picker,
+    // drops, and folder navigation give absolute ones.
+    if let Some(path) = cli.image.as_deref() {
+        application.select_path(absolute_path(path), None);
     }
 
     let event_loop_result = event_loop.run_app_on_demand(&mut application);

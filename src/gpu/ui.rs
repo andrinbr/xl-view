@@ -1,15 +1,29 @@
 use std::sync::OnceLock;
 
 use fontdue::{Font, FontSettings, LineMetrics};
-use xl_view::color::srgb_eotf;
+use xl_view::color::{HDR_REFERENCE_WHITE_NITS, PQ_PEAK_NITS, SourceIntensityTarget, srgb_eotf};
+use xl_view::decode::{HISTOGRAM_BINS_PER_STOP, HISTOGRAM_REFERENCE_WHITE_BIN, Histogram};
+use xl_view::units::usize_from_u32;
 
 use crate::APPLICATION_NAME;
 use crate::app_icon;
-use xl_view::units::usize_from_u32;
 
 const FONT_BYTES: &[u8] = include_bytes!("../../assets/fonts/AdwaitaSans-Regular.ttf");
 const MAX_CHARACTERS_PER_CELL: usize = 80;
 const EMPTY_STATE_HELP: &str = r#"Use drag and drop or press "O" to open a file"#;
+
+// UI colors are linear-light BT.709 with straight alpha, where 1.0 is HDR
+// reference white. They are not sRGB-encoded: tune them as linear values.
+// Only the logo is sRGB-encoded and goes through `srgb_to_linear`.
+/// Overlay panel. `EMPTY_STATE_GREY` in presentation.wgsl repeats its grey.
+const PANEL_RGBA: [f32; 4] = [0.012, 0.012, 0.012, 0.84];
+const SECTION_TITLE_RGB: [f32; 3] = [0.82, 0.86, 0.94];
+const SECTION_RULE_RGB: [f32; 3] = [0.20, 0.23, 0.29];
+const LABEL_RGB: [f32; 3] = [0.68, 0.72, 0.78];
+const VALUE_RGB: [f32; 3] = [0.94, 0.94, 0.94];
+const HISTOGRAM_BAR_RGB: [f32; 3] = [0.5, 0.5, 0.5];
+const EMPTY_STATE_TITLE_RGB: [f32; 3] = [0.94, 0.95, 0.97];
+const EMPTY_STATE_HELP_RGB: [f32; 3] = [0.60, 0.64, 0.70];
 
 pub struct OverlayImage {
     pub height: u32,
@@ -17,21 +31,45 @@ pub struct OverlayImage {
     pub width: u32,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct OverlaySection {
     pub title: &'static str,
-    pub rows: Vec<(String, String)>,
+    pub rows: Vec<OverlayRow>,
+}
+
+#[derive(Debug, PartialEq)]
+#[expect(clippy::large_enum_variant)] // An overlay has a handful of rows.
+pub enum OverlayRow {
+    /// A label and its value.
+    Text(String, String),
+    /// A label and a histogram as wide as the value column.
+    Histogram {
+        label: String,
+        bins: Histogram,
+        /// Marked with a solid line.
+        intensity_target: Option<SourceIntensityTarget>,
+    },
 }
 
 #[derive(Clone, Copy)]
 struct OverlayLayout {
     content_width: usize,
+    histogram_height: usize,
     label_width: usize,
     row_ascent: usize,
     row_height: usize,
     title_ascent: usize,
     title_height: usize,
     width: usize,
+}
+
+impl OverlayLayout {
+    fn height_of(self, row: &OverlayRow) -> usize {
+        match row {
+            OverlayRow::Text(..) => self.row_height,
+            OverlayRow::Histogram { .. } => self.histogram_height,
+        }
+    }
 }
 
 pub fn render_text_overlay(sections: &[OverlaySection], scale_factor: f64) -> OverlayImage {
@@ -53,16 +91,20 @@ pub fn render_text_overlay(sections: &[OverlaySection], scale_factor: f64) -> Ov
     let title_metrics = font_line_metrics(font, scale.title_font_px);
     let row_height = ceil_to_usize(line_metrics.new_line_size).max(1);
     let title_height = ceil_to_usize(title_metrics.new_line_size).max(1);
-    let label_width = sections
-        .iter()
-        .flat_map(|section| &section.rows)
-        .map(|(label, _)| text_width(font, label, scale.font_px))
+    let rows = || sections.iter().flat_map(|section| &section.rows);
+    let label_width = rows()
+        .map(|row| {
+            let (OverlayRow::Text(label, _) | OverlayRow::Histogram { label, .. }) = row;
+            text_width(font, label, scale.font_px)
+        })
         .max()
         .unwrap_or(1);
-    let value_width = sections
-        .iter()
-        .flat_map(|section| &section.rows)
-        .map(|(_, value)| text_width(font, value, scale.font_px))
+    let value_width = rows()
+        .filter_map(|row| match row {
+            OverlayRow::Text(_, value) => Some(text_width(font, value, scale.font_px)),
+            // Takes the width of the widest value.
+            OverlayRow::Histogram { .. } => None,
+        })
         .max()
         .unwrap_or(1);
     let table_width = label_width + scale.column_gap + value_width;
@@ -73,21 +115,9 @@ pub fn render_text_overlay(sections: &[OverlaySection], scale_factor: f64) -> Ov
         .unwrap_or(1);
     let content_width = table_width.max(title_width);
     let width = scale.padding * 2 + content_width;
-    let table_height = sections
-        .iter()
-        .map(|section| section.rows.len() * row_height)
-        .sum::<usize>();
-    let section_height =
-        title_height + scale.title_rule_gap + scale.rule_thickness + scale.rule_row_gap;
-    let height = scale.padding * 2
-        + table_height
-        + sections.len() * section_height
-        + sections.len().saturating_sub(1) * scale.section_gap;
-    let mut pixels = vec![0.0_f32; width * height * 4];
-    fill(&mut pixels, [0.012, 0.012, 0.012, 0.84]);
-
     let layout = OverlayLayout {
         content_width,
+        histogram_height: row_height * 3,
         label_width,
         row_ascent: ceil_to_usize(line_metrics.ascent),
         row_height,
@@ -95,6 +125,16 @@ pub fn render_text_overlay(sections: &[OverlaySection], scale_factor: f64) -> Ov
         title_height,
         width,
     };
+    let table_height = rows().map(|row| layout.height_of(row)).sum::<usize>();
+    let section_height =
+        title_height + scale.title_rule_gap + scale.rule_thickness + scale.rule_row_gap;
+    let height = scale.padding * 2
+        + table_height
+        + sections.len() * section_height
+        + sections.len().saturating_sub(1) * scale.section_gap;
+    let mut pixels = vec![0.0_f32; width * height * 4];
+    fill(&mut pixels, PANEL_RGBA);
+
     let mut y = scale.padding;
     for (section_index, section) in sections.iter().enumerate() {
         if section_index > 0 {
@@ -126,21 +166,22 @@ fn draw_overlay_section(
         y + layout.title_ascent,
         section.title,
         scale.title_font_px,
-        [0.82, 0.86, 0.94],
+        SECTION_TITLE_RGB,
     );
     y += layout.title_height + scale.title_rule_gap;
-    draw_horizontal_rule(
+    fill_rectangle(
         pixels,
         layout.width,
-        scale.padding,
-        y,
-        layout.content_width,
-        scale.rule_thickness,
+        (scale.padding, y),
+        (layout.content_width, scale.rule_thickness),
+        SECTION_RULE_RGB,
     );
     y += scale.rule_thickness + scale.rule_row_gap;
 
-    for (row_index, (label, value)) in section.rows.iter().enumerate() {
-        let baseline = y + row_index * layout.row_height + layout.row_ascent;
+    let value_x = scale.padding + layout.label_width + scale.column_gap;
+    for row in &section.rows {
+        let (OverlayRow::Text(label, _) | OverlayRow::Histogram { label, .. }) = row;
+        let baseline = y + layout.row_ascent;
         draw_text(
             pixels,
             layout.width,
@@ -148,19 +189,97 @@ fn draw_overlay_section(
             baseline,
             label,
             scale.font_px,
-            [0.68, 0.72, 0.78],
+            LABEL_RGB,
         );
-        draw_text(
+        match row {
+            OverlayRow::Text(_, value) => draw_text(
+                pixels,
+                layout.width,
+                value_x,
+                baseline,
+                value,
+                scale.font_px,
+                VALUE_RGB,
+            ),
+            OverlayRow::Histogram {
+                bins,
+                intensity_target,
+                ..
+            } => draw_histogram(pixels, bins, *intensity_target, scale, layout, (value_x, y)),
+        }
+        y += layout.height_of(row);
+    }
+    y
+}
+
+/// Draws the bars of a histogram row from `x` to the right edge of the rows,
+/// and its markings over them: a dashed line at reference white and at each
+/// stop above it, and a solid line at the end of the intensity target's bin.
+#[expect(clippy::cast_precision_loss)] // A few hundred pixels and 125 bins.
+fn draw_histogram(
+    pixels: &mut [f32],
+    bins: &Histogram,
+    intensity_target: Option<SourceIntensityTarget>,
+    scale: &UiScale,
+    layout: OverlayLayout,
+    (x, y): (usize, usize),
+) {
+    let width = scale.padding + layout.content_width - x;
+    let top = y + scale.histogram_inset;
+    let height = layout.histogram_height - 2 * scale.histogram_inset;
+    // The axis ends at the peak of PQ, inside the last bin.
+    let end = histogram_position(f64::from(PQ_PEAK_NITS));
+    let x_at = |position: f32| x + ceil_to_usize(width as f32 * (position / end).clamp(0.0, 1.0));
+    let largest = bins.iter().copied().max().unwrap_or(0);
+    for (bin, count) in bins.iter().enumerate() {
+        let bar_height = histogram_bar_height(*count, largest, height);
+        let left = x_at(bin as f32);
+        fill_rectangle(
             pixels,
             layout.width,
-            scale.padding + layout.label_width + scale.column_gap,
-            baseline,
-            value,
-            scale.font_px,
-            [0.94, 0.94, 0.94],
+            (left, top + height - bar_height),
+            (x_at((bin + 1) as f32) - left, bar_height),
+            HISTOGRAM_BAR_RGB,
         );
     }
-    y + section.rows.len() * layout.row_height
+    let mut draw_line = |position: f32, dash: usize| {
+        // A line at the end of the axis stays inside the histogram.
+        let line_x = x_at(position).min(x + width - scale.rule_thickness);
+        for dash_y in (0..height).step_by(dash * 2) {
+            fill_rectangle(
+                pixels,
+                layout.width,
+                (line_x, top + dash_y),
+                (scale.rule_thickness, dash.min(height - dash_y)),
+                SECTION_RULE_RGB,
+            );
+        }
+    };
+    for bin in (HISTOGRAM_REFERENCE_WHITE_BIN..bins.len()).step_by(HISTOGRAM_BINS_PER_STOP) {
+        draw_line(bin as f32, scale.histogram_dash);
+    }
+    if let Some(target) = intensity_target {
+        // The upper edge of the target's bin, where the bars of content up to
+        // the target end. A dash as long as the line draws it solid.
+        draw_line(histogram_position(target.nits()).ceil(), height);
+    }
+}
+
+/// Where a luminance lies on the axis of the histogram, in bins.
+#[expect(clippy::cast_possible_truncation, clippy::cast_precision_loss)] // A position on an axis of 125 bins.
+fn histogram_position(nits: f64) -> f32 {
+    let stops = (nits / f64::from(HDR_REFERENCE_WHITE_NITS)).log2() as f32;
+    HISTOGRAM_REFERENCE_WHITE_BIN as f32 + HISTOGRAM_BINS_PER_STOP as f32 * stops
+}
+
+/// Scales by the square root of the count, which keeps small bins readable.
+/// Rounding up shows every bin that is not empty.
+#[expect(clippy::cast_precision_loss)] // A bar is a few dozen pixels tall.
+fn histogram_bar_height(count: u64, largest: u64, height: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    ceil_to_usize((count as f32 / largest as f32).sqrt() * height as f32).min(height)
 }
 
 pub fn render_empty_state(scale_factor: f64) -> OverlayImage {
@@ -189,7 +308,7 @@ pub fn render_empty_state(scale_factor: f64) -> OverlayImage {
         title_y + ceil_to_usize(title_metrics.ascent),
         &title,
         scale.title_font_px,
-        [0.94, 0.95, 0.97],
+        EMPTY_STATE_TITLE_RGB,
     );
 
     let help_y = title_y + title_height + scale.title_help_gap;
@@ -200,7 +319,7 @@ pub fn render_empty_state(scale_factor: f64) -> OverlayImage {
         help_y + ceil_to_usize(help_metrics.ascent),
         EMPTY_STATE_HELP,
         scale.help_font_px,
-        [0.60, 0.64, 0.70],
+        EMPTY_STATE_HELP_RGB,
     );
 
     OverlayImage {
@@ -275,6 +394,8 @@ fn srgb_to_linear(encoded: f32) -> f32 {
 struct UiScale {
     column_gap: usize,
     font_px: f32,
+    histogram_dash: usize,
+    histogram_inset: usize,
     padding: usize,
     rule_row_gap: usize,
     rule_thickness: usize,
@@ -290,6 +411,8 @@ fn ui_scale(scale_factor: f64) -> UiScale {
     UiScale {
         column_gap: pixels(24.0),
         font_px: 17.0 * factor,
+        histogram_dash: pixels(3.0),
+        histogram_inset: pixels(4.0),
         padding: pixels(14.0),
         rule_row_gap: pixels(7.0),
         rule_thickness: pixels(1.0).max(1),
@@ -407,19 +530,19 @@ fn fill(pixels: &mut [f32], rgba: [f32; 4]) {
     }
 }
 
-fn draw_horizontal_rule(
+/// Recolors a rectangle and keeps the alpha of the panel under it.
+fn fill_rectangle(
     pixels: &mut [f32],
     canvas_width: usize,
-    x: usize,
-    y: usize,
-    rule_width: usize,
-    thickness: usize,
+    (x, y): (usize, usize),
+    (width, height): (usize, usize),
+    rgb: [f32; 3],
 ) {
     let canvas_height = pixels.len() / 4 / canvas_width;
-    for pixel_y in y..y.saturating_add(thickness).min(canvas_height) {
-        for pixel_x in x..x.saturating_add(rule_width).min(canvas_width) {
+    for pixel_y in y..y.saturating_add(height).min(canvas_height) {
+        for pixel_x in x..x.saturating_add(width).min(canvas_width) {
             let pixel = &mut pixels[(pixel_y * canvas_width + pixel_x) * 4..][..4];
-            pixel[..3].copy_from_slice(&[0.20, 0.23, 0.29]);
+            pixel[..3].copy_from_slice(&rgb);
         }
     }
 }
@@ -447,20 +570,33 @@ fn floor_to_i32(value: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use xl_view::decode::HISTOGRAM_BINS;
+
     use super::*;
+
+    #[test]
+    fn empty_state_background_matches_the_overlay_panel() {
+        let shader = include_str!("shaders/presentation.wgsl");
+        let expected = format!("const EMPTY_STATE_GREY: f32 = {:?};", PANEL_RGBA[0]);
+        assert!(
+            shader.contains(&expected),
+            "shader must contain `{expected}` to match the panel grey",
+        );
+    }
+
+    fn text(label: &str, value: &str) -> OverlayRow {
+        OverlayRow::Text(label.to_owned(), value.to_owned())
+    }
 
     fn sections() -> Vec<OverlaySection> {
         vec![
             OverlaySection {
                 title: "IMAGE",
-                rows: vec![
-                    ("File".to_owned(), "photo.jxl".to_owned()),
-                    ("Dimensions".to_owned(), "4000 x 3000".to_owned()),
-                ],
+                rows: vec![text("File", "photo.jxl"), text("Dimensions", "4000 x 3000")],
             },
             OverlaySection {
                 title: "SOURCE",
-                rows: vec![("Range".to_owned(), "HDR (PQ transfer)".to_owned())],
+                rows: vec![text("Range", "HDR (PQ transfer)")],
             },
         ]
     }
@@ -477,12 +613,9 @@ mod tests {
         let image = render_text_overlay(&sections(), 1.0);
         assert!(image.width > 200);
         assert!(image.height > 100);
-        assert!(
-            image
-                .pixels
-                .chunks_exact(4)
-                .any(|pixel| pixel == [0.20, 0.23, 0.29, 0.84])
-        );
+        let [red, green, blue] = SECTION_RULE_RGB;
+        let rule = [red, green, blue, PANEL_RGBA[3]];
+        assert!(image.pixels.chunks_exact(4).any(|pixel| pixel == rule));
         assert!(image.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0.99));
         assert!(
             image
@@ -498,6 +631,76 @@ mod tests {
         let hidpi = render_text_overlay(&sections(), 2.0);
         assert_eq!(hidpi.width, normal.width * 2);
         assert_eq!(hidpi.height, normal.height * 2);
+    }
+
+    #[test]
+    fn histogram_row_is_taller_than_a_text_row_and_fills_the_value_column() {
+        let render = |row| {
+            let mut sections = sections();
+            sections[1].rows.push(row);
+            render_text_overlay(&sections, 1.0)
+        };
+        let histogram = |bins, intensity_target| {
+            render(OverlayRow::Histogram {
+                label: "Histogram".to_owned(),
+                bins,
+                intensity_target,
+            })
+        };
+        let count = |image: &OverlayImage, rgb: [f32; 3]| {
+            let pixels = image.pixels.chunks_exact(4);
+            pixels.filter(|pixel| pixel[..3] == rgb).count()
+        };
+        // Bar pixels in one column of the panel.
+        let bar_height = |image: &OverlayImage, x: usize| {
+            let rows = image.pixels.chunks_exact(usize_from_u32(image.width) * 4);
+            rows.filter(|row| row[x * 4..][..3] == HISTOGRAM_BAR_RGB)
+                .count()
+        };
+        let text_row = render(text("Histogram", "1000 nits"));
+        // The darkest bins, the one of 1,000 nits and the brightest one, away
+        // from the dashed lines.
+        let mut bins = [0; HISTOGRAM_BINS];
+        bins[0] = 4;
+        bins[1] = 1;
+        bins[HISTOGRAM_REFERENCE_WHITE_BIN + 18] = 4;
+        bins[HISTOGRAM_BINS - 1] = 4;
+        let plain = histogram(bins, None);
+        let scale = ui_scale(1.0);
+        let width = usize_from_u32(plain.width);
+
+        assert!(plain.height > text_row.height);
+        // The histogram takes the width of the values and adds none.
+        assert_eq!(plain.width, text_row.width);
+        assert_eq!(count(&text_row, HISTOGRAM_BAR_RGB), 0);
+        // The last bar ends at the right edge of the rows.
+        let tallest = bar_height(&plain, width - scale.padding - 1);
+        assert_ne!(tallest, 0);
+        assert_eq!(bar_height(&plain, width - scale.padding), 0);
+        let first = (0..width).find(|x| bar_height(&plain, *x) > 0).unwrap();
+        assert_eq!(bar_height(&plain, first), tallest);
+        // A quarter of the largest count is half as tall.
+        let second = (first..width)
+            .find(|x| bar_height(&plain, *x) < tallest)
+            .unwrap();
+        assert_eq!(bar_height(&plain, second), tallest.div_ceil(2));
+        // Beside the two section rules, the markings are six dashed lines and
+        // a solid line for the intensity target.
+        let section_rules = 2 * (width - 2 * scale.padding) * scale.rule_thickness;
+        let dashed = count(&plain, SECTION_RULE_RGB) - section_rules;
+        let solid = tallest * scale.rule_thickness;
+        assert!(2 * solid < dashed && dashed < 4 * solid);
+        let marked = histogram(bins, SourceIntensityTarget::new(1_000.0));
+        assert_eq!(
+            count(&marked, SECTION_RULE_RGB) - section_rules,
+            dashed + solid
+        );
+        // The solid line stands at the end of the bar of the target's bin and
+        // covers none of it.
+        assert_eq!(
+            count(&marked, HISTOGRAM_BAR_RGB),
+            count(&plain, HISTOGRAM_BAR_RGB)
+        );
     }
 
     #[test]

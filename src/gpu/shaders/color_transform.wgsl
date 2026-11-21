@@ -110,8 +110,11 @@ const ICTCP_TO_LMS_PRIME = mat3x3f(
     vec3f(0.1110296, -0.1110296, -0.3206272),
 );
 
+// Mirrors BT2020_LUMA in color.rs.
+const BT2020_LUMA = vec3f(0.2627, 0.678, 0.0593);
+
 fn luma_bt2020(rgb: vec3f) -> f32 {
-    return dot(rgb, vec3f(0.2627, 0.6780, 0.0593));
+    return dot(rgb, BT2020_LUMA);
 }
 
 fn luma_bt709(rgb: vec3f) -> f32 {
@@ -138,7 +141,10 @@ fn tone_map_pq_hermite(
     source_peak_pq: f32,
     output_peak_pq: f32,
 ) -> f32 {
-    if source_peak_nits <= display_peak_nits { return value; }
+    // The source peak leaves out the brightest pixels, which can exceed the
+    // display peak while the curve is off. They clip like the curve does when
+    // the source peak approaches the display peak from above.
+    if source_peak_nits <= display_peak_nits { return min(value, display_peak_nits); }
     if value >= source_peak_nits { return display_peak_nits; }
 
     let input = pq_oetf_scalar(value / PQ_PEAK_NITS) / source_peak_pq;
@@ -173,10 +179,11 @@ fn tone_map_bt2020_max_rgb(
     source_peak_pq: f32,
     output_peak_pq: f32,
 ) -> vec3f {
-    if source_peak_nits <= display_peak_nits { return rgb_nits; }
-
     let maximum = max(rgb_nits.r, max(rgb_nits.g, rgb_nits.b));
     if maximum <= 0.0 { return rgb_nits; }
+    if source_peak_nits <= display_peak_nits && maximum <= display_peak_nits {
+        return rgb_nits;
+    }
 
     let mapped_maximum = tone_map_pq_hermite(
         maximum,

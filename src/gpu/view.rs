@@ -45,8 +45,21 @@ impl ViewTransform {
         view
     }
 
+    /// The center to render from. At scale 1.0 it is snapped so image pixel
+    /// centers land on screen pixel centers, and bilinear sampling copies
+    /// pixels exactly instead of averaging neighbors.
     pub fn center(self) -> PhysicalPosition<f64> {
-        self.center
+        if self.scale.to_bits() != 1.0_f64.to_bits() {
+            return self.center;
+        }
+        let snap = |center: f64, viewport: u32| {
+            let half_viewport = f64::from(viewport) / 2.0;
+            (center - half_viewport).round() + half_viewport
+        };
+        PhysicalPosition::new(
+            snap(self.center.x, self.viewport.width),
+            snap(self.center.y, self.viewport.height),
+        )
     }
 
     pub fn scale(self) -> f64 {
@@ -106,9 +119,12 @@ impl ViewTransform {
             self.set_fit();
             return true;
         }
+        // Anchor on the rendered center, which is snapped at 1:1, so the
+        // image point shown under the cursor stays there.
+        let rendered_center = self.center();
         let image_at_cursor = PhysicalPosition::new(
-            self.center.x + (cursor.x - f64::from(self.viewport.width) / 2.0) / old_scale,
-            self.center.y + (cursor.y - f64::from(self.viewport.height) / 2.0) / old_scale,
+            rendered_center.x + (cursor.x - f64::from(self.viewport.width) / 2.0) / old_scale,
+            rendered_center.y + (cursor.y - f64::from(self.viewport.height) / 2.0) / old_scale,
         );
         // Fit can already exceed the usual absolute limit for tiny images. Base the manual limit
         // on both values so the first zoom-in never makes a fitted image smaller.
@@ -193,6 +209,54 @@ mod tests {
         let view = ViewTransform::fit(PhysicalSize::new(4000, 2000), PhysicalSize::new(1000, 1000));
         assert_near(view.scale(), 0.25);
         assert_eq!(view.center(), PhysicalPosition::new(2000.0, 1000.0));
+    }
+
+    #[test]
+    fn one_to_one_puts_image_pixels_on_screen_pixels() {
+        // Screen pixel x samples center - viewport / 2 + x + 0.5, which is an
+        // image pixel center only when center - viewport / 2 is whole.
+        for (viewport, expected) in [
+            (1023, PhysicalPosition::new(2000.5, 1500.5)),
+            (1024, PhysicalPosition::new(2000.0, 1500.0)),
+        ] {
+            let mut view = ViewTransform::fit(
+                PhysicalSize::new(4000, 3000),
+                PhysicalSize::new(viewport, viewport),
+            );
+            view.set_one_to_one(1.0);
+            assert_eq!(view.center(), expected, "{viewport}");
+        }
+    }
+
+    #[test]
+    fn one_to_one_pans_in_whole_pixels_but_keeps_sub_pixel_motion() {
+        let mut view =
+            ViewTransform::fit(PhysicalSize::new(4000, 3000), PhysicalSize::new(1024, 1024));
+        view.set_one_to_one(1.0);
+        view.pan_by(-0.3, 0.0);
+        assert_eq!(view.center(), PhysicalPosition::new(2000.0, 1500.0));
+        for _ in 0..3 {
+            view.pan_by(-0.3, 0.0);
+        }
+        assert_eq!(view.center(), PhysicalPosition::new(2001.0, 1500.0));
+
+        view.set_one_to_one(2.0);
+        view.pan_by(-0.6, 0.0);
+        assert_near(view.center().x, 2001.5);
+    }
+
+    #[test]
+    fn zooming_out_of_one_to_one_keeps_the_shown_point_under_the_cursor() {
+        let mut view =
+            ViewTransform::fit(PhysicalSize::new(4000, 3000), PhysicalSize::new(1023, 767));
+        view.set_one_to_one(1.0);
+        // The odd viewport snaps the rendered center half a pixel.
+        assert_eq!(view.center(), PhysicalPosition::new(2000.5, 1500.5));
+
+        view.zoom_at(PhysicalPosition::new(511.5, 383.5), 2.0);
+
+        assert_near(view.scale(), 2.0);
+        assert_eq!(view.center(), PhysicalPosition::new(2000.5, 1500.5));
     }
 
     #[test]

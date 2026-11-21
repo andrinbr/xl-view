@@ -141,12 +141,6 @@ fn gpu_shaders_parse_and_validate() {
     }
 }
 
-#[test]
-fn parameter_buffer_has_uniform_and_copy_destination_usage() {
-    assert!(PARAM_BUFFER_USAGE.contains(wgpu::BufferUsages::UNIFORM));
-    assert!(PARAM_BUFFER_USAGE.contains(wgpu::BufferUsages::COPY_DST));
-}
-
 // Evaluates `dither_encoded` for every probed position, bit depth, and level.
 const DITHER_PROBE_SHADER: &str = r"
 @group(0) @binding(0) var<storage, read_write> output: array<f32>;

@@ -9,7 +9,6 @@ fn hash_to_unit(x: u32, y: u32, channel: u32, phase: u32) -> f32 {
 }
 
 fn dither_noise(position: vec2u, channel: u32, bits: u32) -> f32 {
-    if bits == 0u { return 0.0; }
     let levels = f32((1u << bits) - 1u);
     return (hash_to_unit(position.x, position.y, channel, 0u)
         - hash_to_unit(position.x, position.y, channel, 1u)) / levels;

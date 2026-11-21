@@ -3,8 +3,8 @@
 The macOS release is an unsigned Apple silicon (ARM64) DMG containing
 `XL-View.app`.
 
-With the configured Rust toolchain available, run these commands from the
-repository root:
+To build the package, use macOS 13 or later and the configured Rust toolchain.
+Run these commands from the repository root:
 
 ```console
 cargo install cargo-packager --version 0.11.8 --locked

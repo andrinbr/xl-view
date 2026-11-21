@@ -17,5 +17,5 @@ pub(super) fn request_native_test_gpu(
     let mut device_descriptor = wgpu::DeviceDescriptor::default();
     device_descriptor.required_features |= required_features;
     pollster::block_on(adapter.request_device(&device_descriptor))
-        .unwrap_or_else(|error| panic!("cannot create device for {requirement}: {error}"))
+        .unwrap_or_else(|error| panic!("failed to create device for {requirement}: {error}"))
 }

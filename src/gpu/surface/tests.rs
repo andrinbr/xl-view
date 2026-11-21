@@ -312,7 +312,7 @@ fn resampling_reserves_gpu_memory_before_tiles() {
     let one_tile = rgba16f_texture_budget_bytes(
         tile_texture_extent(),
         tile_texture_extent(),
-        mip_level_count(tile_texture_extent(), tile_texture_extent()),
+        crate::gpu::tiles::TILE_MIP_LEVEL_COUNT,
         1,
     );
     assert_eq!(maximum_capacity(100, one_tile - 1, u32::MAX), 0);
@@ -401,6 +401,138 @@ fn tiled_shader_matches_continuous_sampling_across_boundaries() {
                 );
             }
         }
+    }
+}
+
+#[test]
+#[ignore = "requires a native GPU adapter for offscreen image-edge execution"]
+fn a_fragment_on_the_far_image_edge_shows_the_background() {
+    // Five tiles: above 2,048 pixels an f32 epsilon below the extent rounds
+    // back to the extent, so only a half-open test keeps the tile index valid.
+    const IMAGE_WIDTH: u32 = TILE_SIZE * 5;
+    const IMAGE_HEIGHT: u32 = 2;
+    const SCALE: f64 = 0.25;
+    // At this scale the centered image spans viewport pixels 0 to 639, and
+    // pixel 640 is centered exactly on the image's right edge.
+    const VIEWPORT_WIDTH: u32 = 641;
+    const EDGE_PIXEL: usize = 640;
+
+    let (device, queue) = request_native_test_gpu(
+        crate::gpu::native_backends(),
+        wgpu::Features::empty(),
+        "image-edge test requires a native GPU adapter",
+    );
+    let fixture =
+        [0.5, 0.25, 0.75, 1.0].repeat(usize::try_from(IMAGE_WIDTH * IMAGE_HEIGHT).unwrap());
+    let cache =
+        TileCache::from_canonical_pixels(&device, &queue, &fixture, IMAGE_WIDTH, IMAGE_HEIGHT);
+    let mut view = ViewTransform::fit(
+        PhysicalSize::new(IMAGE_WIDTH, IMAGE_HEIGHT),
+        PhysicalSize::new(VIEWPORT_WIDTH, 1),
+    );
+    view.set_one_to_one(SCALE);
+
+    for (path, canonical_pixels, tiled_resources) in [
+        ("coarse", Some(fixture.as_slice()), None),
+        ("tiled", None, Some(&cache)),
+    ] {
+        let actual = render_offscreen_scene(
+            &device,
+            &queue,
+            SurfaceColorSpace::Srgb,
+            TextureFormat::Rgba8UnormSrgb,
+            HDR_REFERENCE_WHITE_NITS,
+            BackgroundMode::Black,
+            0.0,
+            HDR_REFERENCE_WHITE_NITS,
+            canonical_pixels,
+            None,
+            tiled_resources,
+            (IMAGE_WIDTH, IMAGE_HEIGHT),
+            (VIEWPORT_WIDTH, 1),
+            Some(view),
+        );
+        for pixel in [0, EDGE_PIXEL - 1] {
+            assert!(
+                actual[pixel][..3].iter().all(|&channel| channel > 0.1),
+                "{path} pixel {pixel} should show the image: {:?}",
+                actual[pixel],
+            );
+        }
+        assert!(
+            actual[EDGE_PIXEL][..3]
+                .iter()
+                .all(|&channel| channel == 0.0),
+            "{path} pixel {EDGE_PIXEL} should show the background: {:?}",
+            actual[EDGE_PIXEL],
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a native GPU adapter for offscreen 1:1 sampling execution"]
+fn one_to_one_copies_image_pixels_exactly() {
+    const IMAGE_WIDTH: u32 = 8;
+    const IMAGE_HEIGHT: u32 = 2;
+    // An odd viewport puts the unsnapped centers between image pixels.
+    const VIEWPORT_WIDTH: u32 = 7;
+    const TOLERANCE: f32 = 2.0 / 255.0;
+
+    let (device, queue) = request_native_test_gpu(
+        crate::gpu::native_backends(),
+        wgpu::Features::empty(),
+        "1:1 sampling test requires a native GPU adapter",
+    );
+    // One-pixel black and white columns: averaging neighbors gives gray.
+    let fixture = (0..IMAGE_WIDTH * IMAGE_HEIGHT)
+        .flat_map(|index| {
+            let level = f32::from(u8::try_from(index % IMAGE_WIDTH % 2).unwrap());
+            [level, level, level, 1.0]
+        })
+        .collect::<Vec<_>>();
+    let cache =
+        TileCache::from_canonical_pixels(&device, &queue, &fixture, IMAGE_WIDTH, IMAGE_HEIGHT);
+    let mut view = ViewTransform::fit(
+        PhysicalSize::new(IMAGE_WIDTH, IMAGE_HEIGHT),
+        PhysicalSize::new(VIEWPORT_WIDTH, 1),
+    );
+    view.set_one_to_one(1.0);
+
+    for (path, canonical_pixels, tiled_resources) in [
+        ("coarse", Some(fixture.as_slice()), None),
+        ("tiled", None, Some(&cache)),
+    ] {
+        let actual = render_offscreen_scene(
+            &device,
+            &queue,
+            SurfaceColorSpace::Srgb,
+            TextureFormat::Rgba8UnormSrgb,
+            HDR_REFERENCE_WHITE_NITS,
+            BackgroundMode::Black,
+            0.0,
+            HDR_REFERENCE_WHITE_NITS,
+            canonical_pixels,
+            None,
+            tiled_resources,
+            (IMAGE_WIDTH, IMAGE_HEIGHT),
+            (VIEWPORT_WIDTH, 1),
+            Some(view),
+        );
+        for (x, pixel) in actual.iter().enumerate() {
+            let expected = if pixel[0] > 0.5 { 1.0 } else { 0.0 };
+            assert!(
+                pixel[..3]
+                    .iter()
+                    .all(|&channel| (channel - expected).abs() <= TOLERANCE),
+                "{path} pixel {x} should be black or white: {pixel:?}",
+            );
+        }
+        assert!(
+            actual
+                .windows(2)
+                .all(|pair| (pair[0][0] - pair[1][0]).abs() > 0.5),
+            "{path} columns should alternate: {actual:?}",
+        );
     }
 }
 
@@ -498,6 +630,7 @@ fn offscreen_shader_pixels_match_cpu_reference() {
     assert_exposure_matches_reference(&gpu, &luminance_fixture);
     assert_hdr_color_mapping_matches_reference(&gpu);
     assert_alpha_compositing_matches_reference(&gpu);
+    assert_exposure_leaves_the_background_unexposed(&gpu);
     assert_transparent_pixels_use_background(&gpu);
     assert_ui_composition_matches_reference(&gpu, &luminance_fixture);
     assert_sdr_white_matches_reference(&gpu);
@@ -709,25 +842,31 @@ fn assert_hdr_color_mapping_matches_reference(gpu: &OffscreenTestGpu) {
             tolerance: 2.0 / 255.0,
         },
     ] {
-        let actual = gpu.render(OffscreenRenderRequest {
-            color_space: case.color_space,
-            format: case.format,
-            peak_nits: case.peak_nits,
-            background: BackgroundMode::Black,
-            source_peak_nits: HLG_PATTERN_SOURCE_PEAK_NITS,
-            canonical_pixels: Some(&fixture),
-            ui_pixel: None,
-            tiled_resources: None,
-        });
-        let reference = output_reference(case, 1_000.0);
-        for (index, rgb) in colors_nits.into_iter().enumerate() {
-            let working = rgb.map(|channel| f64::from(channel / HDR_REFERENCE_WHITE_NITS));
-            assert_rgba_close(
-                &format!("{:?} HDR color {index}", case.color_space),
-                &actual[index],
-                reference.transform([working[0], working[1], working[2], 1.0]),
-                case.tolerance,
-            );
+        // At the display peak the curve is off, and brighter colors still clip.
+        for source_peak_nits in [HLG_PATTERN_SOURCE_PEAK_NITS, case.peak_nits] {
+            let actual = gpu.render(OffscreenRenderRequest {
+                color_space: case.color_space,
+                format: case.format,
+                peak_nits: case.peak_nits,
+                background: BackgroundMode::Black,
+                source_peak_nits,
+                canonical_pixels: Some(&fixture),
+                ui_pixel: None,
+                tiled_resources: None,
+            });
+            let reference = output_reference(case, source_peak_nits);
+            for (index, rgb) in colors_nits.into_iter().enumerate() {
+                let working = rgb.map(|channel| f64::from(channel / HDR_REFERENCE_WHITE_NITS));
+                assert_rgba_close(
+                    &format!(
+                        "{:?} source peak {source_peak_nits}, HDR color {index}",
+                        case.color_space
+                    ),
+                    &actual[index],
+                    reference.transform([working[0], working[1], working[2], 1.0]),
+                    case.tolerance,
+                );
+            }
         }
     }
 }
@@ -768,6 +907,56 @@ fn assert_alpha_compositing_matches_reference(gpu: &OffscreenTestGpu) {
             &actual[x],
             reference.transform([composite[0], composite[1], composite[2], 1.0]),
             2.0 / 255.0,
+        );
+    }
+}
+
+fn assert_exposure_leaves_the_background_unexposed(gpu: &OffscreenTestGpu) {
+    const EXPOSURE_STOPS: f32 = -1.0;
+    const SOURCE_PEAK_NITS: f32 = 1_000.0;
+    const BACKGROUND: f64 = 0.18;
+    let mut fixture =
+        vec![0.0_f32; usize::try_from(OFFSCREEN_WIDTH * OFFSCREEN_HEIGHT * 4).unwrap()];
+    for row in 0..usize::try_from(OFFSCREEN_HEIGHT).unwrap() {
+        for (x, alpha) in [0.0, 0.5, 1.0].into_iter().enumerate() {
+            let offset = (row * usize::try_from(OFFSCREEN_WIDTH).unwrap() + x) * 4;
+            fixture[offset..offset + 4].copy_from_slice(&[1.0, 0.0, 0.0, alpha]);
+        }
+    }
+    let case = OffscreenOutputCase {
+        color_space: SurfaceColorSpace::Srgb,
+        format: TextureFormat::Rgba8UnormSrgb,
+        encoding: OutputEncoding::SdrSrgbHardware,
+        peak_nits: HDR_REFERENCE_WHITE_NITS,
+        tolerance: 2.0 / 255.0,
+    };
+    let actual = gpu.render_with_exposure(
+        OffscreenRenderRequest {
+            color_space: case.color_space,
+            format: case.format,
+            peak_nits: case.peak_nits,
+            background: BackgroundMode::MiddleGray,
+            source_peak_nits: SOURCE_PEAK_NITS,
+            canonical_pixels: Some(&fixture),
+            ui_pixel: None,
+            tiled_resources: None,
+        },
+        EXPOSURE_STOPS,
+    );
+    let reference = OutputTransform {
+        exposure_stops: f64::from(EXPOSURE_STOPS),
+        ..output_reference(case, SOURCE_PEAK_NITS)
+    };
+    // The reference exposes all of its input. Dividing the background by the
+    // exposure scale cancels that, so only the image is exposed.
+    let background = BACKGROUND / f64::from(EXPOSURE_STOPS).exp2();
+    for (x, alpha) in [0.0, 0.5, 1.0].into_iter().enumerate() {
+        let composite = composite_linear([1.0, 0.0, 0.0, alpha], [background; 3]);
+        assert_rgba_close(
+            &format!("alpha {alpha} at {EXPOSURE_STOPS:+} stops over middle gray"),
+            &actual[x],
+            reference.transform([composite[0], composite[1], composite[2], 1.0]),
+            case.tolerance,
         );
     }
 }
@@ -817,6 +1006,15 @@ fn assert_ui_composition_matches_reference(gpu: &OffscreenTestGpu, fixture: &[f3
             format: TextureFormat::Rgb10a2Unorm,
             encoding: OutputEncoding::Pq,
             peak_nits: 600.0,
+            tolerance: 2.0 / 1_023.0,
+        },
+        // A macOS PQ target can lie below reference white. UI white then
+        // sits at the output peak, like the white of an SDR image.
+        OffscreenOutputCase {
+            color_space: SurfaceColorSpace::Bt2100Pq,
+            format: TextureFormat::Rgb10a2Unorm,
+            encoding: OutputEncoding::Pq,
+            peak_nits: 100.0,
             tolerance: 2.0 / 1_023.0,
         },
         OffscreenOutputCase {
@@ -1061,7 +1259,7 @@ fn assert_measured_linear_peak_reaches_presentation(gpu: &OffscreenTestGpu) {
 fn output_reference(case: OffscreenOutputCase, source_peak_nits: f32) -> OutputTransform {
     OutputTransform {
         encoding: case.encoding,
-        source_intensity_target: SourceIntensityTarget::new(f64::from(source_peak_nits)).unwrap(),
+        source_peak: SourceIntensityTarget::new(f64::from(source_peak_nits)).unwrap(),
         output_peak: OutputPeak::new(f64::from(case.peak_nits)).unwrap(),
         exposure_stops: 0.0,
     }
@@ -1093,14 +1291,14 @@ fn render_offscreen_scene(
     viewport_dimensions: (u32, u32),
     view_transform: Option<ViewTransform>,
 ) -> Vec<[f32; 4]> {
-    const BYTES_PER_ROW: u32 = 256;
     let (image_width, image_height) = image_dimensions;
     let (viewport_width, viewport_height) = viewport_dimensions;
     let pixel_bytes = match format {
         TextureFormat::Rgba8UnormSrgb | TextureFormat::Rgb10a2Unorm => 4,
         _ => unreachable!("offscreen test used unsupported target format"),
     };
-    assert!(viewport_width * pixel_bytes <= BYTES_PER_ROW);
+    let bytes_per_row =
+        (viewport_width * pixel_bytes).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let candidate = SurfaceCandidate {
         color_space,
         format,
@@ -1172,7 +1370,7 @@ fn render_offscreen_scene(
     });
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("offscreen color reference readback"),
-        size: u64::from(BYTES_PER_ROW * viewport_height),
+        size: u64::from(bytes_per_row * viewport_height),
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -1207,7 +1405,7 @@ fn render_offscreen_scene(
             buffer: &readback,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(BYTES_PER_ROW),
+                bytes_per_row: Some(bytes_per_row),
                 rows_per_image: Some(viewport_height),
             },
         },
@@ -1291,11 +1489,11 @@ fn gpu_failures_have_actionable_messages() {
 
 #[test]
 fn gain_map_images_use_their_sdr_base_until_the_surface_is_hdr() {
-    assert!(!prefers_hdr_rendition(OutputMode::Auto, false));
-    assert!(prefers_hdr_rendition(OutputMode::Auto, true));
-    assert!(!prefers_hdr_rendition(OutputMode::Sdr, false));
+    assert_eq!(gain_map_rendition(OutputMode::Auto, false), Rendition::Sdr);
+    assert_eq!(gain_map_rendition(OutputMode::Auto, true), Rendition::Hdr);
+    assert_eq!(gain_map_rendition(OutputMode::Sdr, false), Rendition::Sdr);
     // Forced PQ may start on an SDR surface until Wayland identifies the
     // window's output, but it never stays there.
-    assert!(prefers_hdr_rendition(OutputMode::Pq, false));
-    assert!(prefers_hdr_rendition(OutputMode::Pq, true));
+    assert_eq!(gain_map_rendition(OutputMode::Pq, false), Rendition::Hdr);
+    assert_eq!(gain_map_rendition(OutputMode::Pq, true), Rendition::Hdr);
 }

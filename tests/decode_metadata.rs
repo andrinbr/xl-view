@@ -1,4 +1,6 @@
-use xl_view::decode::{DecodeError, DecodeLimits, DecodeResult, decode_file, decode_memory};
+use xl_view::decode::{
+    DecodeError, DecodeLimits, DecodeResult, DecodedImage, decode_file, decode_memory,
+};
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(
@@ -37,6 +39,15 @@ fn xmp() -> &'static [u8] {
     br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="3"/></rdf:RDF></x:xmpmeta>"#
 }
 
+/// The parse error recorded for the EXIF or XMP box of type `ty`.
+fn metadata_error(image: &DecodedImage, ty: [u8; 4]) -> Option<String> {
+    if ty == *b"Exif" {
+        image.metadata.exif.as_ref()?.parse_error.clone()
+    } else {
+        image.metadata.xmp.as_ref()?.parse_error.clone()
+    }
+}
+
 fn decode_file_bytes(bytes: &[u8], name: &str) -> DecodeResult {
     let path = std::env::temp_dir().join(format!("xl-view-{name}-{}.jxl", std::process::id()));
     std::fs::write(&path, bytes).unwrap();
@@ -57,20 +68,19 @@ fn eof_metadata_limit_includes_buffered_bytes() {
         // Complete but invalid TIFF/XML remains a nonfatal parse error.
         assert!(decode_memory(&bytes, limits).is_ok());
 
+        // One byte more is skipped with an error, and the image still shows.
         let mut bytes = base.clone();
         append_box(&mut bytes, ty, &[0; 1025], true);
-        assert!(matches!(
-            decode_memory(&bytes, limits),
-            Err(DecodeError::MetadataMemoryLimit {
-                required: 1025,
-                limit: 1024
-            })
-        ));
+        let decoded = decode_memory(&bytes, limits).unwrap();
+        assert_eq!(
+            metadata_error(&decoded, ty).as_deref(),
+            Some("the box is larger than the 1024-byte limit")
+        );
     }
 }
 
 #[test]
-fn large_sparse_eof_metadata_is_rejected_with_a_typed_limit() {
+fn large_sparse_eof_metadata_stops_reading_at_the_limit() {
     use std::io::Write;
 
     let mut bytes = container(&fixture("linear-bt2020.jxl"));
@@ -85,8 +95,9 @@ fn large_sparse_eof_metadata_is_rejected_with_a_typed_limit() {
     drop(file);
     let result = decode_file(&path, DecodeLimits::from_memory_ceiling_mib(1));
     std::fs::remove_file(path).unwrap();
-    assert!(
-        matches!(result, Err(DecodeError::MetadataMemoryLimit { required, limit }) if required == limit + 1 && limit == 1024 * 1024)
+    assert_eq!(
+        metadata_error(&result.unwrap(), *b"xml ").as_deref(),
+        Some("the box is larger than the 1048576-byte limit")
     );
 }
 
@@ -210,12 +221,38 @@ fn incomplete_metadata_never_publishes_pixels_or_partial_payloads() {
             Err(DecodeError::Decoder(_))
         ));
     }
-    let mut bytes = container(&raw);
-    append_box(&mut bytes, *b"brob", b"xml invalid brotli", true);
-    assert!(matches!(
-        decode_memory(&bytes, limits()),
-        Err(DecodeError::Decoder(_))
-    ));
+}
+
+#[test]
+fn unreadable_metadata_boxes_leave_the_image_showing() {
+    // Brotli stream generated with `brotli -q 11 -w 24` from 32 MiB of zeros.
+    let zeros = include_bytes!("fixtures/zeros-32mib.br");
+    for (ty, compressed, payload, error) in [
+        (
+            *b"Exif",
+            false,
+            &b"\0\0"[..],
+            "the box is shorter than its TIFF offset",
+        ),
+        (
+            *b"xml ",
+            true,
+            &b"invalid brotli"[..],
+            "compressed box: invalid data",
+        ),
+        // Decompression stops at the 16 MiB EXIF limit instead of
+        // allocating the whole 32 MiB.
+        (*b"Exif", true, &zeros[..], "compressed box: over budget"),
+    ] {
+        let mut bytes = container(&fixture("linear-bt2020.jxl"));
+        if compressed {
+            append_box(&mut bytes, *b"brob", &[&ty[..], payload].concat(), true);
+        } else {
+            append_box(&mut bytes, ty, payload, false);
+        }
+        let decoded = decode_memory(&bytes, limits()).unwrap();
+        assert_eq!(metadata_error(&decoded, ty).as_deref(), Some(error));
+    }
 }
 
 #[test]

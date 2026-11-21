@@ -3,22 +3,13 @@ use std::hash::Hash;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sysinfo::System;
 use xl_view::decode::{DecodedImage, ImageKey, Rendition};
+use xl_view::units::{BYTES_PER_GIB, u64_from_usize};
 
-use xl_view::units::u64_from_usize;
+const MINIMUM_AUTOMATIC_CACHE_BYTES: u64 = 2 * BYTES_PER_GIB;
 
-const GIB: u64 = 1024 * 1024 * 1024;
-const MINIMUM_AUTOMATIC_CACHE_BYTES: u64 = 2 * GIB;
-
-pub(super) fn automatic_decoded_cache_bytes() -> u64 {
-    let mut system = System::new();
-    system.refresh_memory();
-    automatic_decoded_cache_bytes_from_total(system.total_memory())
-}
-
-fn automatic_decoded_cache_bytes_from_total(total_memory: u64) -> u64 {
-    MINIMUM_AUTOMATIC_CACHE_BYTES.max(total_memory / 4)
+pub(super) fn automatic_decoded_cache_bytes(total_memory_bytes: u64) -> u64 {
+    MINIMUM_AUTOMATIC_CACHE_BYTES.max(total_memory_bytes / 4)
 }
 
 #[derive(Debug)]
@@ -247,14 +238,12 @@ mod tests {
 
     #[test]
     fn automatic_limit_is_at_least_two_gib_and_otherwise_one_quarter() {
-        assert_eq!(automatic_decoded_cache_bytes_from_total(0), 2 * GIB);
-        assert_eq!(automatic_decoded_cache_bytes_from_total(4 * GIB), 2 * GIB);
-        assert_eq!(automatic_decoded_cache_bytes_from_total(8 * GIB), 2 * GIB);
-        assert_eq!(automatic_decoded_cache_bytes_from_total(32 * GIB), 8 * GIB);
-        assert_eq!(
-            automatic_decoded_cache_bytes_from_total(128 * GIB),
-            32 * GIB
-        );
+        const GIB: u64 = BYTES_PER_GIB;
+        assert_eq!(automatic_decoded_cache_bytes(0), 2 * GIB);
+        assert_eq!(automatic_decoded_cache_bytes(4 * GIB), 2 * GIB);
+        assert_eq!(automatic_decoded_cache_bytes(8 * GIB), 2 * GIB);
+        assert_eq!(automatic_decoded_cache_bytes(32 * GIB), 8 * GIB);
+        assert_eq!(automatic_decoded_cache_bytes(128 * GIB), 32 * GIB);
     }
 
     #[test]

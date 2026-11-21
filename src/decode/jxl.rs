@@ -1,5 +1,6 @@
+use std::borrow::Cow;
 use std::fs::{self, File, Metadata};
-use std::io::{BufReader, IoSliceMut};
+use std::io::{BufReader, IoSliceMut, Read};
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
@@ -14,32 +15,36 @@ use moxcms::{ColorProfile, DataColorSpace, Layout, TransformF32Executor, Transfo
 use rayon::prelude::*;
 
 use crate::color::{
-    HDR_REFERENCE_WHITE_NITS, PQ_PEAK_NITS, SourceDynamicRange, SourceIntensityTarget,
-    hlg_inverse_oetf, hlg_system_gamma, pq_eotf,
+    BT2020_LUMA_F32, HDR_REFERENCE_WHITE_NITS, PQ_PEAK_NITS, SourceDynamicRange,
+    SourceIntensityTarget, hlg_inverse_oetf, hlg_system_gamma, pq_eotf,
 };
-use crate::metadata::{parse_exif, parse_xmp};
-use crate::units::{u64_from_usize, usize_from_u32};
+use crate::metadata::{ExifMetadata, MAX_METADATA_BYTES, XmpMetadata, parse_exif, parse_xmp};
+use crate::units::{mib_to_bytes, mib_to_usize_bytes, u64_from_usize, usize_from_u32};
 
 use super::gain_map::{self, BaseImage, CaptureInput, GainMap};
 use super::{
     CANONICAL_BYTES_PER_PIXEL, CanonicalPixel, CoarsePixel, DecodeError, DecodeLimits,
-    DecodeResult, DecodedImage, DecodedTileStore, ImageKey, ImageMetadata, LinearUnit, Rendition,
+    DecodeResult, DecodedImage, DecodedTileStore, HISTOGRAM_BINS, HISTOGRAM_BINS_PER_STOP,
+    HISTOGRAM_REFERENCE_WHITE_BIN, Histogram, ImageKey, ImageMetadata, LinearUnit, Rendition,
     SourceColorEncoding, ToneMappingMetadata,
 };
 
-const BT2020_LUMA: [f32; 3] = [0.2627, 0.6780, 0.0593];
 const CHUNK_PIXELS: usize = 65_536;
-const MAX_SCRATCH_BYTES: usize = 32 * 1024 * 1024;
-const MAX_COARSE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SCRATCH_BYTES: usize = mib_to_usize_bytes(32);
+const MAX_COARSE_BYTES: u64 = mib_to_bytes(64);
 const MAX_COARSE_DIMENSION: u32 = 4_096;
-const MAX_TRAILING_METADATA_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TRAILING_METADATA_BYTES: usize = mib_to_usize_bytes(32);
 const XML: JxlAuxBoxType = JxlAuxBoxType(*b"xml ");
+// An Exif box starts with the big-endian offset of its TIFF header.
+const EXIF_OFFSET_BYTES: usize = 4;
 // jxl clamps converted HLG output to this range before f16 storage.
 const HLG_SIGNAL_MIN: f32 = half::f16::from_f32_const(-0.074).to_f32_const();
 const HLG_SIGNAL_MAX: f32 = half::f16::from_f32_const(1.1).to_f32_const();
-// Two RGB buffers plus a row of f64 preview accumulators per worker.
-const WORKER_SCRATCH_BYTES: usize =
-    CHUNK_PIXELS * 6 * size_of::<f32>() + MAX_COARSE_DIMENSION as usize * size_of::<[f64; 4]>();
+// Conversion input and output: two RGB buffers.
+const CONVERSION_FLOATS_PER_PIXEL: usize = 6;
+// The conversion buffers plus a row of f64 preview accumulators per worker.
+const WORKER_SCRATCH_BYTES: usize = CHUNK_PIXELS * CONVERSION_FLOATS_PER_PIXEL * size_of::<f32>()
+    + MAX_COARSE_DIMENSION as usize * size_of::<[f64; 4]>();
 const MAX_WORKERS: usize = MAX_SCRATCH_BYTES / WORKER_SCRATCH_BYTES;
 
 /// Decodes a filesystem source within the supplied limits. A gain map
@@ -240,7 +245,8 @@ fn decode_input(
     {
         return Err(DecodeError::UnsupportedAssociatedAlphaEncoding);
     }
-    let gain_map_budget = gain_map_budget(width, height, limits, maximum_retained_bytes)?;
+    let image_bytes = validate_image_memory(width, height, limits, maximum_retained_bytes)?;
+    let gain_map_budget = gain_map_budget(limits, image_bytes);
     input.set_budget(gain_map_budget);
     let extra_count = info.extra_channels.len();
     decoder
@@ -299,6 +305,7 @@ fn decode_input(
         height,
         source_dynamic_range: source.dynamic_range,
         source_peak: calibrated.source_peak,
+        histogram: calibrated.histogram,
         intensity_target: source.intensity,
         linear_unit: calibrated.linear_unit,
         hdr_source: calibrated.hdr_source,
@@ -308,17 +315,18 @@ fn decode_input(
     }))
 }
 
-/// Checks that the image fits the memory ceiling and returns what it leaves
-/// for a gain map.
-fn gain_map_budget(
+/// Checks that the decoded image and its conversion scratch fit the memory
+/// ceiling, and that a prefetched image fits `maximum_retained_bytes`.
+/// Returns the bytes the image and its scratch need together.
+fn validate_image_memory(
     width: u32,
     height: u32,
     limits: DecodeLimits,
     maximum_retained_bytes: Option<u64>,
-) -> Result<usize, DecodeError> {
+) -> Result<u64, DecodeError> {
     let required = estimated_memory_cost_bytes(width, height)?;
     let required_with_scratch = required
-        .checked_add(estimated_render_scratch_bytes(width, height)?)
+        .checked_add(estimated_conversion_scratch_bytes(width, height)?)
         .ok_or(DecodeError::SizeOverflow)?;
     validate_output_memory(required_with_scratch, limits)?;
     if let Some(available) = maximum_retained_bytes
@@ -329,10 +337,13 @@ fn gain_map_budget(
             available,
         });
     }
-    Ok(usize::try_from(
-        u64_from_usize(limits.memory_ceiling_bytes).saturating_sub(required_with_scratch),
-    )
-    .unwrap_or(usize::MAX))
+    Ok(required_with_scratch)
+}
+
+/// What the image and its scratch leave of the memory ceiling for a gain map.
+fn gain_map_budget(limits: DecodeLimits, image_bytes: u64) -> usize {
+    usize::try_from(u64_from_usize(limits.memory_ceiling_bytes).saturating_sub(image_bytes))
+        .unwrap_or(usize::MAX)
 }
 
 /// Decodes the first displayable frame into a new canonical buffer. Also
@@ -366,18 +377,21 @@ fn finish_metadata(
     limits: DecodeLimits,
 ) -> Result<(), DecodeError> {
     if has_more_frames {
-        return extract_aux_boxes(&decoder, metadata, limits);
+        extract_aux_boxes(&decoder, metadata);
+        return Ok(());
     }
     // Always process, even at external EOF: decoder buffers may hold metadata.
     // The input holds the whole file, and closing it lets EOF end the boxes.
     decoder.close_input();
     expect_event(advance(&mut decoder, input, None, limits)?, Event::Complete)?;
-    extract_aux_boxes(&decoder, metadata, limits)?;
+    extract_aux_boxes(&decoder, metadata);
     if let Some(aux) = decoder.trailing_box() {
         let limit = limits.memory_ceiling_bytes.min(MAX_TRAILING_METADATA_BYTES);
+        let too_large = move |_| Err(format!("the box is larger than the {limit}-byte limit"));
         let mut required = aux.raw_data().len();
         if required > limit {
-            return Err(DecodeError::MetadataMemoryLimit { required, limit });
+            store_aux_box(metadata, aux.box_type(), too_large);
+            return Ok(());
         }
         let mut remaining = Vec::new();
         let mut buffer = [0_u8; 8192];
@@ -393,7 +407,8 @@ fn finish_metadata(
             }
             required += count;
             if required > limit {
-                return Err(DecodeError::MetadataMemoryLimit { required, limit });
+                store_aux_box(metadata, aux.box_type(), too_large);
+                return Ok(());
             }
             remaining
                 .try_reserve(count)
@@ -403,7 +418,9 @@ fn finish_metadata(
                 })?;
             remaining.extend_from_slice(&buffer[..count]);
         }
-        extract_aux_box(aux, &remaining, metadata, limits)?;
+        store_aux_box(metadata, aux.box_type(), |limit| {
+            read_aux_box(aux, &remaining, limit)
+        });
     }
     Ok(())
 }
@@ -683,16 +700,21 @@ impl ColorConversion {
                 .map_err(profile_error)?;
             std::array::from_fn(|channel| bt2020_luminance(&columns[channel * 3..channel * 3 + 3]))
         } else {
-            BT2020_LUMA
+            BT2020_LUMA_F32
         };
         let channels = self.input_channels();
         Ok(pixels
             .par_iter()
             .map(|pixel| {
                 let rgba = pixel.map(|value| half::f16::from_bits(value).to_f32());
+                // Fully transparent pixels never count, in either alpha mode,
+                // as in the measurements of `convert_band`. Color under
+                // alpha 0 is invisible and can be arbitrary, so it must not
+                // change the brightness of the visible image. Opaque images
+                // decode with alpha 1.0.
                 if !rgba[3].is_finite()
+                    || rgba[3] <= 0.0
                     || rgba[..channels].iter().any(|value| !value.is_finite())
-                    || (self.associated && rgba[3] <= 0.0)
                 {
                     return 0.0;
                 }
@@ -712,7 +734,15 @@ impl ColorConversion {
 
     fn normalize(&self, rgb: &mut [f32]) {
         let multiplier = self.hlg_gamma.map_or(self.scale, |gamma| {
-            bt2020_luminance(rgb).max(0.0).powf(gamma - 1.0) * self.scale
+            // Black stays black, as in the shader's `hlg_input_to_canonical`.
+            // Below a target of about 300 nits the system gamma is below 1,
+            // and zero to the power gamma - 1 is infinite.
+            let luminance = bt2020_luminance(rgb);
+            if luminance > 0.0 {
+                luminance.powf(gamma - 1.0) * self.scale
+            } else {
+                0.0
+            }
         });
         for value in rgb {
             *value *= multiplier;
@@ -722,8 +752,8 @@ impl ColorConversion {
 
 fn bt2020_luminance(rgb: &[f32]) -> f32 {
     rgb[0].mul_add(
-        BT2020_LUMA[0],
-        rgb[1].mul_add(BT2020_LUMA[1], rgb[2] * BT2020_LUMA[2]),
+        BT2020_LUMA_F32[0],
+        rgb[1].mul_add(BT2020_LUMA_F32[1], rgb[2] * BT2020_LUMA_F32[2]),
     )
 }
 
@@ -873,6 +903,7 @@ fn conversion_workers(width: u32, height: u32) -> usize {
 struct CalibratedImage {
     store: DecodedTileStore,
     source_peak: SourceIntensityTarget,
+    histogram: Histogram,
     linear_unit: Option<LinearUnit>,
     hdr_source: bool,
 }
@@ -895,8 +926,7 @@ fn calibrate_and_convert(
     } else {
         None
     };
-    let (store, observed_peak) =
-        convert_pixels(pixels, width, height, opaque, &conversion, gain_map)?;
+    let (store, stats) = convert_pixels(pixels, width, height, opaque, &conversion, gain_map)?;
     // The PQ and HLG target only bounds the content. Their pixels may stay far
     // below it or exceed it. HLG decoding still uses the target for its OOTF.
     let source_peak = match source.dynamic_range {
@@ -904,14 +934,92 @@ fn calibrate_and_convert(
         SourceDynamicRange::Sdr
         | SourceDynamicRange::Linear
         | SourceDynamicRange::Pq
-        | SourceDynamicRange::Hlg => measured_source_peak(observed_peak),
+        | SourceDynamicRange::Hlg => measured_source_peak(stats.presentation_peak()),
     };
     Ok(CalibratedImage {
         store,
         source_peak,
+        histogram: stats.histogram,
         linear_unit,
         hdr_source: source.hdr_source(source_peak),
     })
+}
+
+/// What conversion measures from the largest color channel of each visible pixel.
+struct PixelStats {
+    /// The exact maximum, which the bins of the histogram cannot give.
+    peak: f32,
+    histogram: Histogram,
+}
+
+impl PixelStats {
+    const EMPTY: Self = Self {
+        peak: 0.0,
+        histogram: [0; HISTOGRAM_BINS],
+    };
+
+    fn add(&mut self, rgb: &[f32]) {
+        let value = rgb.iter().copied().fold(0.0, f32::max);
+        self.peak = self.peak.max(value);
+        self.histogram[histogram_bin(value)] += 1;
+    }
+
+    fn merge(mut self, other: &Self) -> Self {
+        self.peak = self.peak.max(other.peak);
+        for (count, other) in self.histogram.iter_mut().zip(other.histogram) {
+            *count += other;
+        }
+        self
+    }
+
+    /// The peak for presentation. A few glints would otherwise set the tone
+    /// mapping of the whole image, so the brightest 0.01% of the pixels do not
+    /// count. The histogram places them only to an eighth of a stop: the brightest
+    /// bins are left out whole while they hold no more than that share, and
+    /// the peak is the upper edge of the bin below them. With no bin left out
+    /// it is the exact maximum.
+    fn presentation_peak(&self) -> f32 {
+        let glints = self.histogram.iter().sum::<u64>() / 10_000;
+        let mut brighter = 0;
+        for (bin, count) in self.histogram.iter().enumerate().rev() {
+            if brighter + count > glints {
+                return if brighter == 0 {
+                    self.peak
+                } else {
+                    histogram_bin_end(bin)
+                };
+            }
+            brighter += count;
+        }
+        self.peak
+    }
+}
+
+/// The bin of a working-space value that is not negative. The exponent of its
+/// eighth power counts eighths of a stop, so the bin comes from the float's
+/// bits without a logarithm.
+fn histogram_bin(value: f32) -> usize {
+    const EXPONENT_SHIFT: u32 = f32::MANTISSA_DIGITS - 1;
+    // SDR white is 1.0 only up to the rounding of its color conversion. Half a
+    // step of the stored f16 lower, which is 1/256 in the eighth power, it
+    // counts below reference white.
+    const BELOW_EDGE: f32 = 1.0 - 1.0 / 256.0;
+    // Biased exponent of 1.0, which starts the bins above reference white.
+    let reference_white = usize_from_u32(1.0_f32.to_bits() >> EXPONENT_SHIFT);
+    let square = value * value;
+    let fourth = square * square;
+    let power = fourth * fourth * BELOW_EDGE;
+    let eighths = usize_from_u32(power.to_bits() >> EXPONENT_SHIFT);
+    (eighths + HISTOGRAM_REFERENCE_WHITE_BIN)
+        .saturating_sub(reference_white)
+        .min(HISTOGRAM_BINS - 1)
+}
+
+/// The upper edge of a bin as a working-space value.
+#[expect(clippy::cast_precision_loss)] // A histogram has 125 bins.
+fn histogram_bin_end(bin: usize) -> f32 {
+    let bins = (bin + 1) as f32 - HISTOGRAM_REFERENCE_WHITE_BIN as f32;
+    (bins / HISTOGRAM_BINS_PER_STOP as f32).exp2()
 }
 
 fn convert_pixels(
@@ -921,7 +1029,7 @@ fn convert_pixels(
     opaque: bool,
     conversion: &ColorConversion,
     gain_map: Option<&GainMap>,
-) -> Result<(DecodedTileStore, f32), DecodeError> {
+) -> Result<(DecodedTileStore, PixelStats), DecodeError> {
     let downsample = coarse_downsample(width, height);
     let coarse_width = width.div_ceil(downsample);
     let coarse_height = height.div_ceil(downsample);
@@ -935,7 +1043,7 @@ fn convert_pixels(
     let band_pixels = rows_per_worker
         .checked_mul(usize_from_u32(width))
         .ok_or(DecodeError::SizeOverflow)?;
-    let peak = pixels
+    let stats = pixels
         .par_chunks_mut(band_pixels)
         .zip(preview.par_chunks_mut(coarse_rows_per_worker * usize_from_u32(coarse_width)))
         .enumerate()
@@ -945,7 +1053,7 @@ fn convert_pixels(
                 pixels, preview, width, downsample, opaque, conversion, gain_map,
             )
         })
-        .try_reduce(|| 0.0_f32, |left, right| Ok(left.max(right)))?;
+        .try_reduce(|| PixelStats::EMPTY, |left, right| Ok(left.merge(&right)))?;
     Ok((
         DecodedTileStore::new(
             width,
@@ -956,7 +1064,7 @@ fn convert_pixels(
             preview,
             pixels,
         ),
-        peak,
+        stats,
     ))
 }
 
@@ -969,13 +1077,13 @@ fn convert_band(
     opaque: bool,
     conversion: &ColorConversion,
     gain_map: Option<(&GainMap, usize)>,
-) -> Result<f32, DecodeError> {
+) -> Result<PixelStats, DecodeError> {
     let rows = pixels.len() / usize_from_u32(width);
     let scratch_pixels = pixels.len().min(CHUNK_PIXELS);
     let mut input = allocate_vec::<f32>(scratch_pixels * conversion.input_channels(), false)?;
     let mut output = allocate_vec::<f32>(scratch_pixels * 3, false)?;
     let mut preview = BandPreview::new(preview, width, downsample, opaque)?;
-    let mut peak = 0.0_f32;
+    let mut stats = PixelStats::EMPTY;
     for (chunk_index, chunk) in pixels.chunks_mut(CHUNK_PIXELS).enumerate() {
         let output = &mut output[..chunk.len() * 3];
         conversion.convert_chunk(chunk, &mut input, output)?;
@@ -988,15 +1096,17 @@ fn convert_band(
             } else {
                 finite_alpha(half::f16::from_bits(pixel[3]).to_f32())
             };
+            // Like the calibration in `maximum_luminance`, only visible
+            // pixels count.
             if alpha > 0.0 {
-                peak = rgb.iter().copied().fold(peak, f32::max);
+                stats.add(rgb);
             }
             preview.add(chunk_index * CHUNK_PIXELS + index, rgb, alpha);
             *pixel = pack_premultiplied(rgb, alpha)?;
         }
     }
     preview.finish(rows);
-    Ok(peak)
+    Ok(stats)
 }
 
 // Zero alpha also hides color that is not finite.
@@ -1140,7 +1250,7 @@ fn estimated_memory_cost_bytes(width: u32, height: u32) -> Result<u64, DecodeErr
         .ok_or(DecodeError::SizeOverflow)
 }
 
-fn estimated_render_scratch_bytes(width: u32, height: u32) -> Result<u64, DecodeError> {
+fn estimated_conversion_scratch_bytes(width: u32, height: u32) -> Result<u64, DecodeError> {
     let pixels = checked_pixel_count(width, height)?.min(CHUNK_PIXELS);
     let downsample = coarse_downsample(width, height);
     let row = if downsample == 1 {
@@ -1149,7 +1259,8 @@ fn estimated_render_scratch_bytes(width: u32, height: u32) -> Result<u64, Decode
         usize_from_u32(width.div_ceil(downsample)) * size_of::<[f64; 4]>()
     };
     Ok(u64_from_usize(
-        (pixels * 6 * size_of::<f32>() + row) * conversion_workers(width, height),
+        (pixels * CONVERSION_FLOATS_PER_PIXEL * size_of::<f32>() + row)
+            * conversion_workers(width, height),
     ))
 }
 
@@ -1251,7 +1362,6 @@ fn source_metadata(info: &JxlBasicInfo, profile: &JxlColorProfile) -> ImageMetad
         color_encoding,
         tone_mapping: ToneMappingMetadata {
             intensity_target_nits: info.tone_mapping.intensity_target,
-            min_nits: info.tone_mapping.min_nits,
         },
         exif: None,
         xmp: None,
@@ -1307,40 +1417,60 @@ fn transfer_label(transfer: &JxlTransferFunction) -> String {
     }
 }
 
-fn extract_aux_boxes(
-    decoder: &JxlDecoder,
-    metadata: &mut ImageMetadata,
-    limits: DecodeLimits,
-) -> Result<(), DecodeError> {
+fn extract_aux_boxes(decoder: &JxlDecoder, metadata: &mut ImageMetadata) {
     for box_type in [JxlAuxBoxType::EXIF, XML] {
         for aux in decoder.aux_boxes(box_type) {
-            extract_aux_box(aux, &[], metadata, limits)?;
+            store_aux_box(metadata, aux.box_type(), |limit| {
+                read_aux_box(aux, &[], limit)
+            });
         }
     }
-    Ok(())
 }
 
-fn extract_aux_box(
-    aux: &JxlAuxBox,
-    trailing: &[u8],
+/// Stores the first EXIF and the first XMP box. `read` gets the size limit
+/// for that kind of box. A box that cannot be read becomes a parse error,
+/// like invalid content: metadata never stops the image from showing, just
+/// as a broken gain map falls back to the base image.
+fn store_aux_box<'a>(
     metadata: &mut ImageMetadata,
-    limits: DecodeLimits,
-) -> Result<(), DecodeError> {
-    let data = aux
-        .data(trailing)
-        .map_err(|error| decoder_error(error, limits))?;
-    if aux.box_type() == JxlAuxBoxType::EXIF && metadata.exif.is_none() {
-        let offset = data
-            .get(..4)
-            .ok_or_else(|| DecodeError::Decoder(Box::new(jxl::error::Error::InvalidBox)))?;
-        metadata.exif = Some(parse_exif(
-            &data[4..],
-            u32::from_be_bytes(offset.try_into().expect("four-byte offset")),
+    box_type: JxlAuxBoxType,
+    read: impl FnOnce(usize) -> Result<Cow<'a, [u8]>, String>,
+) {
+    if box_type == JxlAuxBoxType::EXIF && metadata.exif.is_none() {
+        let exif = read(EXIF_OFFSET_BYTES + MAX_METADATA_BYTES).and_then(|data| {
+            let (offset, payload) = data
+                .split_first_chunk::<EXIF_OFFSET_BYTES>()
+                .ok_or_else(|| "the box is shorter than its TIFF offset".to_owned())?;
+            Ok(parse_exif(payload, u32::from_be_bytes(*offset)))
+        });
+        metadata.exif = Some(exif.unwrap_or_else(|error| ExifMetadata {
+            parse_error: Some(error),
+            ..ExifMetadata::default()
+        }));
+    } else if box_type == XML && metadata.xmp.is_none() {
+        metadata.xmp = Some(read(MAX_METADATA_BYTES).map_or_else(
+            |error| XmpMetadata {
+                parse_error: Some(error),
+                rating: None,
+            },
+            |data| parse_xmp(&data),
         ));
-    } else if aux.box_type() == XML && metadata.xmp.is_none() {
-        metadata.xmp = Some(parse_xmp(&data));
     }
-    Ok(())
+}
+
+/// Reads a box payload, decompressing a `brob` box within `limit`.
+fn read_aux_box<'a>(
+    aux: &'a JxlAuxBox,
+    trailing: &[u8],
+    limit: usize,
+) -> Result<Cow<'a, [u8]>, String> {
+    if aux.is_compressed() {
+        gain_map::decompress_brotli(aux.raw_data().chain(trailing), limit)
+            .map(Cow::Owned)
+            .map_err(|reason| format!("compressed box: {reason}"))
+    } else {
+        aux.data(trailing).map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(test)]

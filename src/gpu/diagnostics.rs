@@ -111,13 +111,14 @@ pub(super) fn image_report(diagnostics: ImageDiagnostics) -> String {
     .unwrap();
     writeln!(report, "  GPU allocator memory: {allocator_memory}").unwrap();
     writeln!(report, "  coarse-preview mip levels: {coarse_mip_levels}").unwrap();
-    write_image_work_status(&mut report, &work, false);
+    write_image_work_status(&mut report, &work);
     report
 }
 
 pub(super) fn image_finished_report(diagnostics: &ImageWorkDiagnostics) -> String {
     let mut report = String::new();
-    write_image_work_status(&mut report, diagnostics, true);
+    write_image_work_status(&mut report, diagnostics);
+    report.push('\n');
     write!(
         report,
         "  GPU image budget estimate: {:.2} MiB of {:.2} MiB",
@@ -128,11 +129,7 @@ pub(super) fn image_finished_report(diagnostics: &ImageWorkDiagnostics) -> Strin
     report
 }
 
-fn write_image_work_status(
-    report: &mut String,
-    diagnostics: &ImageWorkDiagnostics,
-    trailing_newline: bool,
-) {
+fn write_image_work_status(report: &mut String, diagnostics: &ImageWorkDiagnostics) {
     writeln!(
         report,
         "  tile cache: {} (hits {}, misses {})",
@@ -146,19 +143,11 @@ fn write_image_work_status(
     )
     .unwrap();
     let scratch_mib = bytes_to_mib(diagnostics.resampling_scratch_peak_bytes);
-    if trailing_newline {
-        writeln!(
-            report,
-            "  CPU resampling scratch peak: {scratch_mib:.2} MiB"
-        )
-        .unwrap();
-    } else {
-        write!(
-            report,
-            "  CPU resampling scratch peak: {scratch_mib:.2} MiB"
-        )
-        .unwrap();
-    }
+    write!(
+        report,
+        "  CPU resampling scratch peak: {scratch_mib:.2} MiB"
+    )
+    .unwrap();
 }
 
 pub(super) fn startup_report(

@@ -7,6 +7,9 @@ const BACKGROUND_BLACK: u32 = 0u;
 const BACKGROUND_CHECKERBOARD: u32 = 1u;
 const BACKGROUND_WHITE: u32 = 2u;
 const BACKGROUND_MIDDLE_GRAY: u32 = 3u;
+// Linear grey behind the empty state, the same as the overlay panel's
+// PANEL_RGBA in ui.rs.
+const EMPTY_STATE_GREY: f32 = 0.012;
 
 struct Params {
     pq_output: u32,
@@ -65,7 +68,7 @@ fn background(position: vec2u) -> vec3f {
 
 fn canonical_input(uv: vec2f, position: vec2u) -> vec4f {
     if params.content_mode == CONTENT_EMPTY_STATE {
-        return vec4f(vec3f(0.012), 1.0);
+        return vec4f(vec3f(EMPTY_STATE_GREY), 1.0);
     }
     if params.content_mode == CONTENT_DIAGNOSTICS_PATTERN {
         return vec4f(hlg_input_to_canonical(
@@ -92,7 +95,11 @@ fn canonical_input(uv: vec2f, position: vec2u) -> vec4f {
         // pixel, so no second reconstruction filter is needed here.
         rgba = textureLoad(resampled_texture, vec2i(position), 0);
     } else {
-        if any(image_uv < vec2f(0.0)) || any(image_uv > vec2f(1.0)) {
+        // Half-open bounds, tested on the position because division is
+        // inexact on GPUs: a fragment exactly on the far edge is outside.
+        // Inside, the integer texel is below the extent, so the tile lookup
+        // below stays in range.
+        if any(image_position < vec2f(0.0)) || any(image_position >= image_extent) {
             return vec4f(0.0);
         }
         rgba = textureSampleGrad(
@@ -103,17 +110,14 @@ fn canonical_input(uv: vec2f, position: vec2u) -> vec4f {
             image_position_dy / image_extent,
         );
         if params.tiled_image == 1u {
-            let maximum_position =
-                vec2f(f32(params.image_width), f32(params.image_height)) - vec2f(0.0001);
-            let bounded_position = clamp(image_position, vec2f(0.0), maximum_position);
-            let tile_position = vec2u(bounded_position) / params.tile_size;
+            let tile_position = vec2u(image_position) / params.tile_size;
             let logical_tile = tile_position.y * params.tile_columns + tile_position.x;
             let slot = tile_slots[logical_tile];
             if slot != 0xffffffffu {
                 let tile_origin = vec2f(tile_position * params.tile_size);
                 let tile_extent = f32(params.tile_size + params.tile_gutter * 2u);
                 let tile_uv =
-                    (bounded_position - tile_origin + vec2f(f32(params.tile_gutter))) / tile_extent;
+                    (image_position - tile_origin + vec2f(f32(params.tile_gutter))) / tile_extent;
                 rgba = textureSampleGrad(
                     tile_texture,
                     image_sampler,
@@ -127,8 +131,7 @@ fn canonical_input(uv: vec2f, position: vec2u) -> vec4f {
     }
     let alpha = clamp(sanitize(rgba.a), 0.0, 1.0);
     // The sampled texture is premultiplied for fringe-free linear filtering.
-    // Both operands are canonical linear BT.2020 values. Composite before
-    // exposure, tone mapping, gamut mapping, and transfer encoding.
+    // output_transform() composites it over the background.
     return vec4f(
         finite_or_zero(rgba.r), finite_or_zero(rgba.g), finite_or_zero(rgba.b),
         alpha,
@@ -154,6 +157,9 @@ fn output_transform(canonical: vec4f, ui: vec4f, position: vec2u) -> vec3f {
         finite_or_zero(canonical.r), finite_or_zero(canonical.g), finite_or_zero(canonical.b),
     ) * exposure;
     let image_alpha = clamp(sanitize(canonical.a), 0.0, 1.0);
+    // Exposure applies to the image only. Both operands are canonical linear
+    // BT.2020 values. Composite before tone mapping, gamut mapping, and
+    // transfer encoding.
     let working = image + background(position) * (1.0 - image_alpha);
     let effective_source_peak_nits = max(
         // Must match shader_parameters(), which derives effective_source_peak_pq.
@@ -169,6 +175,9 @@ fn output_transform(canonical: vec4f, ui: vec4f, position: vec2u) -> vec3f {
     );
     let ui_alpha = clamp(sanitize(ui.a), 0.0, 1.0);
     let ui_linear_bt709 = vec3f(sanitize(ui.r), sanitize(ui.g), sanitize(ui.b));
+    // UI white is HDR reference white, limited to the output peak. A macOS PQ
+    // target is 100 nits times the current EDR headroom and can lie below it.
+    let ui_white_nits = min(params.hdr_reference_white_nits, params.output_peak_nits);
 
     if params.pq_output != 0u {
         // PQ retains the BT.2020 destination gamut. Only apply its final
@@ -178,19 +187,20 @@ fn output_transform(canonical: vec4f, ui: vec4f, position: vec2u) -> vec3f {
             luma_bt2020(mapped_bt2020),
             params.output_peak_nits,
         );
-        let ui_nits = BT709_TO_BT2020
-            * (ui_linear_bt709 * params.hdr_reference_white_nits);
+        let ui_nits = BT709_TO_BT2020 * (ui_linear_bt709 * ui_white_nits);
         let display_nits = image_nits * (1.0 - ui_alpha) + ui_nits;
         return dither_encoded(pq_oetf(display_nits / PQ_PEAK_NITS), position, 10u);
     }
 
     // SDR changes destination gamut to BT.709 and needs perceptual mapping.
+    // The result is linear and not dithered: the sRGB attachment encodes and
+    // quantizes it after the shader, so dithering here would mean encoding,
+    // dithering and decoding again. Hardware quantization is accepted instead.
     let image_nits = gamut_map_bt2020_to_bt709_ictcp_hard(
         mapped_bt2020,
         params.output_peak_nits,
     );
-    return (image_nits * (1.0 - ui_alpha)
-        + ui_linear_bt709 * params.hdr_reference_white_nits)
+    return (image_nits * (1.0 - ui_alpha) + ui_linear_bt709 * ui_white_nits)
         / params.output_peak_nits;
 }
 

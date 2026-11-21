@@ -227,17 +227,6 @@ fn sdr_rendition_is_the_untouched_base_image() {
 }
 
 #[test]
-fn file_decoding_defaults_to_the_hdr_rendition() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/test_pattern-gain-map.jxl");
-    let decoded = decode_file(&path, limits()).unwrap();
-    assert!(matches!(
-        decoded.gain_map,
-        Some(GainMapStatus::Applied { .. })
-    ));
-}
-
-#[test]
 fn gain_map_boxes_apply_wherever_they_are_stored() {
     let fixture = Fixture::load();
     let expected = decode_memory(&fixture.container, limits()).unwrap();
@@ -265,7 +254,7 @@ fn gain_map_boxes_apply_wherever_they_are_stored() {
         assert_eq!(decoded.gain_map, expected.gain_map, "{case}");
         assert_eq!(pixels(&decoded), pixels(&expected), "{case}");
 
-        // Files are read through a different input than memory.
+        // Files use a different input than memory and must also default to HDR.
         let path = std::env::temp_dir().join(format!(
             "xl-view-gain-map-{}-{}.jxl",
             std::process::id(),
@@ -275,6 +264,7 @@ fn gain_map_boxes_apply_wherever_they_are_stored() {
         let decoded = decode_file(&path, limits());
         std::fs::remove_file(&path).unwrap();
         let decoded = decoded.unwrap_or_else(|error| panic!("{case} from a file: {error}"));
+        assert_eq!(decoded.gain_map, expected.gain_map, "{case} from a file");
         assert_eq!(pixels(&decoded), pixels(&expected), "{case} from a file");
     }
 }

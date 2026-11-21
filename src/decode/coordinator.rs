@@ -80,10 +80,10 @@ impl DecodeAttempt {
     }
 }
 
-#[derive(Debug, Default)]
 /// Queue entries and `active` collectively contain each key in `jobs` exactly
 /// once, and every `JobLocation` mirrors that key's current container. The
 /// shared mutex protects updates to both representations as one transaction.
+#[derive(Debug, Default)]
 struct CoordinatorState {
     demand: VecDeque<DecodeJob>,
     prefetch: VecDeque<DecodeJob>,

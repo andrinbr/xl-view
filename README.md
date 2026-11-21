@@ -25,6 +25,8 @@ targets JPEG XL and handles large images such as panoramas.
 - **Sharp scaling:** high-quality resampling for a detailed view
 - **Image cache and preloading:** keep recent images in memory and preload adjacent files for faster browsing
 - **Metadata overlay:** inspect image, output, and EXIF details without leaving the viewer
+- **Histogram:** see how an image's brightness spreads from shadows to HDR highlights.
+  Dashed lines mark SDR white (203 nits) and each stop above it, a solid line the peak declared in its metadata.
 - **Exposure adjustment:** brighten or darken an image to inspect highlights and shadows
 - **Selectable backgrounds:** assess contrast, edges, and transparency on different backgrounds
 - **Display diagnostics:** show a test pattern and runtime/display information
@@ -161,10 +163,12 @@ otherwise. Use `--output pq` or `--output sdr` to require a mode,
 
 ## Supported image formats
 
-Currently JPEG XL (`.jxl`) only. 
+Only JPEG XL (`.jxl`) is supported.
 
 Supported source encodings include SDR, PQ, HLG, gain maps, and linear RGB (including scRGB).
 All can be displayed in either HDR or SDR mode.
+
+For gain map files whose base image is HDR, XL-View always shows that HDR image (tone mapped in SDR mode).
 
 ## Troubleshooting
 

@@ -3,11 +3,17 @@
 use std::fmt::Write as _;
 
 use exif::{Error as ExifError, Exif, In, Tag, Value};
+use quick_xml::NsReader;
+use quick_xml::escape::unescape;
+use quick_xml::events::Event;
+use quick_xml::name::{LocalName, Namespace, ResolveResult};
+
+use crate::units::mib_to_usize_bytes;
 
 const MAX_EXIF_TEXT_CHARACTERS: usize = 256;
-const MAX_EXIF_BYTES: usize = 16 * 1024 * 1024;
-const MAX_XMP_BYTES: usize = 4 * 1024 * 1024;
-const MAX_XMP_NODES: u32 = 4_096;
+/// Largest EXIF or XMP payload parsed. XMP can embed images, such as the
+/// depth map and original of a portrait photo, but only its rating is read.
+pub(crate) const MAX_METADATA_BYTES: usize = mib_to_usize_bytes(16);
 const XMP_BASIC_NAMESPACE: &str = "http://ns.adobe.com/xap/1.0/";
 
 /// Common fields parsed from an EXIF payload capped at 16 MiB.
@@ -47,9 +53,9 @@ pub struct XmpMetadata {
 #[must_use]
 pub fn parse_exif(raw_payload: &[u8], tiff_header_offset: u32) -> ExifMetadata {
     let mut metadata = ExifMetadata::default();
-    if raw_payload.len() > MAX_EXIF_BYTES {
+    if raw_payload.len() > MAX_METADATA_BYTES {
         metadata.parse_error = Some(format!(
-            "EXIF payload is {} bytes. The limit is {MAX_EXIF_BYTES} bytes",
+            "EXIF payload is {} bytes. The limit is {MAX_METADATA_BYTES} bytes",
             raw_payload.len()
         ));
         return metadata;
@@ -172,9 +178,12 @@ fn format_partial_errors(errors: &[ExifError]) -> String {
 
 /// Parses supported fields from a JPEG XL XML metadata box.
 ///
-/// XMP is treated as untrusted input: DTDs are rejected and the XML tree has a
-/// fixed node limit. Invalid XML or property values are retained as a
-/// diagnostic instead of failing image decoding.
+/// XMP is treated as untrusted input: DTDs are rejected, and the payload is
+/// read as a stream instead of being built into a tree, so time and memory
+/// stay proportional to its size. Reading stops at the rating. Invalid XML up
+/// to there, or an invalid value, is retained as a diagnostic instead of
+/// failing image decoding. A rating written inside CDATA is not supported and
+/// counts as an invalid value. No known XMP writer produces one.
 #[must_use]
 pub fn parse_xmp(raw_payload: &[u8]) -> XmpMetadata {
     match parse_xmp_rating(raw_payload) {
@@ -190,38 +199,76 @@ pub fn parse_xmp(raw_payload: &[u8]) -> XmpMetadata {
 }
 
 fn parse_xmp_rating(raw_payload: &[u8]) -> Result<Option<f64>, String> {
-    if raw_payload.len() > MAX_XMP_BYTES {
+    if raw_payload.len() > MAX_METADATA_BYTES {
         return Err(format!(
-            "XMP payload is {} bytes. The limit is {MAX_XMP_BYTES} bytes",
+            "XMP payload is {} bytes. The limit is {MAX_METADATA_BYTES} bytes",
             raw_payload.len()
         ));
     }
     let xml = std::str::from_utf8(raw_payload)
         .map_err(|error| format!("XMP is not valid UTF-8: {error}"))?;
-    let options = roxmltree::ParsingOptions {
-        nodes_limit: MAX_XMP_NODES,
-        ..roxmltree::ParsingOptions::default()
-    };
-    let document = roxmltree::Document::parse_with_options(xml, options)
-        .map_err(|error| format!("invalid XMP XML: {error}"))?;
-
-    for node in document.descendants().filter(roxmltree::Node::is_element) {
-        if let Some(value) = node.attribute((XMP_BASIC_NAMESPACE, "Rating")) {
-            return parse_rating_value(value).map(Some);
-        }
-        if node.has_tag_name((XMP_BASIC_NAMESPACE, "Rating")) {
-            let value = node
-                .text()
-                .ok_or_else(|| "XMP rating has no value".to_owned())?;
-            return parse_rating_value(value).map(Some);
+    // The reader rejects more than 128 namespace declarations in scope and
+    // more than 65,535 nested elements, which keeps every namespace lookup cheap.
+    let mut reader = NsReader::from_str(xml);
+    // `<a/>` is read like `<a></a>`, so both forms take the same path.
+    reader.config_mut().expand_empty_elements = true;
+    let mut open_elements = 0_u32;
+    loop {
+        match reader.read_event().map_err(invalid_xml)? {
+            Event::DocType(_) => return Err(invalid_xml("a DTD is not allowed")),
+            Event::Start(element) => {
+                for attribute in element.attributes() {
+                    let attribute = attribute.map_err(invalid_xml)?;
+                    if is_xmp_rating(reader.resolver().resolve_attribute(attribute.key)) {
+                        let value = unescape(&attribute.value).map_err(invalid_xml)?;
+                        return parse_rating_value(&value).map(Some);
+                    }
+                }
+                let name = element.name();
+                if is_xmp_rating(reader.resolver().resolve_element(name)) {
+                    let text = reader.read_text(name).map_err(invalid_xml)?;
+                    let value = unescape(&text).map_err(invalid_xml)?;
+                    return parse_rating_value(&value).map(Some);
+                }
+                open_elements += 1;
+            }
+            Event::End(_) => open_elements = open_elements.saturating_sub(1),
+            Event::Eof if open_elements > 0 => {
+                return Err(invalid_xml("an element is not closed"));
+            }
+            Event::Eof => return Ok(None),
+            _ => {}
         }
     }
-    Ok(None)
+}
+
+fn invalid_xml(error: impl std::fmt::Display) -> String {
+    format!("invalid XMP XML: {error}")
+}
+
+/// Whether a resolved name is `Rating` in the XMP namespace. The reader keeps
+/// namespace names as written, so references in them are resolved here.
+fn is_xmp_rating((namespace, name): (ResolveResult, LocalName)) -> bool {
+    // Without leading zeros, a character takes at most six bytes as a
+    // reference, like `&#x2F;`. Longer names are not resolved: doing that for
+    // every name called `Rating` would let one huge namespace name slow the
+    // whole payload.
+    const MAX_ESCAPED_NAMESPACE_BYTES: usize = XMP_BASIC_NAMESPACE.len() * 6;
+    name.as_ref() == "Rating"
+        && matches!(
+            namespace,
+            ResolveResult::Bound(Namespace(namespace))
+                if namespace.len() <= MAX_ESCAPED_NAMESPACE_BYTES
+                    && unescape(namespace).is_ok_and(|namespace| namespace == XMP_BASIC_NAMESPACE)
+        )
 }
 
 fn parse_rating_value(value: &str) -> Result<f64, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("XMP rating has no value".to_owned());
+    }
     let rating = value
-        .trim()
         .parse::<f64>()
         .map_err(|_| "XMP rating is not numeric".to_owned())?;
     if rating.to_bits() == (-1.0_f64).to_bits() || (0.0..=5.0).contains(&rating) {
@@ -270,8 +317,25 @@ mod tests {
     }
 
     #[test]
+    fn partly_malformed_exif_keeps_the_fields_that_could_be_read() {
+        let mut payload = test_payload();
+        // Point the model string, the second entry of the first IFD, past
+        // the end of the payload.
+        let outside = u32::try_from(payload.len()).unwrap();
+        write_entry(&mut payload, 8 + 14, 0x0110, 2, 9, outside);
+        let exif = parse_exif(&payload, 0);
+        assert_eq!(exif.camera_make.as_deref(), Some("ACME"));
+        assert_eq!(exif.camera_model, None);
+        assert_eq!(exif.lens_model.as_deref(), Some("Prime 50"));
+        assert!(
+            exif.parse_error
+                .is_some_and(|error| error.starts_with("partially parsed EXIF"))
+        );
+    }
+
+    #[test]
     fn oversized_exif_is_not_parsed() {
-        let payload = vec![0; MAX_EXIF_BYTES + 1];
+        let payload = vec![0; MAX_METADATA_BYTES + 1];
         let exif = parse_exif(&payload, 0);
         assert!(exif.parse_error.is_some());
     }
@@ -335,10 +399,99 @@ mod tests {
         assert_eq!(out_of_range.rating, None);
         assert!(out_of_range.parse_error.is_some());
 
-        let oversized_payload = vec![b' '; MAX_XMP_BYTES + 1];
+        let oversized_payload = vec![b' '; MAX_METADATA_BYTES + 1];
         let oversized = parse_xmp(&oversized_payload);
         assert_eq!(oversized.rating, None);
         assert!(oversized.parse_error.is_some());
+    }
+
+    #[test]
+    fn xmp_reading_stops_at_the_rating_and_rejects_an_empty_one() {
+        // Nothing after the rating is read, not even malformed XML.
+        let early = parse_xmp(
+            br#"<a xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="2"><xmp:Rating>5"#,
+        );
+        assert_eq!(early.rating, Some(2.0));
+        assert_eq!(early.parse_error, None);
+
+        for empty in [
+            &br#"<xmp:Rating xmlns:xmp="http://ns.adobe.com/xap/1.0/"/>"#[..],
+            br#"<xmp:Rating xmlns:xmp="http://ns.adobe.com/xap/1.0/"> </xmp:Rating>"#,
+        ] {
+            let empty = parse_xmp(empty);
+            assert_eq!(empty.rating, None);
+            assert_eq!(
+                empty.parse_error.as_deref(),
+                Some("XMP rating has no value")
+            );
+        }
+
+        let unclosed = parse_xmp(br#"<xmp:Rating xmlns:xmp="http://ns.adobe.com/xap/1.0/">4"#);
+        assert_eq!(unclosed.rating, None);
+        assert!(
+            unclosed
+                .parse_error
+                .is_some_and(|error| error.contains("not closed"))
+        );
+    }
+
+    #[test]
+    fn xmp_rating_and_namespace_may_use_character_references() {
+        for xml in [
+            r#"<a xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="&#52;"/>"#,
+            r#"<a xmlns:xmp="http://ns.adobe.com/xap/1.0/"><xmp:Rating>&#x34;</xmp:Rating></a>"#,
+            r#"<a xmlns:xmp="http://ns.adobe.com/xap/1.0&#47;" xmp:Rating="4"/>"#,
+            r#"<a><Rating xmlns="http://ns.adobe.com/xap/1.0&#x2F;">4</Rating></a>"#,
+        ] {
+            let xmp = parse_xmp(xml.as_bytes());
+            assert_eq!(xmp.rating, Some(4.0), "{xml}");
+            assert_eq!(xmp.parse_error, None, "{xml}");
+        }
+
+        // Not supported: the element's content is read as plain text.
+        for xml in [
+            r#"<a xmlns:xmp="http://ns.adobe.com/xap/1.0/"><xmp:Rating><![CDATA[4]]></xmp:Rating></a>"#,
+            r#"<a xmlns:xmp="http://ns.adobe.com/xap/1.0/"><xmp:Rating><b/>4</xmp:Rating></a>"#,
+        ] {
+            let xmp = parse_xmp(xml.as_bytes());
+            assert_eq!(xmp.rating, None, "{xml}");
+            assert_eq!(
+                xmp.parse_error.as_deref(),
+                Some("XMP rating is not numeric"),
+                "{xml}"
+            );
+        }
+    }
+
+    #[test]
+    fn adversarial_xmp_is_bounded() {
+        use std::fmt::Write as _;
+
+        // A tree parser that checks each attribute of an element against all
+        // earlier ones needs minutes for this. A rating after it is found.
+        let mut attributes = String::from(r#"<a xmlns:xmp="http://ns.adobe.com/xap/1.0/""#);
+        for index in 0..200_000 {
+            write!(attributes, r#" a{index}="""#).unwrap();
+        }
+        attributes.push_str(r#" xmp:Rating="1"/>"#);
+        assert_eq!(parse_xmp(attributes.as_bytes()).rating, Some(1.0));
+
+        // The XML reader's own limits keep namespace lookups cheap.
+        let mut declarations = String::from("<a");
+        for index in 0..1_000 {
+            write!(declarations, r#" xmlns:p{index}="u""#).unwrap();
+        }
+        declarations.push_str("/>");
+        assert!(
+            parse_xmp(declarations.as_bytes())
+                .parse_error
+                .is_some_and(|error| error.contains("namespace bindings"))
+        );
+        assert!(
+            parse_xmp("<a>".repeat(100_000).as_bytes())
+                .parse_error
+                .is_some_and(|error| error.contains("nests elements deeper"))
+        );
     }
 
     fn test_payload() -> Vec<u8> {
